@@ -712,24 +712,33 @@ in
       uid=$(pm exec -u root "$NAME" /run/current-system/sw/bin/id -u -- "$session_user" | tr -d '[:space:]')
       gid=$(pm exec -u root "$NAME" /run/current-system/sw/bin/id -g -- "$session_user" | tr -d '[:space:]')
 
-      # Per-session bindfs at /develop-home/<session_user>.
-      # --perms="og=" strips group/other perms in the mounted
-      # view so other session users in the same container can't
-      # peek into this project even if they guess the username.
+      # Per-session HOME at /develop-home/<session_user>, with the
+      # project bind-mounted ONE LEVEL DOWN at <home>/dev. Keeping the
+      # home and the project separate lets us drop home-level files
+      # (.bashrc, .nixct, nix profile state) into the session HOME
+      # without polluting the user's project tree.
+      #   <home>      - real writable dir owned by the session user, 0700.
+      #   <home>/dev  - bindfs view of /hostmnts/<id>. --perms="og="
+      #                 strips group/other perms so other session users
+      #                 can't peek in even if they guess the username.
       # shellcheck disable=SC2016
       pm exec -u root "$NAME" \
         /run/current-system/sw/bin/bash -lc '
           set -e
           home_dir=/develop-home/$1
+          proj_dir=$home_dir/dev
           src=/hostmnts/$2
-          mkdir -p "$home_dir"
-          if ! mountpoint -q "$home_dir"; then
+          mkdir -p "$proj_dir"
+          chown "$3:$4" "$home_dir"
+          chmod 0700 "$home_dir"
+          if ! mountpoint -q "$proj_dir"; then
             bindfs --map=0/$3:@0/@$4 --perms="og=" \
-              -o allow_other "$src" "$home_dir"
+              -o allow_other "$src" "$proj_dir"
           fi
         ' bash "$session_user" "$mount_id" "$uid" "$gid"
 
       home_dir="/develop-home/$session_user"
+      proj_dir="$home_dir/dev"
       extra_setenv=()
 
       # Dev-shell command. In host-daemon mode, build the dev shell
@@ -848,13 +857,13 @@ in
       #            shell exits, until they too exit).
       # --uid/--gid + --setenv=HOME=...: shell runs as session
       #            user with the project as HOME.
-      echo "develop: $hostpath -> $home_dir (scope: $scope)"
+      echo "develop: $hostpath -> $proj_dir (HOME: $home_dir, scope: $scope)"
       pm exec -it -u root "$NAME" \
         /run/current-system/sw/bin/systemd-run \
           --scope --collect --quiet \
           --unit="$scope" \
           --uid="$uid" --gid="$gid" \
-          --working-directory="$home_dir" \
+          --working-directory="$proj_dir" \
           --setenv="HOME=$home_dir" \
           "''${extra_setenv[@]+''${extra_setenv[@]}}" \
           ${tools.bash} -lc "$develop_cmd"
@@ -1013,10 +1022,12 @@ in
                                 auto-runs up if not running.
       shell                     alias for enter.
     develop [-A] [-S name=path] <hostpath>
-                                bind-mount <hostpath> at /develop-home/<user>
-                                in the running container, exec nix develop
-                                there as a per-session user. Re-running on
-                                the same hostpath reuses the user.
+                                bind-mount <hostpath> at /develop-home/<user>/dev
+                                (~/dev) in the running container, exec nix
+                                develop there as a per-session user. The
+                                session HOME (/develop-home/<user>) is a
+                                separate writable dir for home-level files.
+                                Re-running on the same hostpath reuses the user.
                                 In host-daemon mode the session auto-manages
                                 GC roots: host store paths used by the
                                 session are protected from

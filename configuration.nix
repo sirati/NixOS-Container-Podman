@@ -108,11 +108,22 @@
       # Settle period in case systemd is mid-tear-down.
       sleep 1
 
-      if mountpoint -q -- "$home_dir"; then
-        fusermount3 -u -- "$home_dir" 2>/dev/null \
-          || umount -- "$home_dir" 2>/dev/null || true
+      # The project is bind-mounted at <home>/dev; the home itself is a
+      # real per-session dir holding home-level files (.bashrc, .nixct,
+      # nix profile state). Unmount the project bind FIRST, then wipe the
+      # home tree - but only once the bind is truly gone, so `rm -rf` can
+      # never recurse into the host's project files.
+      proj_dir="$home_dir/dev"
+      if mountpoint -q -- "$proj_dir"; then
+        fusermount3 -u -- "$proj_dir" 2>/dev/null \
+          || umount -- "$proj_dir" 2>/dev/null || true
       fi
-      rmdir -- "$home_dir" 2>/dev/null || true
+      if mountpoint -q -- "$proj_dir"; then
+        # Bind still up - don't risk rm -rf into host files.
+        rmdir -- "$proj_dir" 2>/dev/null || true
+      else
+        rm -rf -- "$home_dir" 2>/dev/null || true
+      fi
 
       # Forwarded-socket proxies (socat units) are killed by their
       # BindsTo=$scope; just clean up the leftover socket files.

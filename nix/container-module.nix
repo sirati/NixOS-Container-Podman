@@ -178,9 +178,13 @@ in
           scan_and_root() {
             [ -d "$home" ] || return 0
             local link target relname rootname
+            # The project is bind-mounted at <home>/dev (see run.nix
+            # develop case), so build artifacts (result*, .direnv) live
+            # there; home-level state (.nixct profile, nix profile dir)
+            # lives directly under <home>.
             for link in \
-              "$home"/result "$home"/result-* \
-              "$home"/.direnv/*-link \
+              "$home"/dev/result "$home"/dev/result-* \
+              "$home"/dev/.direnv/*-link \
               "$home"/.nixct/devshell* \
               "$home"/.local/state/nix/profiles/*-link
             do
