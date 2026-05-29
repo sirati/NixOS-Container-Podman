@@ -95,6 +95,18 @@
       #   nixStore.daemonSocket   Host nix-daemon socket bound in for
       #                           host-daemon mode (default
       #                           /nix/var/nix/daemon-socket/socket).
+      #
+      #   runName                 basename of the run-script binary
+      #                           (default "nix-dev-container"). mkNixct
+      #                           sets "nixct".
+      #   idleTimeout             seconds of no active develop session
+      #                           after which a host-side monitor stops
+      #                           the container. 0 (default) = disabled.
+      #   stateDirLine            override the bash line that sets
+      #                           $STATE_DIR (default: persistent under
+      #                           XDG_STATE_HOME). null keeps the default;
+      #                           mkNixct passes a tmpfs (XDG_RUNTIME_DIR)
+      #                           line for ephemeral state.
       mkContainer =
         { modules ? [ ]
         , shellUser ? "root"
