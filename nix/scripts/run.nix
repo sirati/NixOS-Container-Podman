@@ -959,9 +959,11 @@ in
           echo "session gcroots:"
           for d in "$SESSION_GCROOTS"/*; do
             [ -d "$d" ] || continue
-            n=$(find "$d" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d '[:space:]')
+            # `|| n=0` keeps errexit from aborting status if the count
+            # pipeline ever fails (e.g. a torn-down session mid-listing).
+            n=$(find "$d" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d '[:space:]') || n=0
             echo "  $(basename "$d") ($n roots)"
-          done 2>/dev/null || true
+          done
         fi
       fi
       echo "rootfs:     $ROOTFS"

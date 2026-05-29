@@ -150,8 +150,9 @@ in
       # re-registers them as GC roots in a host-visible directory, keeping the
       # host daemon from collecting them for the session's lifetime.
       #
-      # Spawned (1B) and torn down (1C) by the run-script wiring; here we only
-      # install the script. Lifecycle is driven by polling the session scope
+      # Spawned per develop session and torn down by the run-script wiring
+      # (run.nix develop-case + host-watchdog.nix); here we only install the
+      # script. Lifecycle is driven by polling the session scope
       # rather than systemd BindsTo: the keeper unit is started BEFORE the
       # scope exists, so a BindsTo dependency would race and the unit would be
       # stopped the instant it started.
@@ -234,8 +235,11 @@ in
           done
 
           # Final pass to catch a build that completed in the last interval.
+          # Best-effort: if the in-container watchdog has already unmounted the
+          # session home, scan_and_root no-ops via its `[ -d "$home" ]` guard -
+          # those last paths were almost always rooted in a prior iteration.
           # Do NOT delete the gcroot dir / its symlinks - removal is the host
-          # watchdog's job (1C).
+          # watchdog's job (see nix/scripts/host-watchdog.nix).
           scan_and_root
           exit 0
         '';

@@ -76,6 +76,13 @@ in
   # by the host user (= container root under default rootless), so this
   # watchdog (running as the host user) can remove it directly without
   # `podman unshare`.
+  #
+  # Fire-and-forget vs the keeper's final pass: the keeper may write one
+  # last symlink here as we remove the dir. Both interleavings are benign
+  # - the link is either removed with the dir, or orphaned and pruned at
+  # the next host GC (a dangling auto-root). MOUNT_ID is the run script's
+  # sanitized id (no `/`, `..`, spaces, or globs), and the path is quoted
+  # and `--`-terminated, so this can never escape the session subdir.
   ${bin "rm"} -rf -- "$STATE_DIR/session-gcroots/$MOUNT_ID"
 
   ${bin "rm"} -f "$SOCK"
