@@ -61,6 +61,23 @@ in
       exit 0
     '
 
+  # Drop this session's GC roots. In host-daemon mode the in-container
+  # gcroot-keeper places GC-root symlinks under
+  # $STATE_DIR/session-gcroots/$MOUNT_ID (a host-visible dir bind-mounted
+  # at the same absolute path) so a concurrent host nix-collect-garbage
+  # won't delete store paths the live session needs. The session is now
+  # over, so those roots must go: removing the symlinks leaves the host
+  # daemon's matching gcroots/auto/* entries dangling, and nix prunes
+  # dangling auto-roots on its next GC - making the paths collectable
+  # again exactly when the session ends.
+  #
+  # Unconditional (mode-agnostic): the dir only exists in host-daemon
+  # mode and `rm -rf` of a missing path is a harmless no-op. It's owned
+  # by the host user (= container root under default rootless), so this
+  # watchdog (running as the host user) can remove it directly without
+  # `podman unshare`.
+  ${bin "rm"} -rf -- "$STATE_DIR/session-gcroots/$MOUNT_ID"
+
   ${bin "rm"} -f "$SOCK"
   ${bin "rmdir"} "$SOCK_DIR" 2>/dev/null || true
 ''
