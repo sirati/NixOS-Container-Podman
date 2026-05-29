@@ -210,7 +210,7 @@ let
           case "$cur" in
             -*)
               COMPREPLY=( $(compgen -W \
-                "-A --forward-agent --x11 --x11-untrusted --wayland -S --socket" \
+                "-A --forward-agent --x11 --x11-untrusted --wayland -S --socket --mount-bashrc --mount-gitconfig" \
                 -- "$cur") )
               ;;
             *)

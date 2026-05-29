@@ -142,6 +142,9 @@ in
   # Idle-timeout default (seconds; 0 = disabled). Overridable via env.
   BUILT_IDLE_TIMEOUT=${toString idleTimeout}
   IDLE_TIMEOUT=''${NIXCT_IDLE_TIMEOUT:-$BUILT_IDLE_TIMEOUT}
+  # Sanitize: a non-integer (e.g. a bad NIXCT_IDLE_TIMEOUT) disables it
+  # cleanly instead of tripping `[ -gt ]` integer errors later.
+  case "$IDLE_TIMEOUT" in ""|*[!0-9]*) IDLE_TIMEOUT=0 ;; esac
   if [ "$BUILT_NIX_STORE_MODE" = "host-daemon" ] && [ "$NIX_STORE_MODE" != "host-daemon" ]; then
     echo "note: container was built for host-daemon mode; ignoring NIX_STORE_MODE=$NIX_STORE_MODE" >&2
     NIX_STORE_MODE=host-daemon
@@ -502,8 +505,16 @@ in
   # it lands on the identical paths. setsid + redirections + disown
   # fully detach it from the foreground command; the monitor's own
   # flock keeps a single instance even across repeated calls.
+  # mark_activity: bump the idle-monitor's activity marker. Called
+  # whenever we ensure the container is running or (re)start a develop
+  # session, so the monitor counts develop setup - the window between
+  # `ensure_running` and the session-scope actually existing - as
+  # activity and never tears the container down mid-setup.
+  mark_activity() { touch "$STATE_DIR/.idle-activity" 2>/dev/null || true; }
+
   maybe_start_idle_monitor() {
     [ "''${IDLE_TIMEOUT:-0}" -gt 0 ] || return 0
+    mark_activity
     STATE_DIR="$STATE_DIR" NAME="$NAME" NIX_STORE_MODE="$NIX_STORE_MODE" \
       NIXCT_IDLE_TIMEOUT="$IDLE_TIMEOUT" \
       setsid "$0" __idle-monitor </dev/null >/dev/null 2>&1 &
@@ -613,11 +624,18 @@ in
             --type=scope --state=active --no-legend 'session-*.scope' \
           2>/dev/null | grep -c '\.scope' || true)
         now=$(date +%s)
+        # Activity = a live session scope OR a recent mark_activity touch
+        # (the latter covers develop's setup window, before the scope
+        # exists, so a stale monitor can't tear down a starting session).
+        amt=$(stat -c %Y "$STATE_DIR/.idle-activity" 2>/dev/null || echo 0)
         if [ "''${active:-0}" -gt 0 ]; then
           last=$now
-        elif [ $((now - last)) -ge "$IDLE_TIMEOUT" ]; then
-          tear_down
-          break
+        else
+          [ "''${amt:-0}" -gt "$last" ] && last=$amt
+          if [ $((now - last)) -ge "$IDLE_TIMEOUT" ]; then
+            tear_down
+            break
+          fi
         fi
         sleep "$interval"
       done
@@ -946,6 +964,9 @@ in
       #            shell exits, until they too exit).
       # --uid/--gid + --setenv=HOME=...: shell runs as session
       #            user with the project as HOME.
+      # Final activity bump right before the scope exists, so a tight
+      # idle timeout can't fire during the last moments of setup.
+      mark_activity
       echo "develop: $hostpath -> $proj_dir (HOME: $home_dir, scope: $scope)"
       pm exec -it -u root "$NAME" \
         /run/current-system/sw/bin/systemd-run \
