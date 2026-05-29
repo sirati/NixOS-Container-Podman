@@ -45,6 +45,12 @@
 , nixStoreMode ? "overlay"
 , hostStore ? "/nix/store"
 , daemonSocket ? "/nix/var/nix/daemon-socket/socket"
+  # idleTimeout : integer seconds of no active develop session after
+  #               which the container is torn down by a host-side idle
+  #               monitor. 0 (default) disables the monitor entirely;
+  #               a no-op for existing containers. Overridable at
+  #               runtime via the NIXCT_IDLE_TIMEOUT env.
+, idleTimeout ? 0
   # Mode-conditional snippets. Defaults are the NixOS-host behavior;
   # the portable-tarball target overrides these.
   #
@@ -132,6 +138,10 @@ in
   # on or off at runtime.
   BUILT_NIX_STORE_MODE=${nixStoreMode}
   NIX_STORE_MODE=''${NIX_STORE_MODE:-$BUILT_NIX_STORE_MODE}
+
+  # Idle-timeout default (seconds; 0 = disabled). Overridable via env.
+  BUILT_IDLE_TIMEOUT=${toString idleTimeout}
+  IDLE_TIMEOUT=''${NIXCT_IDLE_TIMEOUT:-$BUILT_IDLE_TIMEOUT}
   if [ "$BUILT_NIX_STORE_MODE" = "host-daemon" ] && [ "$NIX_STORE_MODE" != "host-daemon" ]; then
     echo "note: container was built for host-daemon mode; ignoring NIX_STORE_MODE=$NIX_STORE_MODE" >&2
     NIX_STORE_MODE=host-daemon
@@ -479,9 +489,25 @@ in
   # Auto-up here never enables GPU - use `up --gpu` explicitly
   # if you need it.
   ensure_running() {
-    if container_running; then return 0; fi
+    if container_running; then maybe_start_idle_monitor; return 0; fi
     if container_exists; then pm rm -f "$NAME" >/dev/null; fi
     ENABLE_GPU=0 start_persistent
+    maybe_start_idle_monitor
+  }
+
+  # maybe_start_idle_monitor: spawn the host-side __idle-monitor loop
+  # detached, but only when an idle timeout is configured. The monitor
+  # re-execs THIS script and recomputes every path from the prologue;
+  # we hand it STATE_DIR/NAME/NIX_STORE_MODE + the timeout in the env so
+  # it lands on the identical paths. setsid + redirections + disown
+  # fully detach it from the foreground command; the monitor's own
+  # flock keeps a single instance even across repeated calls.
+  maybe_start_idle_monitor() {
+    [ "''${IDLE_TIMEOUT:-0}" -gt 0 ] || return 0
+    STATE_DIR="$STATE_DIR" NAME="$NAME" NIX_STORE_MODE="$NIX_STORE_MODE" \
+      NIXCT_IDLE_TIMEOUT="$IDLE_TIMEOUT" \
+      setsid "$0" __idle-monitor </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   }
 
   # ----- socket / X11 / Wayland forwarding ----------------------
@@ -557,10 +583,45 @@ in
       [ "$ENABLE_GPU"    = "1" ] && tags="$tags gpu"
       [ "$ENABLE_OPENGL" = "1" ] && tags="$tags opengl"
       echo "$NAME: up''${tags:+ (''${tags# })} [store: $NIX_STORE_MODE]"
+      maybe_start_idle_monitor
       ;;
     down|stop)
       tear_down
       echo "$NAME: down"
+      ;;
+    __idle-monitor)
+      # Hidden: host-side loop that tears the container down after
+      # IDLE_TIMEOUT seconds with no active develop session. Spawned
+      # detached by maybe_start_idle_monitor. A flock on a per-state
+      # lock file makes this single-instance: if another monitor holds
+      # it we just exit.
+      exec 9>"$STATE_DIR/.idle-monitor.lock" || exit 0
+      flock -n 9 || exit 0
+      [ "''${IDLE_TIMEOUT:-0}" -gt 0 ] || exit 0
+      # Poll often enough to be responsive but never busy-loop: clamp
+      # to [3, 30] and never above the timeout itself.
+      interval=$IDLE_TIMEOUT
+      [ "$interval" -gt 30 ] && interval=30
+      [ "$interval" -lt 3 ] && interval=3
+      last=$(date +%s)
+      while container_running; do
+        # An active develop session shows up as a running
+        # session-*.scope unit (created only by `develop`). grep -c
+        # exits 1 on zero matches, so `|| true` is required here.
+        active=$(pm exec "$NAME" \
+          /run/current-system/sw/bin/systemctl list-units \
+            --type=scope --state=active --no-legend 'session-*.scope' \
+          2>/dev/null | grep -c '\.scope' || true)
+        now=$(date +%s)
+        if [ "''${active:-0}" -gt 0 ]; then
+          last=$now
+        elif [ $((now - last)) -ge "$IDLE_TIMEOUT" ]; then
+          tear_down
+          break
+        fi
+        sleep "$interval"
+      done
+      exit 0
       ;;
     enter|shell)
       forward_agent=0
@@ -643,6 +704,8 @@ in
       forward_agent=0
       x11_mode=""
       wayland=0
+      mount_bashrc=0
+      mount_gitconfig=0
       sock_specs=()
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -650,6 +713,8 @@ in
           --x11)             x11_mode=trusted; shift ;;
           --x11-untrusted)   x11_mode=untrusted; shift ;;
           --wayland)         wayland=1; shift ;;
+          --mount-bashrc)    mount_bashrc=1; shift ;;
+          --mount-gitconfig) mount_gitconfig=1; shift ;;
           -S|--socket)
             if [ -z "''${2:-}" ]; then
               echo "develop: -S requires name=path" >&2; exit 2
@@ -742,6 +807,24 @@ in
               -o allow_other "$src" "$proj_dir"
           fi
         ' bash "$session_user" "$mount_id" "$uid" "$gid"
+
+      # Opt-in: copy the invoking host user's dotfiles read-only into
+      # the session HOME. Each is piped in as container root, chowned
+      # to the session user and locked to 0444. The framework ~/.bashrc
+      # already sources ~/.bashrc.user. Missing host sources are
+      # skipped silently. Use -i (stdin piped), not -it.
+      if [ "$mount_bashrc" -eq 1 ] && [ -f "$HOME/.bashrc" ]; then
+        # shellcheck disable=SC2016
+        pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
+          set -e; dest="/develop-home/$1/$2"; cat > "$dest"; chown "$3:$4" "$dest"; chmod 0444 "$dest"
+        ' bash "$session_user" ".bashrc.user" "$uid" "$gid" < "$HOME/.bashrc"
+      fi
+      if [ "$mount_gitconfig" -eq 1 ] && [ -f "$HOME/.gitconfig" ]; then
+        # shellcheck disable=SC2016
+        pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
+          set -e; dest="/develop-home/$1/$2"; cat > "$dest"; chown "$3:$4" "$dest"; chmod 0444 "$dest"
+        ' bash "$session_user" ".gitconfig" "$uid" "$gid" < "$HOME/.gitconfig"
+      fi
 
       home_dir="/develop-home/$session_user"
       proj_dir="$home_dir/dev"
@@ -1068,6 +1151,14 @@ in
                                 path is /run/sockets/<ns>/<name>; no
                                 env is auto-set (do it in your shell).
 
+  develop-only flags:
+    --mount-bashrc              copy the host \$HOME/.bashrc into the
+                                session HOME as ~/.bashrc.user (0444),
+                                sourced by the framework ~/.bashrc.
+    --mount-gitconfig           copy the host \$HOME/.gitconfig into the
+                                session HOME (0444). Both skip silently
+                                if the host file is absent.
+
   env:
     NAME             container name              (default $DEFAULT_NAME)
     STATE_DIR        host state directory        (default \$XDG_STATE_HOME/nix-dev-container/\$NAME)
@@ -1085,6 +1176,9 @@ in
     NIX_STORE_LOWER  source for the /nix/store mount (default $NIX_STORE_LOWER)
     NIX_DAEMON_SOCKET host nix-daemon socket for host-daemon mode
                        (default $NIX_DAEMON_SOCKET)
+    NIXCT_IDLE_TIMEOUT idle-stop timeout in seconds (build default: $BUILT_IDLE_TIMEOUT,
+                       0 = disabled). When > 0 the container auto-stops
+                       after that many seconds with no active develop session.
   EOF
       exit 2
       ;;
