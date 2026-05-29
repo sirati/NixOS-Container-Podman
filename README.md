@@ -122,6 +122,87 @@ nix run .#testdaemon.enter
 nix run .#testdaemon.develop -- ./my-project
 ```
 
+## `nixct` (installable package + NixOS module)
+
+`nixct` is a ready-to-install variant of this framework that ships the `nixct`
+command. It is built **host-daemon** and **develop-only**: the host `/nix/store`
+is mounted read-only and all builds go to the host nix-daemon, and it keeps **no
+permanent state** — the overlay upper/work live on tmpfs under
+`$XDG_RUNTIME_DIR`, so nothing survives a reboot. There is **no dev user**; the
+only entry point is `nixct develop`, which spins up an ephemeral per-session
+user. Your project is bind-mounted at `~/dev`, with a separate writable HOME
+carrying a framework `~/.bashrc` that enables direnv.
+
+### Installing
+
+From a NixOS system flake, add this flake as an input and either drop the
+package in `environment.systemPackages`:
+
+```nix
+inputs.nix-dev-container.url = "github:.../nix-dev-container";
+
+# in your configuration:
+environment.systemPackages = [
+  inputs.nix-dev-container.packages.x86_64-linux.nixct
+];
+```
+
+or — preferred, since it is configurable — import the module and enable it:
+
+```nix
+imports = [ inputs.nix-dev-container.nixosModules.nixct ];
+
+programs.nixct = {
+  enable = true;
+  idleTimeoutSeconds = 600;   # stop after 10 min idle; 0 disables
+  gpu.enable = true;          # service runs `nixct up --gpu --opengl`
+  gpu.hostHasToolkit = true;  # use host nvidia-container-toolkit (CDI)
+  # service.enable = true;    # keep it up for the login session instead
+};
+```
+
+The `programs.nixct` options:
+
+- `enable` — install the `nixct` binary system-wide.
+- `name` — container name (default `nixct`).
+- `idleTimeoutSeconds` — stop the container after this many seconds with no
+  active `nixct develop` session (default `600`; `0` disables; ignored when
+  `service.enable = true`).
+- `gpu.enable` — GPU/OpenGL passthrough (the user service runs
+  `nixct up --gpu --opengl`).
+- `gpu.hostHasToolkit` — use the host's nvidia-container-toolkit (CDI) for
+  `--gpu`.
+- `service.enable` — run a per-user systemd service that starts nixct on login
+  and keeps it up (disables idle shutdown).
+- `package` — the built nixct package; defaults to one built from the options
+  above.
+
+### Lifecycle
+
+The container auto-starts on the first `nixct` call. By default it auto-stops
+after `idleTimeoutSeconds` once there is no active `nixct develop` session;
+override at runtime with the `NIXCT_IDLE_TIMEOUT` env var. With
+`programs.nixct.service.enable = true` a per-user `systemd --user` service
+(`Type=oneshot`, `RemainAfterExit`) brings it up on login and keeps it running
+for the login session, disabling idle shutdown.
+
+### Dotfile mounts
+
+`nixct develop` can pull in a couple of host dotfiles, both opt-in:
+
+- `--mount-bashrc` copies the host `~/.bashrc` into the session as read-only
+  `~/.bashrc.user`, which the framework `~/.bashrc` sources (it always sets up
+  direnv regardless).
+- `--mount-gitconfig` copies the host `~/.gitconfig` in read-only.
+
+Both skip silently if the host file is absent.
+
+### Usage
+
+```sh
+nixct develop ~/some/project
+```
+
 ## Portable tarball
 
 `nix build .#<container>.portable` produces a **self-contained tarball** that
