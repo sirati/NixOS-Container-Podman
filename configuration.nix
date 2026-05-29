@@ -22,15 +22,15 @@
 
   security.sudo.wheelNeedsPassword = false;
 
+  # bindfs / socat / fuse3 are provided by the framework module (they're
+  # load-bearing for the develop subcommand in any container).
   environment.systemPackages = with pkgs; [
     bashInteractive
-    bindfs        # uid-remap fuse mount used by /home/dev-<id>
     coreutils
     curl
     firefox       # wayland / x11 forwarding smoke test
     git
     hello         # smoke-test target for `nix run nixpkgs#hello`
-    socat         # used by the inner watchdog + socket-proxy units
     vim
   ];
   # xauth is pulled into the closure via shellInit below (direct
@@ -70,109 +70,9 @@
     unset _gpu_libdir
   '';
 
-  # Per-develop-session watchdog. Spawned by the develop subcommand once per
-  # session-scope; blocks until session-<mount_id>.scope becomes inactive
-  # (i.e. every process the session-user started, including reparented
-  # daemons, has exited), then unmounts the per-session bindfs mounts,
-  # deletes the session user, and notifies the outer host watchdog so it
-  # can drop the host-side bind.
-  environment.etc."nix-dev-container/inner-watchdog.sh" = {
-    mode = "0555";
-    text = ''
-      #!${pkgs.bashInteractive}/bin/bash
-      # args: <mount_id> <session_user>
-      set -u
-      PATH=/run/current-system/sw/bin:/run/wrappers/bin
-
-      mount_id=$1
-      session_user=$2
-      scope="session-''${mount_id}.scope"
-      home_dir="/develop-home/''${session_user}"
-      socket_dir="/run/sockets/''${mount_id}"
-
-      # Stage 1: wait for the scope to actually come into existence.
-      # The watchdog is started before the develop subcommand creates the
-      # scope, so without this wait `is-active` would return inactive
-      # immediately and we'd tear down before the user ever got a shell.
-      for _ in $(seq 1 120); do
-        state=$(systemctl is-active "$scope" 2>/dev/null || true)
-        case "$state" in active|activating|reloading) break ;; esac
-        sleep 0.5
-      done
-
-      # Stage 2: wait for the scope to become inactive (= every process,
-      # including reparented daemons, has exited).
-      while systemctl is-active --quiet "$scope" 2>/dev/null; do
-        sleep 2
-      done
-      # Settle period in case systemd is mid-tear-down.
-      sleep 1
-
-      # The project is bind-mounted at <home>/dev; the home itself is a
-      # real per-session dir holding home-level files (.bashrc, .nixct,
-      # nix profile state). Unmount the project bind FIRST, then wipe the
-      # home tree - but only once the bind is truly gone, so `rm -rf` can
-      # never recurse into the host's project files.
-      proj_dir="$home_dir/dev"
-      if mountpoint -q -- "$proj_dir"; then
-        fusermount3 -u -- "$proj_dir" 2>/dev/null \
-          || umount -- "$proj_dir" 2>/dev/null || true
-      fi
-      if mountpoint -q -- "$proj_dir"; then
-        # Bind still up - don't risk rm -rf into host files.
-        rmdir -- "$proj_dir" 2>/dev/null || true
-      else
-        rm -rf -- "$home_dir" 2>/dev/null || true
-      fi
-
-      # Forwarded-socket proxies (socat units) are killed by their
-      # BindsTo=$scope; just clean up the leftover socket files.
-      rm -rf -- "$socket_dir" 2>/dev/null || true
-
-      userdel -- "$session_user" 2>/dev/null || true
-      groupdel -- "$session_user" 2>/dev/null || true
-
-      # Notify the per-session host watchdog. The socket path is bound to
-      # this mount_id, so we don't pass it as data - the outer watchdog
-      # knows by virtue of WHICH socket received the connection what to
-      # tear down. A compromised in-container watchdog can only ask for
-      # its OWN session's teardown.
-      sock="/var/host-watchdog/''${mount_id}/sock"
-      if [ -S "$sock" ]; then
-        : | socat - "UNIX-CONNECT:$sock" 2>/dev/null || true
-      fi
-    '';
-  };
-
-
-  # Container directory layout for develop sessions:
-  #   /hostmnts                - bind target for host paths. Owned by the
-  #                              container root (= host sirati under the
-  #                              default rootless mapping); mode 0700 on the
-  #                              host source so session users in the
-  #                              container can never list / enumerate it.
-  #                              They only see /develop-home/<user>, the
-  #                              FUSE remap of their own subpath.
-  #   /develop-home/<user>     - per-session bindfs view of /hostmnts/<id>
-  #                              with the session-user uid mapped in.
-  #   /run/agents/<id>         - per-session bindfs view of an agent-socket
-  #                              dir (if -A was passed).
-  #
-  # /hostmnts itself is created by the run script as a 0700 dir on the host
-  # before bind-mounting; we don't redeclare it via tmpfiles because that
-  # would chmod the bind source on every boot.
-  #
-  # /develop-home and /run/agents are 0711: traversal-only for non-root.
-  # That lets a session user `cd /develop-home/<own_user>` (because they
-  # only need execute on the parent) but blocks `ls /develop-home` (no
-  # read), so they can't enumerate other sessions' usernames. The bindfs
-  # mounts they each get below additionally strip group/other perms, so
-  # even if a session user guesses another session's username they can't
-  # read into the directory.
-  systemd.tmpfiles.rules = [
-    "d /develop-home 0711 root root -"
-    "d /run/sockets  0711 root root -"
-  ];
+  # The develop-session watchdog, the /develop-home + /run/sockets tmpfiles,
+  # and bindfs/socat/fuse3 now live in the framework module
+  # (nix/container-module.nix) so every container supports `develop`.
 
   networking.hostName = lib.mkDefault "nixct";
 }
