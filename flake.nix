@@ -103,6 +103,9 @@
         , gpu ? { }
         , keepId ? { }
         , nixStore ? { }
+        , runName ? "nix-dev-container"
+        , idleTimeout ? 0
+        , stateDirLine ? null
         }:
         let
           # Unpack the structured options into the flat names the rest of
@@ -201,7 +204,7 @@
           };
 
           run = pkgs.writeShellApplication {
-            name = "nix-dev-container";
+            name = runName;
             runtimeInputs = with pkgs; [
               # Existing tools.
               podman crun coreutils util-linux fuse-overlayfs gnused xauth
@@ -217,13 +220,13 @@
             # Script body extracted to nix/scripts/run.nix. Same text body
             # drives both NixOS and portable tarball targets; the `tools`
             # attrset carries the path resolution policy.
-            text = import ./nix/scripts/run.nix {
-              inherit tools rootfs shellUser name
+            text = import ./nix/scripts/run.nix ({
+              inherit tools rootfs shellUser name idleTimeout
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
                       nixStoreMode hostStore daemonSocket;
               hostWatchdogPath = "${hostWatchdogScript}";
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
-            };
+            } // nixpkgs.lib.optionalAttrs (stateDirLine != null) { inherit stateDirLine; });
           };
           # Per-container subcommand packages. Each is a derivation named for
           # the subcommand with a single bin/<name> binary, so
@@ -233,7 +236,7 @@
             name = subcommand;
             runtimeInputs = [ ];
             bashOptions = [ ];
-            text = ''exec ${run}/bin/nix-dev-container ${subcommand} "$@"'';
+            text = ''exec ${run}/bin/${runName} ${subcommand} "$@"'';
           };
 
           # Plain attrset of derivations; wrap with lib.recurseIntoAttrs at
@@ -312,6 +315,29 @@
         nixStore.mode = "host-daemon";
       };
 
+      # Thin wrapper producing a host-daemon, develop-only, tmpfs-state,
+      # idle-stopping container named `nixct`. Entry is `nixct develop`;
+      # there is no dev user (shellUser = "root"). State lives on tmpfs
+      # (XDG_RUNTIME_DIR) so the overlay upper/work are ephemeral.
+      mkNixct =
+        { name ? "nixct"
+        , idleTimeout ? 600          # seconds; 0 disables idle shutdown
+        , gpuHasToolkit ? false      # CDI via host nvidia-container-toolkit
+        }:
+        mkContainer {
+          inherit name idleTimeout;
+          modules = [ ./nix/nixct-system.nix ];
+          shellUser = "root";        # no dev user; entry is `nixct develop`
+          runName = "nixct";
+          nixStore.mode = "host-daemon";
+          gpu.hostHasToolkit = gpuHasToolkit;
+          # No permanent state: put STATE_DIR on tmpfs (XDG_RUNTIME_DIR), so
+          # upper/work are ephemeral. $-refs are literal bash for run.nix.
+          stateDirLine = "STATE_DIR=\${STATE_DIR:-\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixct/$NAME}";
+        };
+
+      nixctInstance = mkNixct { };
+
       nvidia = mkContainer {
         modules = [ ./configuration-nvidia.nix ];
         shellUser = "dev";
@@ -355,7 +381,7 @@
       #       packages.x86_64-linux.myct = ct.packages;
       #       # `nix run .#myct.enter`, `.#myct.boot`, `.#myct.purge`, ...
       #     };
-      lib.${system} = { inherit mkContainer; };
+      lib.${system} = { inherit mkContainer mkNixct; };
 
       # Flat outputs (validated by nix flake check). These all resolve to a
       # derivation; running them invokes nix-dev-container with the matching
@@ -365,6 +391,8 @@
         inherit (example.packages)
           up down stop enter shell develop exec boot logs status purge;
         default = example.run;
+
+        nixct = nixctInstance.run;
 
         # Standalone host-readiness probe. Same script the portable
         # tarball ships under bin/check-host-compat, just without the
@@ -409,6 +437,11 @@
           rootfsSquashfs = nixctNvidia.rootfsSquashfs;
           portable       = nixctNvidia.portable;
         };
+        nixct         = nixctInstance.packages // {
+          rootfsFolder   = nixctInstance.rootfsFolder;
+          rootfsSquashfs = nixctInstance.rootfsSquashfs;
+          portable       = nixctInstance.portable;
+        };
       };
 
       apps.${system}.default = {
@@ -421,5 +454,8 @@
       };
 
       nixosConfigurations.example = example.nixosSystem;
+
+      nixosModules.nixct = import ./nix/nixos-module.nix { inherit mkNixct; };
+      nixosModules.default = self.nixosModules.nixct;
     };
 }
