@@ -40,48 +40,96 @@
       # symlink (so Nix sees the closure as live for GC) and made available
       # inside the container at runtime by overlay-mounting the host's
       # /nix/store - see the run script.
+      # mkContainer options are grouped into structured sub-attrsets so
+      # each concern (portable packaging, gpu, keep-id, nix-store policy)
+      # stays self-documenting and independently overridable. Every
+      # sub-attrset and field is optional; defaults reproduce the old
+      # flat-argument behavior.
+      #
+      #   portable.format         "squashfs" (default) | "folder" | "both"
+      #                           Portable-tarball layout. squashfs is the
+      #                           smallest but needs squashfuse on the host;
+      #                           folder ships plain files; both ships each
+      #                           and the run script picks at up time.
+      #
+      #   gpu.hostHasToolkit      false (default) | true
+      #                           When true, `up --gpu` uses the host's
+      #                           nvidia-container-toolkit (CDI):
+      #                           `--device nvidia.com/gpu=all`. When false,
+      #                           --gpu falls back to manual /dev/nvidia* +
+      #                           /run/opengl-driver binds. Same result;
+      #                           CDI is just cleaner / upstream-supported.
+      #
+      #   keepId.enable           false (default) | true
+      #                           Run with --userns=keep-id:uid=<U>,gid=<G>
+      #                           so $shellUser maps 1:1 to the invoking
+      #                           host user (Wayland/X11 without world-
+      #                           writable sockets). Cost: container root
+      #                           maps to host first-subuid, so the rootfs
+      #                           upper needs an in-place ownership
+      #                           migration at up time.
+      #   keepId.uid / keepId.gid In-container uid/gid the keep-id mapping
+      #                           pins to the invoking user (default
+      #                           1000/100; must match
+      #                           configuration.nix users.users.<shellUser>).
+      #
+      #   nixStore.mode           "overlay" (default) | "passthrough" | "ro"
+      #                             | "host-daemon"
+      #                           How the container's /nix/store is provided:
+      #                             overlay     host store RO + writable
+      #                                         fuse-overlayfs upper.
+      #                             passthrough host store, writable in place.
+      #                             ro          host store, read-only.
+      #                             host-daemon host store RO AND the host
+      #                                         nix-daemon socket bound in;
+      #                                         the container runs no daemon
+      #                                         and has no nixbld users -
+      #                                         every build/query is delegated
+      #                                         to the host daemon. Requires
+      #                                         the host's store prefix to be
+      #                                         /nix/store and the container's
+      #                                         closure to be realised there.
+      #   nixStore.hostStore      Source path for the /nix/store mount
+      #                           (default /nix/store). Override for a
+      #                           relocated host store (e.g. nix-portable).
+      #   nixStore.daemonSocket   Host nix-daemon socket bound in for
+      #                           host-daemon mode (default
+      #                           /nix/var/nix/daemon-socket/socket).
       mkContainer =
         { modules ? [ ]
         , shellUser ? "root"
         , name ? "nixct"
-          # Format of the portable tarball this mkContainer call
-          # produces under the `portable` attr. See nix/portable-tarball.nix
-          # for the trade-offs. Acceptable values:
-          #   "squashfs" - default; smallest tarball; needs squashfuse on host
-          #   "folder"   - rootfs as plain files; no squashfuse needed
-          #   "both"     - ship both; dispatch picks at up time
-        , portableFormat ? "squashfs"
-          # When true, `nix run .#<name>.up -- --gpu` uses the host's
-          # nvidia-container-toolkit (CDI) integration:
-          #   podman run --device nvidia.com/gpu=all ...
-          # When false (the default), --gpu falls back to manual device
-          # binds (/dev/nvidia* + /run/opengl-driver bind). Both end with
-          # the same set of devices/libs in the container; CDI is just
-          # cleaner / supported upstream.
-        , hostHasNvidiaContainerToolkit ? false
-          # When true, the container runs with --userns=keep-id:uid=<U>,
-          # gid=<G> so that container's $shellUser (uid U, gid G) maps
-          # 1:1 to the host's invoking user. This is what makes Wayland /
-          # X11 work without making the host's sockets world-writable.
-          # Cost: container uid 0 (root) now maps to host first-subuid
-          # (e.g. 100000); the rootfs upper layer needs an ownership
-          # migration which the run script does in-place at `up` time
-          # (with $STATE_DIR/.keepid-migrated as the idempotency marker).
-        , useKeepId ? false
-          # In-container uid/gid the keep-id mapping pins to host's
-          # invoking user. Must match the user/group the rootfs activation
-          # creates (matches configuration.nix users.users.<shellUser>).
-        , keepIdUid ? 1000
-        , keepIdGid ? 100
+        , portable ? { }
+        , gpu ? { }
+        , keepId ? { }
+        , nixStore ? { }
         }:
         let
+          # Unpack the structured options into the flat names the rest of
+          # mkContainer / run.nix already use.
+          portableFormat              = portable.format or "squashfs";
+          hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
+          useKeepId                   = keepId.enable or false;
+          keepIdUid                   = keepId.uid or 1000;
+          keepIdGid                   = keepId.gid or 100;
+          nixStoreMode                = nixStore.mode or "overlay";
+          hostStore                   = nixStore.hostStore or "/nix/store";
+          daemonSocket                = nixStore.daemonSocket or "/nix/var/nix/daemon-socket/socket";
+          hostDaemon                  = nixStoreMode == "host-daemon";
+
           # Tool resolution attrset - full /nix/store paths for the NixOS
           # build. See nix/scripts/tools.nix for the contract.
           tools = (import ./nix/scripts/tools.nix).mkNixosTools pkgs;
 
           nixosSystem = nixpkgs.lib.nixosSystem {
             inherit system;
-            modules = [ ./nix/container-module.nix ] ++ modules;
+            modules = [
+              ./nix/container-module.nix
+              # Toggle the host-daemon NixOS profile (no in-container
+              # daemon / nixbld users, store = daemon) to match the
+              # selected nixStore.mode.
+              { nixDevContainer.hostDaemon.enable = hostDaemon; }
+            ] ++ modules;
           };
 
           toplevel = nixosSystem.config.system.build.toplevel;
@@ -171,7 +219,8 @@
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix {
               inherit tools rootfs shellUser name
-                      hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+                      hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
+                      nixStoreMode hostStore daemonSocket;
               hostWatchdogPath = "${hostWatchdogScript}";
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
             };
@@ -217,18 +266,23 @@
             inherit pkgs rootfsFolder;
           };
 
-          # Portable tarball.
-          portable = import ./nix/portable-tarball.nix {
+          # Portable tarball. Named distinctly from the `portable` function
+          # argument above: a `portable` let-binding would shadow the
+          # argument, so `portable.format` (read above for portableFormat)
+          # would point back here and recurse infinitely.
+          portableTarball = import ./nix/portable-tarball.nix {
             inherit pkgs name shellUser rootfsFolder rootfsSquashfs
-                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
+                    nixStoreMode hostStore daemonSocket;
             version = if self ? rev then self.rev else "dirty";
             format = portableFormat;
           };
         in
         {
           inherit nixosSystem toplevel rootfs
-                  rootfsFolder rootfsSquashfs portable
+                  rootfsFolder rootfsSquashfs
                   run packages;
+          portable = portableTarball;
         };
 
       example = mkContainer {
@@ -241,15 +295,29 @@
         # the child). Host-uid translation for Wayland / develop binds
         # will be handled per-volume via podman idmap (option 2) once
         # implemented.
-        useKeepId = false;
+        keepId.enable = false;
+      };
+
+      # Same base config but using the host's nix-daemon: /nix/store is
+      # mounted read-only and every build/query inside the container is
+      # delegated to the host daemon over its bind-mounted socket. No
+      # in-container daemon, no nixbld users. The container's closure must
+      # already be realised in the host's /nix/store (it is, since this
+      # builds against it). `nix run .#testdaemon.enter`, etc.
+      hostDaemonExample = mkContainer {
+        modules = [ ./configuration.nix ];
+        shellUser = "dev";
+        name = "testdaemon";
+        keepId.enable = false;
+        nixStore.mode = "host-daemon";
       };
 
       nvidia = mkContainer {
         modules = [ ./configuration-nvidia.nix ];
         shellUser = "dev";
         name = "testnvidia";
-        hostHasNvidiaContainerToolkit = false;
-        useKeepId = false;
+        gpu.hostHasToolkit = false;
+        keepId.enable = false;
       };
 
       # Production-ish nvidia dev container: host-matching driver
@@ -266,9 +334,9 @@
         modules = [ ./configuration-nixct-nvidia.nix ];
         shellUser = "dev";
         name = "nixct-nvidia";
-        hostHasNvidiaContainerToolkit = true;
-        useKeepId = false;
-        portableFormat = "folder";
+        gpu.hostHasToolkit = true;
+        keepId.enable = false;
+        portable.format = "folder";
       };
 
     in
@@ -325,6 +393,11 @@
           rootfsFolder   = example.rootfsFolder;
           rootfsSquashfs = example.rootfsSquashfs;
           portable       = example.portable;
+        };
+        testdaemon    = hostDaemonExample.packages // {
+          rootfsFolder   = hostDaemonExample.rootfsFolder;
+          rootfsSquashfs = hostDaemonExample.rootfsSquashfs;
+          portable       = hostDaemonExample.portable;
         };
         testnvidia    = nvidia.packages // {
           rootfsFolder   = nvidia.rootfsFolder;

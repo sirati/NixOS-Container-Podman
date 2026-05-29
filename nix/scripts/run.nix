@@ -1,6 +1,6 @@
-# Main nix-dev-container dispatcher. ~1340 lines of bash, factored
-# out of flake.nix so the same text can drive (a) the NixOS-host
-# writeShellApplication build and (b) the portable-tarball build.
+# Main nix-dev-container dispatcher, factored out of flake.nix so the
+# same text can drive (a) the NixOS-host writeShellApplication build and
+# (b) the portable-tarball build.
 #
 # Tool resolution comes through the `tools` attrset (see
 # nix/scripts/tools.nix): every reference to a named binary like bash,
@@ -10,6 +10,11 @@
 # their PATH-resolution behavior because they're either supplied via
 # writeShellApplication's runtimeInputs (NixOS) or by the host's
 # /usr/bin (portable, with a sane PATH set at script entry).
+#
+# The script body is assembled from cohesive bash fragments under
+# nix/scripts/lib/ (store, gpu, forwarding, watchdog) plus the container
+# lifecycle + dispatch kept here. Splitting keeps each concern editable
+# in isolation; everything is still emitted as one self-contained script.
 
 { tools
 , rootfs ? null
@@ -26,6 +31,20 @@
   # empty so podman uses whatever it's configured for (typically runc
   # or crun via /etc/containers/containers.conf on Debian/Fedora/Arch).
 , ociRuntimeFlag ? "--runtime ${tools.crun}"
+  # ----- /nix/store policy (build-time defaults) -----------------
+  # nixStoreMode : default NIX_STORE_MODE. One of overlay|passthrough|
+  #                ro|host-daemon. host-daemon is COUPLED to NixOS-module
+  #                config baked at build time (no in-container daemon /
+  #                nixbld users, store = daemon), so unlike the other
+  #                three it can't be toggled at runtime via NIX_STORE_MODE.
+  # hostStore    : default lowerdir/source for the /nix/store bind
+  #                (NIX_STORE_LOWER). Usually /nix/store; override for a
+  #                relocated host store (e.g. nix-portable).
+  # daemonSocket : host nix-daemon socket bound into the container in
+  #                host-daemon mode (NIX_DAEMON_SOCKET).
+, nixStoreMode ? "overlay"
+, hostStore ? "/nix/store"
+, daemonSocket ? "/nix/var/nix/daemon-socket/socket"
   # Mode-conditional snippets. Defaults are the NixOS-host behavior;
   # the portable-tarball target overrides these.
   #
@@ -43,6 +62,14 @@
 , mountLowerBody ? ":  # NixOS: rootfs is a static /nix/store path; nothing to mount."
 }:
 
+let
+  # Cohesive bash fragments. See the header of each file for its contract.
+  storeLib      = import ./lib/store.nix { };
+  gpuFns        = import ./lib/gpu.nix { };
+  watchdogFns   = import ./lib/watchdog.nix { inherit hostWatchdogPath; };
+  forwardingFns = import ./lib/forwarding.nix { inherit tools; };
+in
+
 ''
   # ----------------------------------------------------------------
   # Design (rootless, persistent):
@@ -57,12 +84,11 @@
   #         upper = $STATE_DIR/upper
   #         work  = $STATE_DIR/work
   #         merged= $STATE_DIR/merged
-  #       Nix-store overlay (fuse-overlayfs - native overlay's
-  #         user-ns chmod restrictions break nix's fchmodat2):
-  #         lower = /nix/store (host store, RO)
-  #         upper = $STATE_DIR/nix-store-upper
-  #         work  = $STATE_DIR/nix-store-work
-  #         merged= $STATE_DIR/merged/nix/store
+  #       Nix-store mount (mode-dependent; see nix/scripts/lib/store.nix):
+  #         overlay      = fuse-overlayfs (lower /nix/store + rw upper)
+  #         passthrough  = bind host /nix/store rw
+  #         ro           = bind host /nix/store ro
+  #         host-daemon  = bind host /nix/store ro + bind host daemon socket
   #
   #   - At up time we ALSO bind-mount $STATE_DIR/work-shared to
   #     itself and make it rshared, so the container's /work can
@@ -99,13 +125,32 @@
 
   NAME=''${NAME:-$DEFAULT_NAME}
   ${stateDirLine}
-  NIX_STORE_MODE=''${NIX_STORE_MODE:-overlay}
 
-  # Lowerdir for the /nix/store fuse-overlayfs. NixOS-host: the host's
-  # real /nix/store. Portable: the rootfs-embedded /nix/store (set by
-  # mount_rootfs_lower). The :=-assignment leaves a portable override
-  # untouched.
-  : "''${NIX_STORE_LOWER:=/nix/store}"
+  # Build-time default store mode. Overridable via env EXCEPT that
+  # host-daemon is coupled to NixOS-module config baked at build time
+  # (no in-container daemon / nixbld users), so it can't be switched
+  # on or off at runtime.
+  BUILT_NIX_STORE_MODE=${nixStoreMode}
+  NIX_STORE_MODE=''${NIX_STORE_MODE:-$BUILT_NIX_STORE_MODE}
+  if [ "$BUILT_NIX_STORE_MODE" = "host-daemon" ] && [ "$NIX_STORE_MODE" != "host-daemon" ]; then
+    echo "note: container was built for host-daemon mode; ignoring NIX_STORE_MODE=$NIX_STORE_MODE" >&2
+    NIX_STORE_MODE=host-daemon
+  fi
+  if [ "$BUILT_NIX_STORE_MODE" != "host-daemon" ] && [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+    echo "error: host-daemon mode requires building mkContainer with nixStore.mode = \"host-daemon\"" >&2
+    exit 2
+  fi
+
+  # Lowerdir/source for the /nix/store mount. NixOS-host: the host's
+  # real /nix/store (or a relocated store, e.g. nix-portable, via the
+  # build-time hostStore default or the NIX_STORE_LOWER env). Portable:
+  # the rootfs-embedded /nix/store (set by mount_rootfs_lower). The
+  # :=-assignment leaves an override untouched.
+  : "''${NIX_STORE_LOWER:=${hostStore}}"
+  # host-daemon: path to the host's nix-daemon socket. Bound into the
+  # container at /nix/var/nix/daemon-socket/socket. Override for a
+  # relocated daemon (e.g. nix-portable's socket).
+  : "''${NIX_DAEMON_SOCKET:=${daemonSocket}}"
 
   UPPER="$STATE_DIR/upper"
   WORK="$STATE_DIR/work"
@@ -193,165 +238,8 @@
     ${mountLowerBody}
   }
 
-  # Print one token per line for the /nix/store volume mount.
-  nix_store_mount_args() {
-    case "$NIX_STORE_MODE" in
-      overlay)
-        echo -v
-        echo "/nix/store:/nix/store:O,upperdir=$NIX_UPPER,workdir=$NIX_WORK"
-        ;;
-      passthrough)
-        echo -v
-        echo "/nix/store:/nix/store:rw"
-        ;;
-      ro)
-        echo -v
-        echo "/nix/store:/nix/store:ro"
-        ;;
-      *)
-        echo "unknown NIX_STORE_MODE: $NIX_STORE_MODE" >&2
-        exit 2
-        ;;
-    esac
-  }
-
-  # One token per line for any lxcfs proc/sys files that exist.
-  lxcfs_mount_args() {
-    if [ ! -d /var/lib/lxcfs/proc ]; then
-      return 0
-    fi
-    local f
-    for f in cpuinfo meminfo stat uptime swaps diskstats loadavg slabinfo; do
-      if [ -e "/var/lib/lxcfs/proc/$f" ]; then
-        echo -v
-        echo "/var/lib/lxcfs/proc/$f:/proc/$f:ro"
-      fi
-    done
-    if [ -e /var/lib/lxcfs/sys/devices/system/cpu/online ]; then
-      echo -v
-      echo "/var/lib/lxcfs/sys/devices/system/cpu/online:/sys/devices/system/cpu/online:ro"
-    fi
-  }
-
   # ----- GPU / OpenGL passthrough -------------------------------
-
-  # accelerator_flags <need_cuda> <need_opengl>: print podman
-  # flags for nvidia GPU and/or OpenGL passthrough, one token
-  # per line. Handles four combinations:
-  #
-  # CUDA via nvidia-container-toolkit (HOST_HAS_NVCT=1):
-  #   `--device nvidia.com/gpu=all`. The toolkit injects all
-  #   /dev/nvidia* nodes and the matching libcuda.so userland.
-  #   Cross-distro and recommended; works on Debian, Fedora,
-  #   Arch, openSUSE, NixOS, etc.
-  #
-  # CUDA without toolkit:
-  #   Bind every /dev/nvidia* node, plus the host directory
-  #   containing libcuda.so*. Probed in order:
-  #     /run/opengl-driver/lib     - NixOS convention
-  #     /usr/lib/x86_64-linux-gnu  - Debian/Ubuntu
-  #     /usr/lib64                 - Fedora/RHEL/openSUSE
-  #     /usr/lib                   - Arch and others
-  #
-  # OpenGL:
-  #   Bind every /dev/dri/* node (works for Intel / AMD / Mesa
-  #   as well as nvidia's GL). Plus the host directory with
-  #   libGL.so*, probed the same way.
-  #
-  # libcuda and libGL live in the same directory on every
-  # distro I know of, so when both are requested we bind that
-  # dir once. NixOS: /run/opengl-driver gets bound at the same
-  # path. Other distros: bound at /opt/host-graphics-libs;
-  # the container's shellInit adds it to LD_LIBRARY_PATH.
-  accelerator_flags() {
-    local need_cuda=$1 need_opengl=$2
-    [ "$need_cuda" = "1" ] || [ "$need_opengl" = "1" ] || return 0
-
-    local found=0
-
-    # CUDA via CDI - injects libcuda + /dev/nvidia* itself.
-    if [ "$need_cuda" = "1" ] && [ "$HOST_HAS_NVCT" = "1" ]; then
-      echo --device
-      echo nvidia.com/gpu=all
-      found=1
-      # CDI doesn't help with OpenGL / Mesa; fall through to
-      # the OpenGL section below if also asked.
-    fi
-
-    # CUDA without toolkit: manual /dev/nvidia* binds.
-    if [ "$need_cuda" = "1" ] && [ "$HOST_HAS_NVCT" != "1" ]; then
-      local d
-      for d in /dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 \
-               /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools \
-               /dev/nvidia-modeset; do
-        if [ -e "$d" ]; then
-          echo --device
-          echo "$d"
-          found=1
-        fi
-      done
-    fi
-
-    # OpenGL: /dev/dri/* binds.
-    if [ "$need_opengl" = "1" ]; then
-      local d
-      for d in /dev/dri/card0 /dev/dri/card1 /dev/dri/card2 \
-               /dev/dri/renderD128 /dev/dri/renderD129 \
-               /dev/dri/renderD130; do
-        if [ -e "$d" ]; then
-          echo --device
-          echo "$d"
-          found=1
-        fi
-      done
-    fi
-
-    # Find userland libs we still need to provide:
-    #   - libcuda.so* if need_cuda and not using toolkit
-    #   - libGL.so* if need_opengl (toolkit doesn't ship GL libs)
-    local need_libdir=0
-    [ "$need_cuda" = "1" ] && [ "$HOST_HAS_NVCT" != "1" ] && need_libdir=1
-    [ "$need_opengl" = "1" ] && need_libdir=1
-    if [ "$need_libdir" = "0" ]; then return 0; fi
-
-    local lib_dir="" d
-    for d in /run/opengl-driver/lib \
-             /usr/lib/x86_64-linux-gnu \
-             /usr/lib64 \
-             /usr/lib; do
-      [ -d "$d" ] || continue
-      if   [ "$need_cuda" = "1" ] && [ "$HOST_HAS_NVCT" != "1" ] \
-           && ls -- "$d"/libcuda.so* >/dev/null 2>&1; then
-        lib_dir=$d; break
-      elif [ "$need_opengl" = "1" ] \
-           && ls -- "$d"/libGL.so* >/dev/null 2>&1; then
-        lib_dir=$d; break
-      fi
-    done
-    if [ -n "$lib_dir" ]; then
-      case "$lib_dir" in
-        /run/opengl-driver/lib)
-          echo -v
-          echo "/run/opengl-driver:/run/opengl-driver:ro"
-          ;;
-        *)
-          echo -v
-          echo "$lib_dir:/opt/host-graphics-libs:ro"
-          ;;
-      esac
-    fi
-    # found stays informational; the dev shell still works
-    # without these libs if e.g. only /dev/dri was requested
-    # and you only need a software renderer.
-    : "$found"
-  }
-
-  # Back-compat shim: gpu_flags / opengl_flags wrap the combined
-  # helper above. ENABLE_GPU / ENABLE_OPENGL are exported by
-  # the up/boot dispatch.
-  gpu_flags() {
-    accelerator_flags "$1" "''${ENABLE_OPENGL:-0}"
-  }
+  ${gpuFns}
 
   # ----- keep-id ownership migration ----------------------------
 
@@ -396,51 +284,7 @@
   # ----- host watchdog -------------------------------------------
 
   HOST_WATCHDOG_DIR="$STATE_DIR/host-watchdog"
-
-  # Per-session host watchdog. One process per mount_id; listens
-  # on $HOST_WATCHDOG_DIR/<mount_id>/sock; exits after teardown.
-  # Spawned by develop, only after the in-container side has
-  # set things up. Idempotent: skipped if already running for
-  # that mount_id.
-  session_watchdog_running() {
-    local mount_id=$1
-    local pid_file="$HOST_WATCHDOG_DIR/$mount_id/pid"
-    [ -f "$pid_file" ] \
-      && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null
-  }
-
-  start_session_watchdog() {
-    local mount_id=$1
-    if session_watchdog_running "$mount_id"; then return 0; fi
-    mkdir -p "$HOST_WATCHDOG_DIR/$mount_id"
-    nohup ${hostWatchdogPath} "$STATE_DIR" "$mount_id" \
-      </dev/null \
-      >"$HOST_WATCHDOG_DIR/$mount_id/log" 2>&1 &
-    disown
-    echo $! > "$HOST_WATCHDOG_DIR/$mount_id/pid"
-    # Brief wait for the socket to come up.
-    local _i
-    for _i in $(seq 1 20); do
-      [ -S "$HOST_WATCHDOG_DIR/$mount_id/sock" ] && return 0
-      sleep 0.1
-    done
-    return 0
-  }
-
-  stop_all_session_watchdogs() {
-    if [ ! -d "$HOST_WATCHDOG_DIR" ]; then return 0; fi
-    local d
-    for d in "$HOST_WATCHDOG_DIR"/*/; do
-      [ -d "$d" ] || continue
-      local pid_file="$d/pid"
-      if [ -f "$pid_file" ]; then
-        kill "$(cat "$pid_file")" 2>/dev/null || true
-        rm -f "$pid_file"
-      fi
-      rm -f "$d/sock"
-      rmdir "$d" 2>/dev/null || true
-    done
-  }
+  ${watchdogFns}
 
   # ----- podman wrapper + container state -----------------------
 
@@ -501,6 +345,7 @@
     migrate_to_keepid
     export USE_KEEP_ID KEEPID_UID KEEPID_GID
     export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK NIX_STORE_LOWER
+    export NIX_DAEMON_SOCKET
     export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS
     export HOST_WATCHDOG_DIR
     export LXCFS_FLAGS
@@ -518,24 +363,8 @@
     podman unshare "${tools.bash}" <<'INNER'
   set -euo pipefail
 
-  # Re-mount overlays (idempotent: unmount any stale ones first).
-  fusermount3 -u "$MERGED/nix/store" 2>/dev/null || umount "$MERGED/nix/store" 2>/dev/null || true
-  umount "$MERGED" 2>/dev/null || true
-
-  mount -t overlay overlay \
-    -o "lowerdir=$ROOTFS,upperdir=$UPPER,workdir=$WORK,userxattr" \
-    "$MERGED"
-
-  case "$NIX_STORE_MODE" in
-    overlay)
-      fuse-overlayfs \
-        -o "lowerdir=$NIX_STORE_LOWER,upperdir=$NIX_UPPER,workdir=$NIX_WORK" \
-        "$MERGED/nix/store"
-      ;;
-    passthrough) mount --bind "$NIX_STORE_LOWER" "$MERGED/nix/store" ;;
-    ro)          mount --bind -o ro "$NIX_STORE_LOWER" "$MERGED/nix/store" ;;
-    *) echo "bad NIX_STORE_MODE: $NIX_STORE_MODE" >&2; exit 2 ;;
-  esac
+  # Mount the rootfs overlay + /nix/store (per NIX_STORE_MODE).
+  ${storeLib.mountAll}
 
   # WORK_SHARED and SOCKET_MOUNTS must be shared mounts so
   # host-side bind-mounts under them propagate into the
@@ -630,273 +459,8 @@
     ENABLE_GPU=0 start_persistent
   }
 
-  # bind_workdir <host-path> <mount-id>: per-develop bind under
-  # $WORK_SHARED/<mount-id>. Args go through env vars, never
-  # interpolated into shell strings, to avoid injection from
-  # attacker-controlled directory names.
-  bind_workdir() {
-    _SRC=$1 _DST="$WORK_SHARED/$2" \
-      podman unshare "${tools.bash}" -c '
-      set -euo pipefail
-      mkdir -p -- "$_DST"
-      if ! mountpoint -q -- "$_DST"; then
-        mount --bind -- "$_SRC" "$_DST"
-      fi
-    '
-  }
-
-  # bind_socket <namespace> <name> <host-sock>: bind a host
-  # socket at $WORK_SHARED/.sockets/<ns>/<name>. The in-container
-  # socat proxy (spawn_socket_proxy) then exposes it at
-  # /run/sockets/<ns>/<name> with the session-user uid. Use for
-  # protocols that do NOT need SCM_RIGHTS fd-passing
-  # (ssh-agent, dbus session bus, etc.). Args go through env
-  # vars to avoid injection.
-  bind_socket() {
-    _SRC=$3 _DST="$WORK_SHARED/.sockets/$1/$2" \
-      podman unshare "${tools.bash}" -c '
-      set -euo pipefail
-      mkdir -p -- "$(dirname -- "$_DST")"
-      [ -e "$_DST" ] || : > "$_DST"
-      if ! mountpoint -q -- "$_DST"; then
-        mount --bind -- "$_SRC" "$_DST"
-      fi
-    '
-  }
-
-  # bind_raw_socket <namespace> <name> <host-sock>: bind a host
-  # socket DIRECTLY at $SOCKET_MOUNTS/<ns>/<name>, no socat
-  # proxy. The container sees it at /var/socket-mounts/<ns>/<name>;
-  # session users can connect because /var/socket-mounts is
-  # 0711 (traverse) and the socket file's host perms gate
-  # access (typically 0755 for wayland, 0777 for X11). Use for
-  # protocols that REQUIRE SCM_RIGHTS fd-passing (Wayland, X11).
-  bind_raw_socket() {
-    _SRC=$3 _DST="$SOCKET_MOUNTS/$1/$2" \
-      podman unshare "${tools.bash}" -c '
-      set -euo pipefail
-      mkdir -p -- "$(dirname -- "$_DST")"
-      chmod 0711 -- "$(dirname -- "$_DST")"
-      [ -e "$_DST" ] || : > "$_DST"
-      if ! mountpoint -q -- "$_DST"; then
-        mount --bind -- "$_SRC" "$_DST"
-      fi
-    '
-  }
-
-  # spawn_socket_proxy <namespace> <name> <uid> <gid> [bind_to]:
-  # ensure a socat proxy is running inside the container that
-  # listens on /run/sockets/<ns>/<name> owned by the session
-  # user, forwarding connections to /hostmnts/.sockets/<ns>/<name>.
-  #
-  # We need a proxy (not bindfs) because FUSE filesystems can't
-  # route AF_UNIX connect() syscalls - bindfs would show the
-  # socket inode but `connect` to it returns ECONNREFUSED.
-  #
-  # If <bind_to> is given (e.g. session-<id>.scope), socat dies
-  # with that unit via systemd BindsTo. For enter-style forwards
-  # there's no scope; socat persists until container down.
-  spawn_socket_proxy() {
-    local ns=$1 name=$2 uid=$3 gid=$4 bind_to=''${5:-}
-    local unit="socket-proxy-''${ns}-''${name}.service"
-    # Idempotent: skip if already active.
-    if pm exec -u root "$NAME" \
-        /run/current-system/sw/bin/systemctl is-active --quiet \
-        "$unit" 2>/dev/null; then
-      return 0
-    fi
-    local args=(
-      --unit="$unit" --collect --quiet
-      --setenv=NS="$ns" --setenv=NAME="$name"
-      --setenv=UID_="$uid" --setenv=GID_="$gid"
-    )
-    if [ -n "$bind_to" ]; then
-      args+=(
-        --property=BindsTo="$bind_to"
-        --property=After="$bind_to"
-      )
-    fi
-    # shellcheck disable=SC2016
-    pm exec -u root "$NAME" \
-      /run/current-system/sw/bin/systemd-run \
-        "''${args[@]}" \
-        --setenv=PATH=/run/current-system/sw/bin:/run/wrappers/bin \
-        /run/current-system/sw/bin/bash -c '
-          set -e
-          mkdir -p "/run/sockets/$NS"
-          chmod 0711 "/run/sockets/$NS"
-          rm -f "/run/sockets/$NS/$NAME"
-          exec socat \
-            UNIX-LISTEN:"/run/sockets/$NS/$NAME",fork,reuseaddr,user="$UID_",group="$GID_",mode=0600 \
-            UNIX-CONNECT:"/hostmnts/.sockets/$NS/$NAME"
-        ' >/dev/null
-  }
-
-  # ensure_xdg_runtime <uid> <gid>: create /run/user/<uid> owned
-  # by the session user, mode 0700. Many GUI apps (Firefox,
-  # Wayland clients, dbus libs) hard-require XDG_RUNTIME_DIR.
-  # We skip PAM/logind, so we have to mint this directory
-  # ourselves. Idempotent.
-  ensure_xdg_runtime() {
-    local uid=$1 gid=$2
-    # shellcheck disable=SC2016
-    pm exec -u root "$NAME" \
-      /run/current-system/sw/bin/bash -lc '
-        set -e
-        d="/run/user/$1"
-        mkdir -p "$d"
-        chown "$1:$2" "$d"
-        chmod 0700 "$d"
-      ' bash "$uid" "$gid" >/dev/null
-  }
-
-  # setup_x11 <mode> <ns> <uid> <gid> [<scope>]: orchestrate the
-  # forwarding side of X11. Echoes two lines on stdout for the
-  # caller: "DISPLAY=:<n>" and "XCOOKIE=<hex>". Returns 0 on
-  # success, 1 if X11 isn't available on the host.
-  #
-  # mode = "trusted":   use the host's existing cookie (like ssh -Y).
-  # mode = "untrusted": run `xauth generate` to mint a fresh
-  #                     SECURITY-extension-restricted cookie
-  #                     (like ssh -X). Requires the host's X
-  #                     server to support the SECURITY extension.
-  setup_x11() {
-    local mode=$1 ns=$2 uid=$3 gid=$4 scope=''${5:-}
-    if [ -z "''${DISPLAY:-}" ]; then
-      echo "--x11: \$DISPLAY is not set on the host" >&2
-      return 1
-    fi
-    local hd=''${DISPLAY#:}; hd=''${hd%.*}
-    local host_sock=/tmp/.X11-unix/X$hd
-    if [ ! -S "$host_sock" ]; then
-      echo "--x11: X11 socket not found at $host_sock" >&2
-      return 1
-    fi
-
-    # Get / generate the cookie.
-    local cookie
-    case "$mode" in
-      trusted)
-        cookie=$(xauth list "$DISPLAY" 2>/dev/null \
-                  | awk 'NR==1 {print $3}')
-        if [ -z "$cookie" ]; then
-          echo "--x11: no MIT-MAGIC-COOKIE for $DISPLAY in host xauth" >&2
-          return 1
-        fi
-        ;;
-      untrusted)
-        local tmp; tmp=$(mktemp --tmpdir nixct-xauth.XXXXXX)
-        chmod 600 "$tmp"
-        if ! xauth -f "$tmp" generate "$DISPLAY" . \
-                     untrusted timeout 0 2>/dev/null; then
-          rm -f "$tmp"
-          echo "--x11-untrusted: xauth generate failed (SECURITY extension missing?)" >&2
-          return 1
-        fi
-        cookie=$(xauth -f "$tmp" list "$DISPLAY" \
-                  | awk 'NR==1 {print $3}')
-        rm -f "$tmp"
-        ;;
-      *) echo "setup_x11: bad mode $mode" >&2; return 1 ;;
-    esac
-
-    # Forward the host socket DIRECTLY (no socat) - X11 uses
-    # SCM_RIGHTS fd-passing for SHM, DRI, etc.
-    bind_raw_socket "$ns" x11 "$host_sock"
-
-    # Inside the container: drop a /tmp/.X11-unix/X<uid> symlink
-    # so the conventional path resolves to the bound socket.
-    # We use the session uid as the display number to avoid
-    # collisions between concurrent sessions.
-    # shellcheck disable=SC2016
-    pm exec -u root "$NAME" \
-      /run/current-system/sw/bin/bash -lc '
-        set -e
-        mkdir -p /tmp/.X11-unix
-        chmod 1777 /tmp/.X11-unix
-        ln -sfn "/var/socket-mounts/$1/x11" "/tmp/.X11-unix/X$2"
-      ' bash "$ns" "$uid" >/dev/null
-
-    ensure_xdg_runtime "$uid" "$gid"
-    printf 'DISPLAY=:%s\n' "$uid"
-    printf 'XCOOKIE=%s\n' "$cookie"
-    printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid"
-  }
-
-  # setup_wayland <ns> <uid> <gid> [<scope>]: forward the
-  # Wayland compositor socket. Many clients (including Firefox)
-  # only accept WAYLAND_DISPLAY as a RELATIVE name and resolve
-  # it against XDG_RUNTIME_DIR. So we make
-  # /run/user/<uid>/wayland-0 a symlink to the proxied socket
-  # and emit XDG_RUNTIME_DIR + WAYLAND_DISPLAY=wayland-0.
-  setup_wayland() {
-    local ns=$1 uid=$2 gid=$3 scope=''${4:-}
-    local wd=''${WAYLAND_DISPLAY:-wayland-0}
-    local host_sock
-    case "$wd" in
-      /*) host_sock=$wd ;;
-      *)
-        if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
-          echo "--wayland: XDG_RUNTIME_DIR is not set on the host" >&2
-          return 1
-        fi
-        host_sock=$XDG_RUNTIME_DIR/$wd
-        ;;
-    esac
-    if [ ! -S "$host_sock" ]; then
-      echo "--wayland: Wayland socket not found at $host_sock" >&2
-      return 1
-    fi
-    # Forward the host socket DIRECTLY (no socat) - Wayland
-    # heavily uses SCM_RIGHTS fd-passing for shm pools,
-    # dma-buf imports, etc.
-    bind_raw_socket "$ns" wayland "$host_sock"
-
-    ensure_xdg_runtime "$uid" "$gid"
-
-    # Make $XDG_RUNTIME_DIR/wayland-0 a symlink to the bound
-    # socket so clients that expect the conventional layout
-    # find it.
-    # shellcheck disable=SC2016
-    pm exec -u root "$NAME" \
-      /run/current-system/sw/bin/bash -lc '
-        set -e
-        target="/run/user/$1/wayland-0"
-        ln -sfn "/var/socket-mounts/$2/wayland" "$target"
-        chown -h "$1:$3" "$target"
-      ' bash "$uid" "$ns" "$gid" >/dev/null
-
-    printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid"
-    printf 'WAYLAND_DISPLAY=wayland-0\n'
-  }
-
-  # parse_socket_spec <spec>: prints "NAME HOSTPATH" or errors out.
-  # Accepts "name=host_path" (name must match [A-Za-z0-9._-]+).
-  parse_socket_spec() {
-    local spec=$1 name path
-    case "$spec" in
-      *=*) name=''${spec%%=*}; path=''${spec#*=} ;;
-      *)
-        echo "socket spec must be name=host_path: $spec" >&2
-        return 1 ;;
-    esac
-    case "$name" in
-      ""|*[!A-Za-z0-9._-]*|.*|-*)
-        echo "invalid socket name: $name" >&2
-        return 1 ;;
-    esac
-    # Resolve and validate the host socket.
-    local resolved
-    if ! resolved=$(realpath -- "$path" 2>/dev/null); then
-      echo "cannot resolve socket path: $path" >&2
-      return 1
-    fi
-    if [ ! -S "$resolved" ]; then
-      echo "not a socket: $resolved" >&2
-      return 1
-    fi
-    printf '%s\n%s\n' "$name" "$resolved"
-  }
+  # ----- socket / X11 / Wayland forwarding ----------------------
+  ${forwardingFns}
 
   tear_down() {
     if container_running; then pm stop -t 5 "$NAME" >/dev/null || true; fi
@@ -907,6 +471,7 @@
     _WS=$WORK_SHARED _MG=$MERGED _SM=$SOCKET_MOUNTS \
       podman unshare "${tools.bash}" -c '
       set +e
+      MERGED="$_MG"
       # socat-proxied socket binds: $WS/.sockets/<ns>/<name>
       if [ -d "$_WS/.sockets" ]; then
         for d in "$_WS"/.sockets/*/; do
@@ -934,9 +499,7 @@
         [ -d "$d" ] && mountpoint -q -- "$d" && umount -- "$d"
       done
       mountpoint -q -- "$_WS" && umount -- "$_WS"
-      fusermount3 -u -- "$_MG/nix/store" 2>/dev/null \
-        || umount -- "$_MG/nix/store" 2>/dev/null
-      umount -- "$_MG" 2>/dev/null
+      ${storeLib.unmount}
       exit 0
     ' || true
   }
@@ -968,7 +531,7 @@
       tags=""
       [ "$ENABLE_GPU"    = "1" ] && tags="$tags gpu"
       [ "$ENABLE_OPENGL" = "1" ] && tags="$tags opengl"
-      echo "$NAME: up''${tags:+ (''${tags# })}"
+      echo "$NAME: up''${tags:+ (''${tags# })} [store: $NIX_STORE_MODE]"
       ;;
     down|stop)
       tear_down
@@ -1256,21 +819,24 @@
       migrate_to_keepid
       export USE_KEEP_ID KEEPID_UID KEEPID_GID
       export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK NIX_STORE_LOWER
-      export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED NIX_STORE_MODE
+      export NIX_DAEMON_SOCKET
+      export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS NIX_STORE_MODE
       export HOST_WATCHDOG_DIR
       podman unshare "${tools.bash}" <<'INNER'
   set -euo pipefail
-  umount "$MERGED" 2>/dev/null || true
-  mount -t overlay overlay \
-    -o "lowerdir=$ROOTFS,upperdir=$UPPER,workdir=$WORK,userxattr" \
-    "$MERGED"
-  fuse-overlayfs \
-    -o "lowerdir=$NIX_STORE_LOWER,upperdir=$NIX_UPPER,workdir=$NIX_WORK" \
-    "$MERGED/nix/store"
+
+  # Mount the rootfs overlay + /nix/store (per NIX_STORE_MODE).
+  ${storeLib.mountAll}
+
+  # WORK_SHARED + SOCKET_MOUNTS rshared so develop binds propagate.
   if ! mountpoint -q "$WORK_SHARED"; then
     mount --bind "$WORK_SHARED" "$WORK_SHARED"
   fi
   mount --make-rshared "$WORK_SHARED"
+  if ! mountpoint -q "$SOCKET_MOUNTS"; then
+    mount --bind "$SOCKET_MOUNTS" "$SOCKET_MOUNTS"
+  fi
+  mount --make-rshared "$SOCKET_MOUNTS"
   GPU=()
   if [ -n "''${GPU_FLAGS_STR:-}" ]; then
     # shellcheck disable=SC2206
@@ -1283,7 +849,7 @@
       --user=0:0
     )
   fi
-  trap 'fusermount3 -u "$MERGED/nix/store" 2>/dev/null; umount "$MERGED" 2>/dev/null' EXIT
+  trap '${storeLib.unmount}' EXIT
   exec podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" \
     ${ociRuntimeFlag} run --rm -it \
     "''${USERNS[@]+''${USERNS[@]}}" \
@@ -1321,6 +887,11 @@
         echo "$NAME: not created"
       fi
       echo "shell user: $SHELL_USER"
+      echo "store mode: $NIX_STORE_MODE"
+      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+        echo "host store: $NIX_STORE_LOWER (ro)"
+        echo "daemon sock:$NIX_DAEMON_SOCKET"
+      fi
       echo "rootfs:     $ROOTFS"
       echo "state dir:  $STATE_DIR"
       if [ -d "$WORK_SHARED" ]; then
@@ -1403,10 +974,20 @@
   env:
     NAME             container name              (default $DEFAULT_NAME)
     STATE_DIR        host state directory        (default \$XDG_STATE_HOME/nix-dev-container/\$NAME)
-    NIX_STORE_MODE   overlay|passthrough|ro      (default overlay)
-                       overlay     - host store stays untouched
+    NIX_STORE_MODE   overlay|passthrough|ro|host-daemon (build default: $BUILT_NIX_STORE_MODE)
+                       overlay     - host store stays untouched; in-container
+                                     installs land in a private overlay upper
                        passthrough - container writes land in host store
                        ro          - no installs from inside
+                       host-daemon - host /nix/store mounted ro AND the host
+                                     nix-daemon socket bound in; builds are
+                                     delegated to the host daemon. Coupled to
+                                     build-time NixOS config (no in-container
+                                     daemon / nixbld users); cannot be toggled
+                                     at runtime.
+    NIX_STORE_LOWER  source for the /nix/store mount (default $NIX_STORE_LOWER)
+    NIX_DAEMON_SOCKET host nix-daemon socket for host-daemon mode
+                       (default $NIX_DAEMON_SOCKET)
   EOF
       exit 2
       ;;

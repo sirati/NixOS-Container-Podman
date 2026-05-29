@@ -43,6 +43,9 @@
 , useKeepId ? false
 , keepIdUid ? 1000
 , keepIdGid ? 100
+, nixStoreMode ? "overlay"
+, hostStore ? "/nix/store"
+, daemonSocket ? "/nix/var/nix/daemon-socket/socket"
 , version ? "0.0.0"
 , format ? "squashfs"
 }:
@@ -97,7 +100,10 @@ let
         exit 1
       fi
       ROOTFS=$ROOTFS_DIR
-      NIX_STORE_LOWER=$ROOTFS/nix/store
+      # host-daemon: the store comes from the host, so keep
+      # NIX_STORE_LOWER at its build-time default. Other modes use the
+      # rootfs-embedded closure as the lower.
+      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '' else if format == "squashfs" then ''
       ROOTFS=$STATE_DIR/lower-mount
       mkdir -p -- "$ROOTFS"
@@ -108,7 +114,10 @@ let
         fi
         squashfuse "$ROOTFS_BLOB" "$ROOTFS"
       fi
-      NIX_STORE_LOWER=$ROOTFS/nix/store
+      # host-daemon: the store comes from the host, so keep
+      # NIX_STORE_LOWER at its build-time default. Other modes use the
+      # rootfs-embedded closure as the lower.
+      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '' else /* both */ ''
       if command -v squashfuse >/dev/null 2>&1 && [ -e "$ROOTFS_BLOB" ]; then
         ROOTFS=$STATE_DIR/lower-mount
@@ -122,12 +131,16 @@ let
         echo "mount_rootfs_lower: neither data/lower.squash + squashfuse nor data/lower/ usable" >&2
         exit 1
       fi
-      NIX_STORE_LOWER=$ROOTFS/nix/store
+      # host-daemon: the store comes from the host, so keep
+      # NIX_STORE_LOWER at its build-time default. Other modes use the
+      # rootfs-embedded closure as the lower.
+      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '';
 
   runText = import ./scripts/run.nix {
     inherit tools shellUser name
-            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
+            nixStoreMode hostStore daemonSocket;
     rootfs = null;
     inherit rootfsLine stateDirLine mountLowerBody;
     hostWatchdogPath    = ''"$_BASE_DIR/lib/host-watchdog"'';

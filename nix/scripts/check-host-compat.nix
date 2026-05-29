@@ -131,6 +131,20 @@ in
     fail "podman info: failed — fix rootless setup before continuing"
   fi
 
+  # ----- nix daemon (host-daemon store mode only) -------------------
+  # Containers built with nixStore.mode = "host-daemon" delegate every
+  # build/query to the host's nix-daemon over its socket. Probe the
+  # conventional socket path; override NIX_DAEMON_SOCKET to check a
+  # relocated daemon (e.g. nix-portable). Informational for other modes.
+  echo
+  echo '== host nix-daemon (host-daemon store mode) =='
+  daemon_sock=''${NIX_DAEMON_SOCKET:-/nix/var/nix/daemon-socket/socket}
+  if [ -S "$daemon_sock" ]; then
+    pass "nix-daemon socket: $daemon_sock"
+  else
+    warn "nix-daemon socket: $daemon_sock not found (only needed for host-daemon mode; set NIX_DAEMON_SOCKET for a relocated store)"
+  fi
+
   # ----- tarball-layout-aware checks --------------------------------
   # The check script lives at <tarball>/bin/check-host-compat with
   # either data/lower.squash (squashfs format) or data/lower/ (folder
