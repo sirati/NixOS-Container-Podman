@@ -731,6 +731,12 @@ in
           mkdir -p "$proj_dir"
           chown "$3:$4" "$home_dir"
           chmod 0700 "$home_dir"
+          # Framework-managed ~/.bashrc (enables direnv; sources a
+          # mounted-in user bashrc if present). Reinstalled every run so
+          # it stays current; user customisation goes in ~/.bashrc.user.
+          cp /etc/nix-dev-container/bashrc "$home_dir/.bashrc"
+          chown "$3:$4" "$home_dir/.bashrc"
+          chmod 0644 "$home_dir/.bashrc"
           if ! mountpoint -q "$proj_dir"; then
             bindfs --map=0/$3:@0/@$4 --perms="og=" \
               -o allow_other "$src" "$proj_dir"

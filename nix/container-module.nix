@@ -117,6 +117,37 @@ in
       nix.channel.enable = false;
       nix.nixPath = lib.mkForce [ "nixpkgs=${pkgs.path}" ];
 
+      # direnv (+ nix-direnv `use flake`) for develop sessions. We pull in
+      # the integration - which installs direnv, wires up nix-direnv at
+      # /etc/direnv/direnvrc and sets DIRENV_CONFIG - but DISABLE the global
+      # shell hooks: the hook is enabled per develop session through the
+      # session .bashrc below instead, so it never leaks into `enter`
+      # shells and the session .bashrc stays in sole control of it.
+      programs.direnv = {
+        enable = lib.mkDefault true;
+        enableBashIntegration = lib.mkDefault false;
+        enableZshIntegration = lib.mkDefault false;
+        enableFishIntegration = lib.mkDefault false;
+      };
+
+      # Skeleton ~/.bashrc installed into every develop-session HOME by the
+      # run script (see run.nix develop case). Runs first so direnv is
+      # always enabled regardless of the user's own dotfiles, then defers
+      # to a user bashrc if one was mounted in (renamed to ~/.bashrc.user
+      # so this file keeps control of the direnv setup - see nixct).
+      # direnv is referenced by absolute store path because the dev shell
+      # spawned by `nix develop` has a hermetic PATH that won't contain it.
+      environment.etc."nix-dev-container/bashrc" = {
+        mode = "0444";
+        text = ''
+          # nix-dev-container develop-session ~/.bashrc (framework-managed).
+          eval "$(${pkgs.direnv}/bin/direnv hook bash)"
+          if [ -f "$HOME/.bashrc.user" ]; then
+            . "$HOME/.bashrc.user"
+          fi
+        '';
+      };
+
       system.stateVersion = lib.mkDefault "25.11";
     }
 
