@@ -176,6 +176,13 @@ in
   # inherit their source's perms (typically 0755 for Wayland,
   # 0777 for X11), which is what gates actual access.
   SOCKET_MOUNTS="$STATE_DIR/socket-mounts"
+  # host-daemon only: per-session GC-root directory. Bound into the
+  # container at the IDENTICAL absolute path so a store-pointing
+  # symlink created here resolves the same in both namespaces; the
+  # host nix-daemon then protects those paths from
+  # nix-collect-garbage for the session lifetime. Each develop
+  # session gets a 0700 root-owned subdir $SESSION_GCROOTS/<mount_id>.
+  SESSION_GCROOTS="$STATE_DIR/session-gcroots"
 
   # Idempotent: create $STATE_DIR layout, pre-populate UPPER with
   # writable copies of every directory NixOS activation chmods or
@@ -189,6 +196,13 @@ in
       "$WORK_SHARED" "$SOCKET_MOUNTS"
     chmod 0700 -- "$WORK_SHARED"
     chmod 0711 -- "$SOCKET_MOUNTS"
+
+    # host-daemon: per-session GC-root parent dir (host side, owned
+    # by the calling user = container root under default rootless).
+    if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+      mkdir -p "$SESSION_GCROOTS"
+      chmod 0700 -- "$SESSION_GCROOTS"
+    fi
 
     # UPPER and NIX_UPPER may already be migrated to host's
     # first subuid (when useKeepId is on), so the calling user
@@ -348,6 +362,7 @@ in
     export NIX_DAEMON_SOCKET
     export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS
     export HOST_WATCHDOG_DIR
+    export SESSION_GCROOTS
     export LXCFS_FLAGS
     LXCFS_FLAGS=$(lxcfs_flags)
     export NIX_STORE_MODE
@@ -377,6 +392,15 @@ in
     mount --bind "$SOCKET_MOUNTS" "$SOCKET_MOUNTS"
   fi
   mount --make-rshared "$SOCKET_MOUNTS"
+
+  # host-daemon: bind the per-session GC-root dir at the IDENTICAL
+  # absolute path in the container, so symlinks created there by the
+  # gcroot-keeper resolve the same in both namespaces and the host
+  # daemon protects the referenced store paths.
+  GCROOTS_BIND=()
+  if [ "''${NIX_STORE_MODE:-}" = "host-daemon" ]; then
+    GCROOTS_BIND=(-v "$SESSION_GCROOTS:$SESSION_GCROOTS")
+  fi
 
   # /hostmnts is the bind target for host paths added via the
   # `develop` subcommand. Owned by container root (= host
@@ -443,6 +467,7 @@ in
     "''${LXCFS[@]+''${LXCFS[@]}}" \
     "''${GPU[@]+''${GPU[@]}}" \
     "''${USERNS[@]+''${USERNS[@]}}" \
+    "''${GCROOTS_BIND[@]+''${GCROOTS_BIND[@]}}" \
     "''${FLAGS[@]}" \
     /init >/dev/null
   INNER
@@ -707,6 +732,21 @@ in
       home_dir="/develop-home/$session_user"
       extra_setenv=()
 
+      # Dev-shell command. In host-daemon mode, build the dev shell
+      # through a discoverable profile under the session HOME so the
+      # gcroot-keeper can register the resulting store paths as GC
+      # roots (protecting them from host nix-collect-garbage for the
+      # session lifetime). The --profile build runs as the SESSION
+      # user (enforced by systemd-run --uid/--gid below), preserving
+      # trust separation. Other modes keep plain `nix develop`.
+      develop_cmd='nix develop'
+      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+        # $HOME expands inside the inner `bash -lc` as the session
+        # user, not here - keep it single-quoted.
+        # shellcheck disable=SC2016
+        develop_cmd='mkdir -p "$HOME/.nixct" && nix develop --profile "$HOME/.nixct/devshell"'
+      fi
+
       scope="session-$mount_id.scope"
 
       if [ "$forward_agent" -eq 1 ]; then
@@ -775,6 +815,30 @@ in
             "$mount_id" "$session_user" >/dev/null
       fi
 
+      # host-daemon: create the per-session GC-root subdir (as
+      # container root, mode 0700 - outside /develop-home so the
+      # session user can't reach it) and spawn the gcroot-keeper.
+      # The keeper watches the session HOME, registers store-pointing
+      # symlinks here, and (because this dir is bound at an identical
+      # path host-side) the host nix-daemon protects those paths from
+      # nix-collect-garbage for the session lifetime.
+      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+        pm exec -u root "$NAME" \
+          /run/current-system/sw/bin/mkdir -p "$SESSION_GCROOTS/$mount_id"
+        pm exec -u root "$NAME" \
+          /run/current-system/sw/bin/chmod 0700 "$SESSION_GCROOTS/$mount_id"
+        keeper_unit="gcroot-keeper-$mount_id.service"
+        if ! pm exec -u root "$NAME" \
+            /run/current-system/sw/bin/systemctl is-active --quiet \
+            "$keeper_unit" 2>/dev/null; then
+          pm exec -u root "$NAME" \
+            /run/current-system/sw/bin/systemd-run \
+              --unit="$keeper_unit" --collect --quiet \
+              /etc/nix-dev-container/gcroot-keeper.sh \
+              "$mount_id" "$session_user" "$SESSION_GCROOTS/$mount_id" >/dev/null
+        fi
+      fi
+
       # Wrap the user's shell in a transient .scope unit.
       # --collect: the scope unit is auto-removed when it goes
       #            inactive (after last member exits).
@@ -793,7 +857,7 @@ in
           --working-directory="$home_dir" \
           --setenv="HOME=$home_dir" \
           "''${extra_setenv[@]+''${extra_setenv[@]}}" \
-          ${tools.bash} -lc "nix develop"
+          ${tools.bash} -lc "$develop_cmd"
       ;;
     boot)
       # ephemeral foreground systemd boot, for debugging the
@@ -891,6 +955,14 @@ in
       if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
         echo "host store: $NIX_STORE_LOWER (ro)"
         echo "daemon sock:$NIX_DAEMON_SOCKET"
+        if [ -d "$SESSION_GCROOTS" ]; then
+          echo "session gcroots:"
+          for d in "$SESSION_GCROOTS"/*; do
+            [ -d "$d" ] || continue
+            n=$(find "$d" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d '[:space:]')
+            echo "  $(basename "$d") ($n roots)"
+          done 2>/dev/null || true
+        fi
       fi
       echo "rootfs:     $ROOTFS"
       echo "state dir:  $STATE_DIR"
@@ -943,6 +1015,12 @@ in
                                 in the running container, exec nix develop
                                 there as a per-session user. Re-running on
                                 the same hostpath reuses the user.
+                                In host-daemon mode the session auto-manages
+                                GC roots: host store paths used by the
+                                session are protected from
+                                nix-collect-garbage for the session
+                                lifetime, and a .nixct/ dir is created in
+                                the project home for the dev-shell profile.
     exec -- CMD...              run CMD inside the container as $SHELL_USER.
     boot                        ephemeral foreground systemd (debugging);
                                 wipes any existing persistent container first.
