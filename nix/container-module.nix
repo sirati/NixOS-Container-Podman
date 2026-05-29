@@ -141,6 +141,106 @@ in
       # applies regardless of env.
       nix.settings.store = lib.mkForce "daemon";
 
+      # Per-session gcroot-keeper. In host-daemon mode a develop session
+      # builds land in the HOST store, but nix records their GC roots against
+      # the container-only /develop-home/<user> path - so a host
+      # `nix-collect-garbage` can delete paths the live session still needs.
+      # This privileged in-container agent (runs as container root) watches
+      # the session user's home for symlinks pointing into /nix/store and
+      # re-registers them as GC roots in a host-visible directory, keeping the
+      # host daemon from collecting them for the session's lifetime.
+      #
+      # Spawned (1B) and torn down (1C) by the run-script wiring; here we only
+      # install the script. Lifecycle is driven by polling the session scope
+      # rather than systemd BindsTo: the keeper unit is started BEFORE the
+      # scope exists, so a BindsTo dependency would race and the unit would be
+      # stopped the instant it started.
+      environment.etc."nix-dev-container/gcroot-keeper.sh" = {
+        mode = "0555";
+        text = ''
+          #!${pkgs.bashInteractive}/bin/bash
+          # args: <mount_id> <session_user> <gcdir-abs-path>
+          set -u
+          PATH=/run/current-system/sw/bin:/run/wrappers/bin
+          shopt -s nullglob
+
+          mount_id=$1
+          session_user=$2
+          gcdir=$3
+          scope="session-''${mount_id}.scope"
+          home="/develop-home/''${session_user}"
+
+          # Scan the curated, shallow set of locations where nix tooling drops
+          # store-pointing symlinks, root every valid store path found. Kept
+          # shallow on purpose: a deep recursive find of the whole project is
+          # too slow and may walk huge trees.
+          scan_and_root() {
+            [ -d "$home" ] || return 0
+            local link target relname rootname
+            for link in \
+              "$home"/result "$home"/result-* \
+              "$home"/.direnv/*-link \
+              "$home"/.nixct/devshell* \
+              "$home"/.local/state/nix/profiles/*-link
+            do
+              [ -L "$link" ] || continue
+              target=$(readlink -f -- "$link" 2>/dev/null) || continue
+              case "$target" in
+                /nix/store/*) ;;
+                *) continue ;;
+              esac
+
+              # Sanitized, shell-safe root name from the link's path relative
+              # to $home: replace any char outside [A-Za-z0-9._-] with '_', and
+              # guard a leading '-'/'.' so the name can never be read as an
+              # option prefix or hidden file.
+              relname=''${link#"$home"/}
+              rootname=$(printf '%s' "$relname" | tr -c 'A-Za-z0-9._-' '_')
+              case "$rootname" in
+                -*|.*) rootname="_''${rootname}" ;;
+              esac
+              [ -n "$rootname" ] || continue
+
+              # Idempotent: --add-root rewrites the symlink. Run as the keeper's
+              # own uid (= container root); we do NOT su to the session user -
+              # the session user builds as itself, root does the rooting. In
+              # host-daemon mode nix.settings.store = "daemon" is baked into
+              # nix.conf so plain nix-store already talks to the host daemon.
+              # stderr/|| true so a transient failure (path mid-GC, daemon
+              # busy) doesn't kill the loop.
+              nix-store --add-root "$gcdir/$rootname" --realise "$target" \
+                >/dev/null 2>&1 || true
+            done
+          }
+
+          # Stage 1: wait for the scope to actually come into existence. The
+          # keeper is started before the develop subcommand creates the scope;
+          # without this wait `is-active` would report inactive immediately and
+          # we'd exit before the session ever built anything.
+          for _ in $(seq 1 120); do
+            state=$(systemctl is-active "$scope" 2>/dev/null || true)
+            case "$state" in active|activating|reloading) break ;; esac
+            sleep 0.5
+          done
+          # Never showed up - nothing to protect.
+          if ! systemctl is-active --quiet "$scope" 2>/dev/null; then
+            exit 0
+          fi
+
+          # Stage 2: re-root on a 5s cadence for as long as the scope lives.
+          while systemctl is-active --quiet "$scope" 2>/dev/null; do
+            scan_and_root
+            sleep 5
+          done
+
+          # Final pass to catch a build that completed in the last interval.
+          # Do NOT delete the gcroot dir / its symlinks - removal is the host
+          # watchdog's job (1C).
+          scan_and_root
+          exit 0
+        '';
+      };
+
       assertions = [{
         assertion = config.nix.enable;
         message = "nixDevContainer.hostDaemon.enable keeps the nix CLI; do not set nix.enable = false.";
