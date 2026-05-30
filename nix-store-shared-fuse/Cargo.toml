@@ -1,0 +1,17 @@
+[package]
+name = "nix-store-shared-fuse"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only FUSE filesystem that realizes Nix store-farm symlinks against a relocated backing store"
+
+[dependencies]
+fuser = "0.14"
+cap-std = "3"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true
