@@ -261,16 +261,10 @@ fn metadata_to_attr(ino: u64, kind: NodeKind, md: &Metadata) -> FileAttr {
     };
 
     // Preserve the underlying permission bits (e.g. 0444/0555 store modes).
-    // For realized dirs the underlying object is a symlink; force a sane
-    // directory mode derived from the redirect-root dir we will serve.
+    // For a realized dir `md` is the real target directory's metadata
+    // (node_metadata stats through the redirect capability, see fs.rs), so
+    // this carries the target's own mode/uid/gid/mtime - not a synthesized one.
     let perm = (md.mode() & 0o7777) as u16;
-    let perm = if matches!(kind, NodeKind::RealizedDir) && (md.mode() & libc::S_IFMT) != libc::S_IFDIR
-    {
-        // Underlying was a symlink (lstat); present a read+exec dir mode.
-        0o555
-    } else {
-        perm
-    };
 
     FileAttr {
         ino,

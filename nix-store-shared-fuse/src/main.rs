@@ -46,6 +46,13 @@ struct Args {
     #[arg(long)]
     allow_other: bool,
 
+    /// Mount with nosuid (strip set-user-ID/set-group-ID bits). Off by
+    /// default so set-uid binaries in the served store keep working; opt in
+    /// to harden. (Note: unprivileged/user-namespace FUSE mounts are often
+    /// forced nosuid by the kernel regardless.)
+    #[arg(long)]
+    nosuid: bool,
+
     /// Run in the foreground (do not return until unmounted). This is the
     /// default; the flag exists for explicit systemd/launcher use.
     #[arg(long, short = 'f')]
@@ -89,13 +96,18 @@ fn main() -> Result<()> {
         bind_target_logical,
     );
 
+    // nodev is always on: a Nix store legitimately contains no device nodes.
+    // nosuid is opt-in (default off) so set-uid binaries in the store keep
+    // working unless the user chooses to harden.
     let mut options = vec![
         MountOption::RO,
         MountOption::FSName("nix-store-shared".to_string()),
         MountOption::Subtype("nixstoreshared".to_string()),
         MountOption::NoDev,
-        MountOption::NoSuid,
     ];
+    if args.nosuid {
+        options.push(MountOption::NoSuid);
+    }
     if args.allow_other {
         options.push(MountOption::AllowOther);
     }

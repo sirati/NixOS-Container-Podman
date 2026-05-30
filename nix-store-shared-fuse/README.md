@@ -81,10 +81,13 @@ realize-as-directory treatment applies **only** to symlinks in the
 * **Read-only.** Only read operations are implemented; every mutating operation
   (`write`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`,
   `mknod`, `setattr`, `setxattr`) is rejected with `EROFS`, and the filesystem
-  is mounted with the `ro` option (plus `nodev`, `nosuid`).
+  is mounted with the `ro` option, always `nodev` (a store has no device
+  nodes), and `nosuid` only when `--nosuid` is passed (off by default so
+  set-uid binaries in the store keep working).
 * Underlying permission bits and mtimes are preserved, so store paths keep their
-  `0444` / `0555` modes. Realized directory nodes (whose underlying object is a
-  symlink) are reported as `S_IFDIR` with a `0555` mode.
+  `0444` / `0555` modes. A realized directory node is reported as `S_IFDIR`
+  with the **real target directory's** mode/uid/gid/mtime (the metadata is
+  stat'd through the redirect root), not a synthesized mode.
 
 ## FUSE operations implemented
 
@@ -119,6 +122,9 @@ nix-store-shared-fuse \
 
 * `--allow-other` — pass FUSE `allow_other` so non-mounting users (e.g.
   container session users) can read the mount. Off by default.
+* `--nosuid` — mount with `nosuid` (strip set-uid/set-gid). Off by default so
+  set-uid binaries in the store keep working; opt in to harden. (Unprivileged /
+  user-namespace FUSE mounts are often forced `nosuid` by the kernel anyway.)
 * `--foreground` / `-f` — run in the foreground. This is the default behaviour
   (the process owns the mount session, suitable for `systemd` / launchers); the
   flag is accepted for explicit use.
