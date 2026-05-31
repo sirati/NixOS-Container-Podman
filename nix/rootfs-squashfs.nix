@@ -1,19 +1,33 @@
-# Squashfs blob of the container rootfs, built by running mksquashfs
-# over the staged tree produced by nix/rootfs-folder.nix. Keeping the
-# staging logic in one place avoids divergence between folder-format
-# and squashfs-format portable tarballs.
+# Squashfs blob of the container rootfs, built by running mksquashfs over
+# the assembled tree produced by nix/rootfs-folder.nix. The folder builder
+# is the single source of truth for the assemble + conditional-materialize
+# model, so this file just wraps it and compresses the result.
 #
 # Output:
 #   $out/lower.squash              - the squashfs blob
 #   $out/lower.squash.sha256       - sha256 of the blob (for integrity
 #                                    checking in the portable tarball)
+#
+# Contract:
+#   { pkgs, systemLower, nixStoreLower, includeStore ? false, name ? "nixct" }
+#     -> drv
+#   includeStore is threaded straight into rootfs-folder.nix:
+#     false -> squashfs over a store-empty skeleton (runtime fills /nix/store)
+#     true  -> squashfs over a self-contained, materialized closure
 
-{ pkgs, rootfsFolder }:
+{ pkgs, systemLower, nixStoreLower, includeStore ? false, name ? "nixct" }:
 
+let
+  # Single source of truth: assemble the folder, then squash THAT.
+  rootfsFolder = import ./rootfs-folder.nix {
+    inherit pkgs systemLower nixStoreLower includeStore name;
+  };
+in
 pkgs.runCommand "nix-container-rootfs-squashfs"
   {
     nativeBuildInputs = [ pkgs.squashfsTools pkgs.coreutils ];
-    passthru = { inherit rootfsFolder; };
+    # Re-export the inner folder (and its layers) for debugging.
+    passthru = { inherit rootfsFolder includeStore; };
   }
   ''
     set -euo pipefail
