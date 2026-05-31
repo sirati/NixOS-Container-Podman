@@ -178,21 +178,6 @@
 
           closure = pkgs.closureInfo { rootPaths = [ toplevel ]; };
 
-          # The rootfs derivation is the IMMUTABLE lower layer. It contains:
-          #   - NixOS-shaped FHS skeleton
-          #   - /init -> ${toplevel}/init (stage-2-init.sh)
-          #   - static /etc files (os-release, machine-id, mtab)
-          #   - /nix/store/<HASH-path> as symlinks to the host store entries;
-          #     these document the closure and serve as Nix GC references.
-          #     They are *masked* at runtime by the fuse-overlayfs mount on
-          #     /nix/store (hardlinks would be ideal but the sandbox builds
-          #     on tmpfs which can't hardlink to the on-disk store).
-          #   - /nix-path-registration (closure manifest, registered on
-          #     first boot via boot.postBootCommands).
-          #
-          # All paths podman/NixOS-activation wants writable at runtime
-          # (/etc/*, /run/*, /nix/var/*, ...) are placed in the OVERLAY UPPER
-          # by the run script, not here.
           # The runtime lower is the assembled rootfs-folder (system-lower
           # skeleton + prebuilt /nix/var db; /nix/store baked in only when
           # the container is self-contained). Bound to `rootfsFolder`,

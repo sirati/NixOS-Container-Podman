@@ -4,7 +4,7 @@
 # which creates ephemeral per-session users at runtime (run script). The
 # framework module (nix/container-module.nix) supplies all develop infra
 # (watchdog, /develop-home + /run/sockets tmpfiles, bindfs/socat/fuse3),
-# direnv integration, and - via nixStore.mode - the host-daemon profile.
+# direnv integration, and - via the hostNixDaemon axis - the host-daemon profile.
 
 { config, lib, pkgs, ... }:
 

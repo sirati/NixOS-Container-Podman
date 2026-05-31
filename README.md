@@ -254,7 +254,8 @@ nixct develop ~/some/project
 ## Portable tarball
 
 `nix build .#<container>.portable` produces a **self-contained tarball** that
-runs on non-NixOS hosts which have nix and podman available. The `lower` axis
+runs on non-NixOS hosts with rootless podman + fuse-overlayfs (and squashfuse
+for the squashfs layout) — no Nix required on the host. The `lower` axis
 selects its layout (`"squashfs"`, default — needs squashfuse on the host — or
 `"folder"`, plain files). Run `check-host-compat` first to probe whether a
 target host meets the prerequisites before building or deploying the tarball.
