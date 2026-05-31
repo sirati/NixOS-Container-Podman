@@ -1,52 +1,83 @@
-# Build the container rootfs as a directory of REAL files (closure
-# copied in, not symlinked back to host /nix/store). The same staging
-# tree is consumed by both:
+# Assemble the container rootfs FOLDER from the orthogonal lower layers.
 #
+# This is the packaging step that turns the tiny, store-empty `systemLower`
+# skeleton into a concrete rootfs directory, OPTIONALLY materializing the
+# real Nix closure into /nix/store.
+#
+# Model:
+#   - systemLower carries the COMPLETE runnable skeleton: FHS dirs, /init,
+#     sbin/init, static /etc, /nix-path-registration, the PRE-BUILT
+#     /nix/var Nix db (closure already registered), the /nix/.store-lower
+#     GC-reference file, and an EMPTY /nix/store mountpoint.
+#   - We copy that whole tree into $out as WRITABLE real files and then,
+#     depending on `includeStore`, either leave /nix/store empty (the
+#     runtime FUSE / host rbind fills it) or MATERIALIZE the real closure
+#     into it (a fully self-contained lower).
+#
+# Consumed by:
 #   - nix/rootfs-squashfs.nix (mksquashfs over this output)
 #   - nix/portable-tarball.nix (folder-format tarball ships it as-is)
 #
-# Output: $out is the rootfs directory tree. Layout matches the
-# symlink-flavoured rootfs in flake.nix, just with real /nix/store
-# entries instead of symlinks into the host store.
+# Contract:
+#   { pkgs, systemLower, nixStoreLower, includeStore ? false, name ? "nixct" }
+#     -> drv whose $out is the assembled rootfs directory.
+#
+#   systemLower    = import ./system-lower.nix { ... }  (skeleton + db)
+#   nixStoreLower  = import ./nix-store-lower.nix { ... }  (passthru.closure)
+#   includeStore   = false -> /nix/store stays EMPTY
+#                    true  -> /nix/store materialized with the real closure
 
-{ pkgs, toplevel, closure, name ? "nixct" }:
+{ pkgs, systemLower, nixStoreLower, includeStore ? false, name ? "nixct" }:
 
 pkgs.runCommand "nix-container-rootfs-folder"
   {
     nativeBuildInputs = [ pkgs.coreutils ];
-    passthru = { inherit toplevel closure; };
+    # Re-export the layers and the chosen mode for composition/debugging,
+    # plus toplevel/closure for convenience (sourced from systemLower).
+    passthru = {
+      inherit systemLower nixStoreLower includeStore;
+      inherit (systemLower) toplevel closure;
+    };
   }
   ''
     set -euo pipefail
 
+    # --- Copy the complete skeleton in as writable real files -------------
+    # systemLower lives in the read-only store with r-xr-xr-x dirs. cp -R
+    # preserves that, so we MUST chmod -R u+w afterwards or later steps (and
+    # the runtime) cannot write. We deliberately do NOT preserve ownership;
+    # everything ends up owned by the build user and is normalized to 0:0
+    # later (mksquashfs -all-root / tarball packaging). The pre-built
+    # /nix/var db and the /nix/.store-lower GC marker come along verbatim.
+    echo "rootfs-folder: staging systemLower skeleton ..."
     mkdir -p $out
-    cd $out
+    cp -R --reflink=auto -- ${systemLower}/. $out/
+    chmod -R u+w $out
 
-    mkdir -p \
-      bin boot dev etc home mnt \
-      nix/store nix/var \
-      opt proc root run sbin srv \
-      sys tmp usr var
-
-    ln -s ${toplevel}/init init
-    ln -s /init sbin/init
-    ln -s ${toplevel}/etc/os-release etc/os-release
-    : > etc/machine-id
-    ln -s /proc/mounts etc/mtab
-
-    cp ${closure}/registration nix-path-registration
-
-    # Copy the full closure as real files. --reflink=auto lets btrfs
-    # hosts dedupe at build time; harmless on other filesystems.
-    # -p preserves modes/ownership/timestamps. Closure store paths
-    # don't typically carry xattrs, but if they do we keep them.
-    echo "rootfs-folder: copying closure ..."
+    ${if includeStore then ''
+    # --- Materialize the real closure into /nix/store ---------------------
+    # Self-contained lower: copy every closure path in as REAL files (not
+    # symlinks). --reflink=auto lets btrfs hosts dedupe at build time;
+    # harmless elsewhere. We preserve mode/timestamps/xattr but not
+    # ownership (normalized at package time). Source the path list from the
+    # nixStoreLower closure (passthru.closure) so both layers agree on the
+    # exact closure being shipped. /nix/store already exists (empty) from
+    # the skeleton copy.
+    echo "rootfs-folder: includeStore=true, materializing closure ..."
     while IFS= read -r p; do
       base=$(basename -- "$p")
-      cp -R --reflink=auto --preserve=mode,ownership,timestamps,xattr \
-        -- "$p" "nix/store/$base"
-    done < ${closure}/store-paths
-    echo "rootfs-folder: closure copy done"
+      cp -R --reflink=auto --preserve=mode,timestamps,xattr \
+        -- "$p" "$out/nix/store/$base"
+    done < ${nixStoreLower.closure}/store-paths
+    chmod -R u+w $out/nix/store
+    echo "rootfs-folder: closure materialized"
+    '' else ''
+    # --- Leave /nix/store EMPTY -------------------------------------------
+    # includeStore=false: the store mountpoint stays empty. The runtime
+    # fills it -- FUSE (host-nix-store mode) or a host /nix rbind (daemon
+    # mode). Nothing to do here.
+    echo "rootfs-folder: includeStore=false, /nix/store left empty"
+    ''}
 
     # Size report (handy when diagnosing tarball bloat).
     du -sh $out 2>/dev/null || true
