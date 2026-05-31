@@ -314,6 +314,7 @@ in
     # overlay (ephemeral/overlay); directory mode has none.
     _UPPER=$UPPER _NIX_UPPER=$NIX_UPPER _NIX_WORK=$NIX_WORK \
     _STORAGE=$STORAGE _STORE_OVERLAY=$_STORE_OVERLAY \
+    _ROOTFS=$ROOTFS _HOST_NIX_DAEMON=$HOST_NIX_DAEMON \
       podman unshare ${tools.bash} -c '
       set -euo pipefail
       if [ "$_STORE_OVERLAY" = "1" ]; then
@@ -331,15 +332,43 @@ in
         "$_UPPER"/var/cache "$_UPPER"/var/spool "$_UPPER"/var/empty \
         "$_UPPER"/var/tmp "$_UPPER"/tmp \
         "$_UPPER"/work
-      # Nix DB / daemon-socket location.
+      # Nix DB / daemon-socket location. The profiles/per-user and
+      # gcroots/per-user dirs are pre-created in the WRITABLE upper so they
+      # mask the read-only, host-root-owned copies baked into the
+      # system-lower /nix/var: an in-container nix-daemon (self-contained or
+      # host-store modes) chmods these to 1777 on connect, which EPERMs
+      # against the baked dirs (owned by a uid unmapped in the rootless
+      # user-ns). The upper copies are owned by container root, so the chmod
+      # succeeds.
       mkdir -p \
         "$_UPPER"/nix/var/nix/db \
-        "$_UPPER"/nix/var/nix/profiles \
-        "$_UPPER"/nix/var/nix/gcroots \
+        "$_UPPER"/nix/var/nix/profiles/per-user \
+        "$_UPPER"/nix/var/nix/gcroots/per-user \
         "$_UPPER"/nix/var/nix/temproots \
         "$_UPPER"/nix/var/nix/userpool \
         "$_UPPER"/nix/var/nix/daemon-socket
-      chmod 1777 "$_UPPER"/tmp "$_UPPER"/var/tmp
+      chmod 1777 "$_UPPER"/tmp "$_UPPER"/var/tmp \
+        "$_UPPER"/nix/var/nix/profiles/per-user \
+        "$_UPPER"/nix/var/nix/gcroots/per-user
+      # Stage a WRITABLE, container-root-owned copy of the baked nix db into
+      # the upper. The db baked into the system-lower /nix/var is read-only
+      # (0444) and owned by an unmapped (host-root) uid; an overlay copy-up
+      # on the first daemon write would inherit those attrs, so the
+      # in-container daemon could not write it ("attempt to write a readonly
+      # database"). A plain cp (not -a) makes a container-root-owned copy
+      # that masks the baked one; chmod makes it writable. Skip in daemon
+      # mode (the host db is authoritative) and never clobber a db the
+      # daemon has already been writing across restarts.
+      if [ "$_HOST_NIX_DAEMON" != "1" ] \
+         && [ -f "$_ROOTFS/nix/var/nix/db/db.sqlite" ] \
+         && [ ! -f "$_UPPER/nix/var/nix/db/db.sqlite" ]; then
+        cp "$_ROOTFS"/nix/var/nix/db/db.sqlite "$_UPPER"/nix/var/nix/db/db.sqlite
+        chmod 0644 "$_UPPER"/nix/var/nix/db/db.sqlite
+        if [ -f "$_ROOTFS/nix/var/nix/db/schema" ]; then
+          cp "$_ROOTFS"/nix/var/nix/db/schema "$_UPPER"/nix/var/nix/db/schema
+          chmod 0644 "$_UPPER"/nix/var/nix/db/schema
+        fi
+      fi
       : > "$_UPPER"/etc/hostname
       : > "$_UPPER"/etc/hosts
       : > "$_UPPER"/etc/resolv.conf
