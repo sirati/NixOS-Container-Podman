@@ -149,17 +149,18 @@
               false
             else hostNixStore;
 
-          # ----- INTERNAL BRIDGE to the legacy run.nix / portable-tarball
-          # parameters. run.nix and portable-tarball.nix are owned by a
-          # later phase and still take the old flat names; we derive them
-          # from the new axes here. The real FUSE / self-contained runtime
-          # (driven by hostNixStore / the new lower) arrives next phase -
-          # for now the runtime is unchanged: host store RO + overlay
-          # upper, or host-daemon delegation.
-          hostDaemon   = hostNixDaemon;
-          nixStoreMode = if hostNixDaemon then "host-daemon" else "overlay";
-          hostStore    = "/nix/store";
-          daemonSocket = "/nix/var/nix/daemon-socket/socket";
+          # Toggles the host-daemon NixOS profile (no in-container daemon /
+          # nixbld users) when delegating to the host nix-daemon.
+          hostDaemon = hostNixDaemon;
+
+          # Normalise the `storage` axis to the bare string run.nix consumes,
+          # rejecting unknown values.
+          storageMode =
+            if storage == "ephemeral" then "ephemeral"
+            else if storage == "directory" then "directory"
+            else if builtins.isAttrs storage && (storage._type or null) == "overlay" then "overlay"
+            else throw "mkContainer: invalid `storage` (expected \"ephemeral\", \"directory\", or lib.overlay { ... })";
+
           # Portable-tarball layer format follows the `lower` axis.
           portableFormat = if lower == "folder" then "folder" else "squashfs";
 
@@ -197,35 +198,12 @@
           # All paths podman/NixOS-activation wants writable at runtime
           # (/etc/*, /run/*, /nix/var/*, ...) are placed in the OVERLAY UPPER
           # by the run script, not here.
-          rootfs = pkgs.runCommand "nix-container-rootfs"
-            {
-              passthru = { inherit toplevel closure nixosSystem shellUser name; };
-            } ''
-            mkdir -p $out
-            cd $out
-
-            mkdir -p \
-              bin boot dev etc home mnt \
-              nix/store nix/var \
-              opt proc root run sbin srv \
-              sys tmp usr var
-
-            ln -s ${toplevel}/init init
-            ln -s /init sbin/init
-            ln -s ${toplevel}/etc/os-release etc/os-release
-            : > etc/machine-id
-            ln -s /proc/mounts etc/mtab
-
-            cp ${closure}/registration nix-path-registration
-
-            # Symlink each closure path into our /nix/store. These are masked
-            # by the fuse-overlayfs lower mount at runtime, but recorded here
-            # they make the closure visible in the derivation output and act
-            # as Nix references so the host store keeps the closure alive.
-            while IFS= read -r p; do
-              ln -s "$p" "$out$p"
-            done < ${closure}/store-paths
-          '';
+          # The runtime lower is the assembled rootfs-folder (system-lower
+          # skeleton + prebuilt /nix/var db; /nix/store baked in only when
+          # the container is self-contained). Bound to `rootfsFolder`,
+          # defined below; run.nix overlays it (or materializes it in
+          # `directory` storage) and provisions /nix/store per the axes.
+          rootfs = rootfsFolder;
 
           # Per-session host watchdog: script body extracted to
           # nix/scripts/host-watchdog.nix so the same text drives both
@@ -258,6 +236,9 @@
               # portable-tarball target. Harmless to ship in the NixOS
               # closure too.
               findutils gawk socat squashfsTools squashfuse
+              # nix: host-side `nix-store --realise --add-root` plants the
+              # per-instance gc root on the store-lower in hostNixStore mode.
+              nix
             ];
             bashOptions = [ "errexit" "pipefail" ];
             # Script body extracted to nix/scripts/run.nix. Same text body
@@ -266,7 +247,15 @@
             text = import ./nix/scripts/run.nix ({
               inherit tools rootfs shellUser name idleTimeout
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
-                      nixStoreMode hostStore daemonSocket;
+                      hostNixDaemon;
+              storage = storageMode;
+              hostNixStore = effectiveHostNixStore;
+              # The FUSE binary + the store-lower path are only needed for the
+              # non-daemon host-store mode; null otherwise.
+              fusePath = if effectiveHostNixStore && !hostNixDaemon
+                         then "${fuse}/bin/nix-store-shared-fuse" else null;
+              nixStoreLower = if effectiveHostNixStore && !hostNixDaemon
+                              then "${nixStoreLower}" else null;
               hostWatchdogPath = "${hostWatchdogScript}";
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
               # Bridge the storage axis to run.nix's stateDirLine: ephemeral
@@ -339,21 +328,37 @@
 
           # Portable tarball. Named `portableTarball` (not `portable`) so it
           # does not collide with the `portable` attr exposed in the result
-          # set below.
+          # set below. A portable tarball MUST be self-contained (the target
+          # host has no shared /nix/store or daemon); the result attrset
+          # below only exposes it for self-contained containers and surfaces
+          # a clear build error otherwise, so this is evaluated lazily and
+          # only when includeStore holds (hostNixStore/hostNixDaemon both off).
           portableTarball = import ./nix/portable-tarball.nix {
             inherit pkgs name shellUser rootfsFolder rootfsSquashfs
-                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
-                    nixStoreMode hostStore daemonSocket;
+                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+            hostNixStore = effectiveHostNixStore;
+            hostNixDaemon = hostNixDaemon;
             version = if self ? rev then self.rev else "dirty";
             format = portableFormat;
           };
+
+          # A portable tarball is only meaningful for a self-contained
+          # container. For hostNixStore / hostNixDaemon containers, expose a
+          # derivation that fails at BUILD time with a clear message (rather
+          # than throwing at eval, which would break `nix flake check`).
+          portable =
+            if includeStore then portableTarball
+            else pkgs.runCommand "${name}-portable-unsupported" { } ''
+              echo "error: a portable tarball requires a self-contained container;" >&2
+              echo "       hostNixStore/hostNixDaemon containers have no portable target." >&2
+              exit 1
+            '';
         in
         {
           inherit nixosSystem toplevel rootfs
                   rootfsFolder rootfsSquashfs
                   nixStoreLower systemLower fuse
-                  run packages;
-          portable = portableTarball;
+                  run packages portable;
         };
 
       example = mkContainer {

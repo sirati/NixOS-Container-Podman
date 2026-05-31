@@ -161,9 +161,10 @@ in
   # FUSE binary + farm path + physical redirect root for HOST_NIX_STORE.
   FUSE_BIN=''${FUSE_BIN:-${if fusePath == null then "" else fusePath}}
   REDIRECT_ROOT=''${REDIRECT_ROOT:-${redirectRoot}}
-  # NIX_STORE_LOWER: the symlink-FARM store path (= FUSE --bind-target and
-  # the host-side GC-root target). Empty unless hostNixStore. NOTE: this
-  # is the symlink farm, NOT the old "host /nix/store source".
+  # NIX_STORE_LOWER: the nix-store-lower STORE PATH (the host-side GC-root
+  # target). Its /nix/store/ subdir is the symlink farm the FUSE serves as
+  # --bind-target (store.nix appends it). Empty unless hostNixStore. NOTE:
+  # this is the nix-store-lower layer, NOT the old "host /nix/store source".
   NIX_STORE_LOWER=''${NIX_STORE_LOWER:-${if nixStoreLower == null then "" else nixStoreLower}}
 
   case "$STORAGE" in

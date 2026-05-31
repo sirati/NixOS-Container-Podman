@@ -11,8 +11,10 @@
 #   HOST_NIX_DAEMON  0 | 1   (rbind whole host /nix ro + use host daemon)
 #   FUSE_BIN         absolute path to nix-store-shared-fuse (HOST_NIX_STORE)
 #   REDIRECT_ROOT    physical store root the FUSE reads from (default /nix/store)
-#   NIX_STORE_LOWER  the symlink-FARM store path = FUSE --bind-target
-#                    (empty unless HOST_NIX_STORE=1)
+#   NIX_STORE_LOWER  the nix-store-lower STORE PATH (the host-side GC-root
+#                    target). Its /nix/store/ subdir is the symlink FARM
+#                    served as the FUSE --bind-target. Empty unless
+#                    HOST_NIX_STORE=1.
 # plus ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK STATE_DIR.
 #
 # ----------------------------------------------------------------------
@@ -127,7 +129,7 @@
       # overlay mounts live in), serving the mount until teardown
       # fusermount3 -u's it. This mirrors how fuse-overlayfs daemonizes.
       setsid "$FUSE_BIN" \
-        --bind-target "$NIX_STORE_LOWER" \
+        --bind-target "$NIX_STORE_LOWER/nix/store" \
         --resolution-root /nix/store \
         --redirect-root "$REDIRECT_ROOT" \
         --allow-other \
