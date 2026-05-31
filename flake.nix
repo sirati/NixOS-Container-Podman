@@ -8,6 +8,12 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
 
+      # Sugar for the on-disk overlay storage strategy:
+      #   storage = lib.overlay { lower = "squashfs"; };
+      # produces an opaque marker that mkContainer recognises as the
+      # overlay-with-persistent-upper writable strategy.
+      overlay = { lower ? "squashfs" }: { _type = "overlay"; inherit lower; };
+
       # mkContainer
       # ===========
       # Take a NixOS configuration and produce a rootfs derivation + run script.
@@ -40,17 +46,47 @@
       # symlink (so Nix sees the closure as live for GC) and made available
       # inside the container at runtime by overlay-mounting the host's
       # /nix/store - see the run script.
-      # mkContainer options are grouped into structured sub-attrsets so
-      # each concern (portable packaging, gpu, keep-id, nix-store policy)
-      # stays self-documenting and independently overridable. Every
-      # sub-attrset and field is optional; defaults reproduce the old
-      # flat-argument behavior.
+      # mkContainer options are organised into ORTHOGONAL axes: each one
+      # controls a single, independent concern. Every axis is optional;
+      # the defaults reproduce the historical on-disk-overlay behavior of
+      # the example containers.
       #
-      #   portable.format         "squashfs" (default) | "folder" | "both"
-      #                           Portable-tarball layout. squashfs is the
-      #                           smallest but needs squashfuse on the host;
-      #                           folder ships plain files; both ships each
-      #                           and the run script picks at up time.
+      #   storage                 Writable strategy for the rootfs. One of:
+      #                             "ephemeral"
+      #                                 overlay with a tmpfs upper - state
+      #                                 lives in XDG_RUNTIME_DIR and is lost
+      #                                 when the container is removed.
+      #                             (lib.overlay { lower ? "squashfs"; })
+      #                                 overlay with a persistent ON-DISK
+      #                                 upper (state survives across runs).
+      #                                 This is the DEFAULT (the historical
+      #                                 behavior of the example containers).
+      #                             "directory"
+      #                                 a materialized writable rootfs with
+      #                                 no overlay at all.
+      #
+      #   lower                   "squashfs" (default) | "folder"
+      #                           Packaging of the immutable base layer.
+      #                           squashfs is the smallest but needs
+      #                           squashfuse on the host; folder ships plain
+      #                           files. Only meaningful for the ephemeral /
+      #                           overlay storage strategies.
+      #
+      #   hostNixStore            false (default) | true
+      #                           When true, /nix/store is served from the
+      #                           host (via the runtime FUSE) instead of
+      #                           being baked into the immutable lower. The
+      #                           closure is GC-pinned but excluded from the
+      #                           shipped layer. Ignored when hostNixDaemon
+      #                           is true (the whole /nix comes from the
+      #                           host then).
+      #
+      #   hostNixDaemon           false (default) | true
+      #                           Delegate every build/query to the host's
+      #                           nix-daemon: no in-container daemon, no
+      #                           nixbld users, /nix comes from the host.
+      #                           Toggles nixDevContainer.hostDaemon.enable.
+      #                           When true, hostNixStore is IGNORED.
       #
       #   gpu.hostHasToolkit      false (default) | true
       #                           When true, `up --gpu` uses the host's
@@ -73,64 +109,57 @@
       #                           1000/100; must match
       #                           configuration.nix users.users.<shellUser>).
       #
-      #   nixStore.mode           "overlay" (default) | "passthrough" | "ro"
-      #                             | "host-daemon"
-      #                           How the container's /nix/store is provided:
-      #                             overlay     host store RO + writable
-      #                                         fuse-overlayfs upper.
-      #                             passthrough host store, writable in place.
-      #                             ro          host store, read-only.
-      #                             host-daemon host store RO AND the host
-      #                                         nix-daemon socket bound in;
-      #                                         the container runs no daemon
-      #                                         and has no nixbld users -
-      #                                         every build/query is delegated
-      #                                         to the host daemon. Requires
-      #                                         the host's store prefix to be
-      #                                         /nix/store and the container's
-      #                                         closure to be realised there.
-      #   nixStore.hostStore      Source path for the /nix/store mount
-      #                           (default /nix/store). Override for a
-      #                           relocated host store (e.g. nix-portable).
-      #   nixStore.daemonSocket   Host nix-daemon socket bound in for
-      #                           host-daemon mode (default
-      #                           /nix/var/nix/daemon-socket/socket).
-      #
       #   runName                 basename of the run-script binary
       #                           (default "nix-dev-container"). mkNixct
       #                           sets "nixct".
       #   idleTimeout             seconds of no active develop session
       #                           after which a host-side monitor stops
       #                           the container. 0 (default) = disabled.
-      #   stateDirLine            override the bash line that sets
-      #                           $STATE_DIR (default: persistent under
-      #                           XDG_STATE_HOME). null keeps the default;
-      #                           mkNixct passes a tmpfs (XDG_RUNTIME_DIR)
-      #                           line for ephemeral state.
       mkContainer =
         { modules ? [ ]
         , shellUser ? "root"
         , name ? "nixct"
-        , portable ? { }
+        , storage ? (overlay { })
+        , lower ? "squashfs"
+        , hostNixStore ? false
+        , hostNixDaemon ? false
         , gpu ? { }
         , keepId ? { }
-        , nixStore ? { }
         , runName ? "nix-dev-container"
         , idleTimeout ? 0
-        , stateDirLine ? null
         }:
         let
-          # Unpack the structured options into the flat names the rest of
-          # mkContainer / run.nix already use.
-          portableFormat              = portable.format or "squashfs";
           hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
           useKeepId                   = keepId.enable or false;
           keepIdUid                   = keepId.uid or 1000;
           keepIdGid                   = keepId.gid or 100;
-          nixStoreMode                = nixStore.mode or "overlay";
-          hostStore                   = nixStore.hostStore or "/nix/store";
-          daemonSocket                = nixStore.daemonSocket or "/nix/var/nix/daemon-socket/socket";
-          hostDaemon                  = nixStoreMode == "host-daemon";
+
+          # Normalise the storage axis.
+          isOverlayStorage = builtins.isAttrs storage && (storage._type or null) == "overlay";
+          isEphemeral      = storage == "ephemeral";
+
+          # hostNixDaemon supersedes hostNixStore: the whole /nix comes
+          # from the host, so a separate host-store toggle is meaningless.
+          effectiveHostNixStore =
+            if hostNixDaemon && hostNixStore
+            then builtins.trace
+              "nix-dev-container: hostNixStore is ignored because hostNixDaemon is true (the whole /nix comes from the host)"
+              false
+            else hostNixStore;
+
+          # ----- INTERNAL BRIDGE to the legacy run.nix / portable-tarball
+          # parameters. run.nix and portable-tarball.nix are owned by a
+          # later phase and still take the old flat names; we derive them
+          # from the new axes here. The real FUSE / self-contained runtime
+          # (driven by hostNixStore / the new lower) arrives next phase -
+          # for now the runtime is unchanged: host store RO + overlay
+          # upper, or host-daemon delegation.
+          hostDaemon   = hostNixDaemon;
+          nixStoreMode = if hostNixDaemon then "host-daemon" else "overlay";
+          hostStore    = "/nix/store";
+          daemonSocket = "/nix/var/nix/daemon-socket/socket";
+          # Portable-tarball layer format follows the `lower` axis.
+          portableFormat = if lower == "folder" then "folder" else "squashfs";
 
           # Tool resolution attrset - full /nix/store paths for the NixOS
           # build. See nix/scripts/tools.nix for the contract.
@@ -238,7 +267,12 @@
                       nixStoreMode hostStore daemonSocket;
               hostWatchdogPath = "${hostWatchdogScript}";
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
-            } // nixpkgs.lib.optionalAttrs (stateDirLine != null) { inherit stateDirLine; });
+              # Bridge the storage axis to run.nix's stateDirLine: ephemeral
+              # storage puts STATE_DIR (overlay upper/work) on tmpfs; all
+              # other strategies keep run.nix's persistent default.
+            } // nixpkgs.lib.optionalAttrs isEphemeral {
+              stateDirLine = "STATE_DIR=\${STATE_DIR:-\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixct/$NAME}";
+            });
           };
           # Per-container subcommand packages. Each is a derivation named for
           # the subcommand with a single bin/<name> binary, so
@@ -267,18 +301,38 @@
             purge    = mkSubcommandPkg "purge";
           };
 
-          # Rootfs as a directory of real files (full closure copied).
-          # Source of truth for the portable-tarball target. The
-          # squashfs blob below is built ON TOP of this same staging
-          # tree.
+          # ----- New orthogonal layer derivations -----------------------
+          # These are the building blocks of the next-phase runtime. They
+          # are computed and EXPOSED now (so `nix flake check` builds them)
+          # but not yet fed to run.nix - the runtime still rides the legacy
+          # symlink-farm `rootfs` above via the bridge.
+          #
+          #   nixStoreLower - the /nix/store closure as its own layer.
+          #   systemLower   - the NixOS system (FHS skeleton + /init) layer.
+          #   fuse          - the runtime FUSE helper for host-served stores.
+          nixStoreLower = import ./nix/nix-store-lower.nix {
+            inherit pkgs toplevel closure;
+          };
+          systemLower = import ./nix/system-lower.nix {
+            inherit pkgs toplevel closure nixStoreLower;
+          };
+          fuse = import ./nix/fuse.nix { inherit pkgs; };
+
+          # Bake the store into the immutable lower only when neither host
+          # source is used (host FUSE store / host nix-daemon).
+          includeStore = !(effectiveHostNixStore || hostNixDaemon);
+
+          # Rootfs as a directory of real files, assembled from the new
+          # system / nix-store lowers. Source of truth for the portable
+          # folder target; the squashfs blob is built over the same tree.
           rootfsFolder = import ./nix/rootfs-folder.nix {
-            inherit pkgs toplevel closure name;
+            inherit pkgs systemLower nixStoreLower includeStore name;
           };
 
-          # Squashfs blob over rootfsFolder. Built on demand; reused
-          # by the squashfs / both portable formats.
+          # Squashfs blob over the same assembled tree. Built on demand;
+          # reused by the squashfs / both portable formats.
           rootfsSquashfs = import ./nix/rootfs-squashfs.nix {
-            inherit pkgs rootfsFolder;
+            inherit pkgs systemLower nixStoreLower includeStore name;
           };
 
           # Portable tarball. Named distinctly from the `portable` function
@@ -296,6 +350,7 @@
         {
           inherit nixosSystem toplevel rootfs
                   rootfsFolder rootfsSquashfs
+                  nixStoreLower systemLower fuse
                   run packages;
           portable = portableTarball;
         };
@@ -310,6 +365,12 @@
         # the child). Host-uid translation for Wayland / develop binds
         # will be handled per-volume via podman idmap (option 2) once
         # implemented.
+        #
+        # Persistent on-disk overlay with a squashfs lower - this is the
+        # mkContainer default, spelled out here for clarity.
+        storage = overlay { lower = "squashfs"; };
+        hostNixStore = false;
+        hostNixDaemon = false;
         keepId.enable = false;
       };
 
@@ -324,7 +385,7 @@
         shellUser = "dev";
         name = "testdaemon";
         keepId.enable = false;
-        nixStore.mode = "host-daemon";
+        hostNixDaemon = true;
       };
 
       # Thin wrapper producing a host-daemon, develop-only, tmpfs-state,
@@ -341,11 +402,9 @@
           modules = [ ./nix/nixct-system.nix ];
           shellUser = "root";        # no dev user; entry is `nixct develop`
           runName = "nixct";
-          nixStore.mode = "host-daemon";
+          hostNixDaemon = true;      # /nix from the host daemon, no nixbld
+          storage = "ephemeral";     # overlay upper/work on tmpfs (no state)
           gpu.hostHasToolkit = gpuHasToolkit;
-          # No permanent state: put STATE_DIR on tmpfs (XDG_RUNTIME_DIR), so
-          # upper/work are ephemeral. $-refs are literal bash for run.nix.
-          stateDirLine = "STATE_DIR=\${STATE_DIR:-\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixct/$NAME}";
         };
 
       nixctInstance = mkNixct { };
@@ -374,7 +433,7 @@
         name = "nixct-nvidia";
         gpu.hostHasToolkit = true;
         keepId.enable = false;
-        portable.format = "folder";
+        lower = "folder";
       };
 
     in
@@ -428,33 +487,24 @@
       # rejects nested attrsets in `packages`. `nix run` searches
       # apps -> packages -> legacyPackages, so `nix run .#testcontainer.enter`
       # still resolves cleanly.
-      legacyPackages.${system} = {
-        testcontainer = example.packages // {
-          rootfsFolder   = example.rootfsFolder;
-          rootfsSquashfs = example.rootfsSquashfs;
-          portable       = example.portable;
+      legacyPackages.${system} =
+        let
+          # Per-container build targets exposed so `nix flake check` walks
+          # into (and thus builds) the layer derivations as well as the
+          # subcommand packages.
+          ctTargets = ct: ct.packages // {
+            inherit (ct) rootfsFolder rootfsSquashfs
+                         nixStoreLower systemLower fuse;
+            portable = ct.portable;
+          };
+        in
+        {
+          testcontainer = ctTargets example;
+          testdaemon    = ctTargets hostDaemonExample;
+          testnvidia    = ctTargets nvidia;
+          nixct-nvidia  = ctTargets nixctNvidia;
+          nixct         = ctTargets nixctInstance;
         };
-        testdaemon    = hostDaemonExample.packages // {
-          rootfsFolder   = hostDaemonExample.rootfsFolder;
-          rootfsSquashfs = hostDaemonExample.rootfsSquashfs;
-          portable       = hostDaemonExample.portable;
-        };
-        testnvidia    = nvidia.packages // {
-          rootfsFolder   = nvidia.rootfsFolder;
-          rootfsSquashfs = nvidia.rootfsSquashfs;
-          portable       = nvidia.portable;
-        };
-        nixct-nvidia  = nixctNvidia.packages // {
-          rootfsFolder   = nixctNvidia.rootfsFolder;
-          rootfsSquashfs = nixctNvidia.rootfsSquashfs;
-          portable       = nixctNvidia.portable;
-        };
-        nixct         = nixctInstance.packages // {
-          rootfsFolder   = nixctInstance.rootfsFolder;
-          rootfsSquashfs = nixctInstance.rootfsSquashfs;
-          portable       = nixctInstance.portable;
-        };
-      };
 
       apps.${system}.default = {
         type = "app";
