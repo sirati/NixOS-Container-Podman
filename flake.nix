@@ -42,10 +42,11 @@
       #     ├── init -> ${toplevel}/init            (NixOS stage-2-init.sh)
       #     └── nix-path-registration               (closure manifest)
       #
-      # The closure itself is NOT copied. It is referenced via the toplevel
-      # symlink (so Nix sees the closure as live for GC) and made available
-      # inside the container at runtime by overlay-mounting the host's
-      # /nix/store - see the run script.
+      # `rootfs` is bound to the assembled `rootfsFolder` (system-lower
+      # skeleton + prebuilt /nix/var db). Its /nix/store is baked in for a
+      # self-contained container, or left empty and filled at runtime by the
+      # FUSE (hostNixStore) or a whole-/nix rbind (hostNixDaemon); the run
+      # script decides per the axes - see nix/scripts/lib/store.nix.
       # mkContainer options are organised into ORTHOGONAL axes: each one
       # controls a single, independent concern. Every axis is optional;
       # the defaults reproduce the historical on-disk-overlay behavior of
@@ -133,12 +134,6 @@
           useKeepId                   = keepId.enable or false;
           keepIdUid                   = keepId.uid or 1000;
           keepIdGid                   = keepId.gid or 100;
-
-          # Normalise the storage axis. Only `isEphemeral` is consumed by
-          # the legacy bridge today (it selects the tmpfs stateDirLine);
-          # the full overlay-persistent vs "directory" runtime distinction
-          # is wired in the runtime phase alongside the FUSE topology.
-          isEphemeral = storage == "ephemeral";
 
           # hostNixDaemon supersedes hostNixStore: the whole /nix comes
           # from the host, so a separate host-store toggle is meaningless.
@@ -261,7 +256,7 @@
               # Bridge the storage axis to run.nix's stateDirLine: ephemeral
               # storage puts STATE_DIR (overlay upper/work) on tmpfs; all
               # other strategies keep run.nix's persistent default.
-            } // nixpkgs.lib.optionalAttrs isEphemeral {
+            } // nixpkgs.lib.optionalAttrs (storageMode == "ephemeral") {
               stateDirLine = "STATE_DIR=\${STATE_DIR:-\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixct/$NAME}";
             });
           };

@@ -6,7 +6,7 @@
 # tmpfs, postBootCommands for nix-path-registration.
 #
 # The nixDevContainer.hostDaemon.enable option (set by mkContainer from
-# nixStore.mode == "host-daemon") switches the container from running its
+# the hostNixDaemon axis) switches the container from running its
 # own nix-daemon to delegating to the HOST daemon over a bind-mounted
 # socket: no in-container daemon, no nixbld build users, store = daemon.
 # The run script provides the matching mounts (host /nix/store ro + the

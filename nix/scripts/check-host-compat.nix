@@ -96,6 +96,15 @@ in
   else
     pass "/dev/fuse: usable"
   fi
+  # user_allow_other: required for the host-nix-store FUSE, which is
+  # mounted with --allow-other so the in-container daemon (a different uid
+  # in the user-ns) can read it. libfuse refuses allow_other without this.
+  # Informational for other store modes (self-contained / host-daemon).
+  if grep -qs '^[[:space:]]*user_allow_other' /etc/fuse.conf; then
+    pass "user_allow_other: enabled in /etc/fuse.conf"
+  else
+    warn "user_allow_other: not set in /etc/fuse.conf (only needed for hostNixStore mode; add 'user_allow_other' there if you use it)"
+  fi
 
   # ----- user-ns + mount-ns combo -----------------------------------
   echo
@@ -132,7 +141,7 @@ in
   fi
 
   # ----- nix daemon (host-daemon store mode only) -------------------
-  # Containers built with nixStore.mode = "host-daemon" delegate every
+  # Containers built with hostNixDaemon = true delegate every
   # build/query to the host's nix-daemon over its socket. Probe the
   # conventional socket path; override NIX_DAEMON_SOCKET to check a
   # relocated daemon (e.g. nix-portable). Informational for other modes.

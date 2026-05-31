@@ -128,12 +128,17 @@
       # process inside podman's rootless user-ns (the same ns the
       # overlay mounts live in), serving the mount until teardown
       # fusermount3 -u's it. This mirrors how fuse-overlayfs daemonizes.
+      # stderr goes to a state-dir logfile (not /dev/null) so a failed
+      # startup is diagnosable. The most common cause is --allow-other
+      # being rejected because the host's /etc/fuse.conf lacks
+      # `user_allow_other`; the error below points at the log.
+      _fuselog="$STATE_DIR/fuse-store.log"
       setsid "$FUSE_BIN" \
         --bind-target "$NIX_STORE_LOWER/nix/store" \
         --resolution-root /nix/store \
         --redirect-root "$REDIRECT_ROOT" \
         --allow-other \
-        "$STATE_DIR/fuse-store" </dev/null >/dev/null 2>&1 &
+        "$STATE_DIR/fuse-store" </dev/null >"$_fuselog" 2>&1 &
       # Poll until the FUSE mount is live (or give up after ~5s).
       _i=0
       while [ "$_i" -lt 50 ]; do
@@ -143,6 +148,9 @@
       done
       if ! mountpoint -q "$STATE_DIR/fuse-store"; then
         echo "nix-store-shared-fuse did not come up at $STATE_DIR/fuse-store" >&2
+        echo "see $_fuselog for details (a common cause is missing" >&2
+        echo "'user_allow_other' in /etc/fuse.conf, needed for --allow-other)" >&2
+        sed 's/^/  fuse: /' "$_fuselog" >&2 2>/dev/null || true
         exit 2
       fi
       if [ "$STORAGE" = "directory" ]; then
