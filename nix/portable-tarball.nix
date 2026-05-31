@@ -43,14 +43,21 @@
 , useKeepId ? false
 , keepIdUid ? 1000
 , keepIdGid ? 100
-, nixStoreMode ? "overlay"
-, hostStore ? "/nix/store"
-, daemonSocket ? "/nix/var/nix/daemon-socket/socket"
+  # A portable tarball is ALWAYS self-contained: it ships its own
+  # /nix/store baked into the rootfs lower (the flake builds the
+  # rootfsFolder/rootfsSquashfs payload with includeStore = true) and
+  # the target host has neither the build host's /nix/store nor a
+  # nix-daemon. Both of these therefore MUST be false; they exist only
+  # so the assertion below can reject a misconfiguration explicitly.
+, hostNixStore ? false
+, hostNixDaemon ? false
 , version ? "0.0.0"
 , format ? "squashfs"
 }:
 
 assert pkgs.lib.elem format [ "squashfs" "folder" "both" ];
+assert (!hostNixStore && !hostNixDaemon)
+  || throw "portable tarball must be self-contained: hostNixStore/hostNixDaemon are not supported on a portable target (the target host has no shared /nix/store or nix-daemon)";
 
 let
   toolsLib = import ./scripts/tools.nix;
@@ -88,11 +95,11 @@ let
     STATE_DIR=''${STATE_DIR:-$DATA_DIR}
   '';
 
-  # All formats also set NIX_STORE_LOWER (the lowerdir for the
-  # /nix/store fuse-overlayfs) to ROOTFS/nix/store. On portable
-  # hosts there is no host-side /nix/store; the rootfs blob/folder
-  # contains the full closure, so the fuse-overlayfs lower must
-  # point inside the (just-mounted) rootfs instead.
+  # mount_rootfs_lower() only resolves $ROOTFS (the extracted/mounted
+  # rootfs lower). The /nix/store overlay lower is derived internally by
+  # store.nix from $ROOTFS/nix/store, since a portable tarball is always
+  # self-contained (the rootfs payload carries the full closure). There
+  # is no host-side /nix/store or nix-daemon, so nothing else to set.
   mountLowerBody =
     if format == "folder" then ''
       if [ ! -d "$ROOTFS_DIR" ]; then
@@ -100,10 +107,6 @@ let
         exit 1
       fi
       ROOTFS=$ROOTFS_DIR
-      # host-daemon: the store comes from the host, so keep
-      # NIX_STORE_LOWER at its build-time default. Other modes use the
-      # rootfs-embedded closure as the lower.
-      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '' else if format == "squashfs" then ''
       ROOTFS=$STATE_DIR/lower-mount
       mkdir -p -- "$ROOTFS"
@@ -114,10 +117,6 @@ let
         fi
         squashfuse "$ROOTFS_BLOB" "$ROOTFS"
       fi
-      # host-daemon: the store comes from the host, so keep
-      # NIX_STORE_LOWER at its build-time default. Other modes use the
-      # rootfs-embedded closure as the lower.
-      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '' else /* both */ ''
       if command -v squashfuse >/dev/null 2>&1 && [ -e "$ROOTFS_BLOB" ]; then
         ROOTFS=$STATE_DIR/lower-mount
@@ -131,16 +130,20 @@ let
         echo "mount_rootfs_lower: neither data/lower.squash + squashfuse nor data/lower/ usable" >&2
         exit 1
       fi
-      # host-daemon: the store comes from the host, so keep
-      # NIX_STORE_LOWER at its build-time default. Other modes use the
-      # rootfs-embedded closure as the lower.
-      [ "$NIX_STORE_MODE" = "host-daemon" ] || NIX_STORE_LOWER=$ROOTFS/nix/store
     '';
 
   runText = import ./scripts/run.nix {
     inherit tools shellUser name
-            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
-            nixStoreMode hostStore daemonSocket;
+            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+    # Portable is always self-contained: persistent on-disk overlay
+    # (data/upper), store baked into the rootfs lower, no host store or
+    # daemon. nixStoreLower stays null so store.nix derives the lower
+    # from $ROOTFS/nix/store itself; redirectRoot keeps its default.
+    storage = "overlay";
+    hostNixStore = false;
+    hostNixDaemon = false;
+    fusePath = null;
+    nixStoreLower = null;
     rootfs = null;
     inherit rootfsLine stateDirLine mountLowerBody;
     hostWatchdogPath    = ''"$_BASE_DIR/lib/host-watchdog"'';
