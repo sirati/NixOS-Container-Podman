@@ -18,6 +18,7 @@ pkgs.runCommand "nix-store-lower"
   {
     passthru = { inherit toplevel closure; };
   } ''
+  set -euo pipefail
   mkdir -p $out/nix/store
 
   # Symlink each closure path into $out/nix/store. Each p is

@@ -92,6 +92,12 @@ pkgs.runCommand "nix-container-system-lower"
       exit 1
     fi
 
+    # nix-store --load-db side-creates the GC reserved-space block (~8 MiB)
+    # and a big-lock in the db dir. Neither belongs in an immutable lower
+    # layer; the runtime /nix/var (overlay upper or writable rootfs) recreates
+    # them on demand. Drop them so the layer stays small.
+    rm -f $out/nix/var/nix/db/reserved $out/nix/var/nix/db/big-lock
+
     # --- GC reference to nixStoreLower -------------------------------------
     # A passthru alone does NOT create a build-output reference. Writing the
     # path into a file in $out makes Nix record nixStoreLower as a runtime
