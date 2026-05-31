@@ -31,20 +31,35 @@
   # empty so podman uses whatever it's configured for (typically runc
   # or crun via /etc/containers/containers.conf on Debian/Fedora/Arch).
 , ociRuntimeFlag ? "--runtime ${tools.crun}"
-  # ----- /nix/store policy (build-time defaults) -----------------
-  # nixStoreMode : default NIX_STORE_MODE. One of overlay|passthrough|
-  #                ro|host-daemon. host-daemon is COUPLED to NixOS-module
-  #                config baked at build time (no in-container daemon /
-  #                nixbld users, store = daemon), so unlike the other
-  #                three it can't be toggled at runtime via NIX_STORE_MODE.
-  # hostStore    : default lowerdir/source for the /nix/store bind
-  #                (NIX_STORE_LOWER). Usually /nix/store; override for a
-  #                relocated host store (e.g. nix-portable).
-  # daemonSocket : host nix-daemon socket bound into the container in
-  #                host-daemon mode (NIX_DAEMON_SOCKET).
-, nixStoreMode ? "overlay"
-, hostStore ? "/nix/store"
-, daemonSocket ? "/nix/var/nix/daemon-socket/socket"
+  # ----- /nix provisioning policy (ORTHOGONAL build-time axes) ---
+  # storage       : rootfs-base storage profile. One of:
+  #                   ephemeral  - overlay upper/work on tmpfs (gone on stop)
+  #                   overlay    - overlay upper/work on disk (persists)
+  #                   directory  - no overlay; $MERGED is a materialized
+  #                                writable real copy of $ROOTFS.
+  #                 Overridable at runtime via the STORAGE env.
+  # hostNixStore  : serve the HOST /nix/store into the container via the
+  #                 nix-store-shared-fuse symlink farm (RO lower) with a
+  #                 writable fuse-overlayfs upper. Overridable via the
+  #                 HOST_NIX_STORE env. Ignored when hostNixDaemon.
+  # hostNixDaemon : delegate to the HOST nix-daemon: rbind the whole host
+  #                 /nix read-only (store + db + socket). COUPLED to the
+  #                 NixOS host-daemon module profile baked at build time
+  #                 (no in-container daemon / nixbld users), so it CANNOT
+  #                 be toggled on/off at runtime.
+  # fusePath      : absolute path to the nix-store-shared-fuse binary;
+  #                 set when hostNixStore && !hostNixDaemon.
+  # redirectRoot  : physical store root the FUSE reads content from
+  #                 (default /nix/store; a relocated store overrides it).
+  # nixStoreLower : store path of the symlink FARM = the FUSE
+  #                 --bind-target AND the host-side GC-root target; set
+  #                 when hostNixStore && !hostNixDaemon.
+, storage ? "overlay"
+, hostNixStore ? false
+, hostNixDaemon ? false
+, fusePath ? null
+, redirectRoot ? "/nix/store"
+, nixStoreLower ? null
   # idleTimeout : integer seconds of no active develop session after
   #               which the container is torn down by a host-side idle
   #               monitor. 0 (default) disables the monitor entirely;
@@ -84,17 +99,18 @@ in
   #     which enters the rootless user-namespace where we have
   #     CAP_SYS_ADMIN.
   #
-  #   - Two overlays:
-  #       Rootfs overlay (kernel overlayfs, userxattr):
-  #         lower = $ROOTFS (Nix store path)
-  #         upper = $STATE_DIR/upper
-  #         work  = $STATE_DIR/work
-  #         merged= $STATE_DIR/merged
-  #       Nix-store mount (mode-dependent; see nix/scripts/lib/store.nix):
-  #         overlay      = fuse-overlayfs (lower /nix/store + rw upper)
-  #         passthrough  = bind host /nix/store rw
-  #         ro           = bind host /nix/store ro
-  #         host-daemon  = bind host /nix/store ro + bind host daemon socket
+  #   - Rootfs base at $MERGED (see nix/scripts/lib/store.nix):
+  #       ephemeral/overlay = kernel overlayfs lower=$ROOTFS over a
+  #                           writable upper/work (tmpfs vs on-disk).
+  #       directory         = no overlay; $MERGED is a materialized
+  #                           writable real copy of $ROOTFS.
+  #   - /nix provisioning on top of the base (orthogonal axes):
+  #       HOST_NIX_DAEMON=1 = rbind whole host /nix ro (store+db+socket)
+  #       HOST_NIX_STORE=1  = nix-store-shared-fuse over the symlink farm
+  #                           (RO) + writable fuse-overlayfs upper
+  #                           (RO bind in directory mode)
+  #       neither           = self-contained store baked in $ROOTFS,
+  #                           served via fuse-overlayfs (own mount)
   #
   #   - At up time we ALSO bind-mount $STATE_DIR/work-shared to
   #     itself and make it rshared, so the container's /work can
@@ -132,12 +148,44 @@ in
   NAME=''${NAME:-$DEFAULT_NAME}
   ${stateDirLine}
 
-  # Build-time default store mode. Overridable via env EXCEPT that
-  # host-daemon is coupled to NixOS-module config baked at build time
-  # (no in-container daemon / nixbld users), so it can't be switched
-  # on or off at runtime.
-  BUILT_NIX_STORE_MODE=${nixStoreMode}
-  NIX_STORE_MODE=''${NIX_STORE_MODE:-$BUILT_NIX_STORE_MODE}
+  # ----- /nix provisioning axes (build-time defaults; env overrides) ----
+  # STORAGE and HOST_NIX_STORE are runtime-overridable. HOST_NIX_DAEMON
+  # is coupled to NixOS-module config baked at build time (no in-container
+  # daemon / nixbld users, store = daemon), so it CANNOT be toggled at
+  # runtime - only the build-time default is honored.
+  STORAGE=''${STORAGE:-${storage}}
+  BUILT_HOST_NIX_STORE=${if hostNixStore then "1" else "0"}
+  HOST_NIX_STORE=''${HOST_NIX_STORE:-$BUILT_HOST_NIX_STORE}
+  BUILT_HOST_NIX_DAEMON=${if hostNixDaemon then "1" else "0"}
+  HOST_NIX_DAEMON=''${HOST_NIX_DAEMON:-$BUILT_HOST_NIX_DAEMON}
+  # FUSE binary + farm path + physical redirect root for HOST_NIX_STORE.
+  FUSE_BIN=''${FUSE_BIN:-${if fusePath == null then "" else fusePath}}
+  REDIRECT_ROOT=''${REDIRECT_ROOT:-${redirectRoot}}
+  # NIX_STORE_LOWER: the symlink-FARM store path (= FUSE --bind-target and
+  # the host-side GC-root target). Empty unless hostNixStore. NOTE: this
+  # is the symlink farm, NOT the old "host /nix/store source".
+  NIX_STORE_LOWER=''${NIX_STORE_LOWER:-${if nixStoreLower == null then "" else nixStoreLower}}
+
+  case "$STORAGE" in
+    ephemeral|overlay|directory) ;;
+    *) echo "error: bad STORAGE=$STORAGE (want ephemeral|overlay|directory)" >&2; exit 2 ;;
+  esac
+  # HOST_NIX_DAEMON is build-coupled: refuse a runtime toggle either way.
+  if [ "$BUILT_HOST_NIX_DAEMON" != "$HOST_NIX_DAEMON" ]; then
+    echo "error: HOST_NIX_DAEMON is fixed at build time (built: $BUILT_HOST_NIX_DAEMON); the NixOS host-daemon profile cannot be toggled at runtime" >&2
+    exit 2
+  fi
+  # In daemon mode the host store axis is meaningless; force it off.
+  if [ "$HOST_NIX_DAEMON" = "1" ]; then
+    HOST_NIX_STORE=0
+  fi
+  # host-store needs both the FUSE binary and the symlink-farm path.
+  if [ "$HOST_NIX_STORE" = "1" ]; then
+    if [ -z "$FUSE_BIN" ] || [ -z "$NIX_STORE_LOWER" ]; then
+      echo "error: HOST_NIX_STORE=1 requires FUSE_BIN and NIX_STORE_LOWER to be set" >&2
+      exit 2
+    fi
+  fi
 
   # Idle-timeout default (seconds; 0 = disabled). Overridable via env.
   BUILT_IDLE_TIMEOUT=${toString idleTimeout}
@@ -145,25 +193,6 @@ in
   # Sanitize: a non-integer (e.g. a bad NIXCT_IDLE_TIMEOUT) disables it
   # cleanly instead of tripping `[ -gt ]` integer errors later.
   case "$IDLE_TIMEOUT" in ""|*[!0-9]*) IDLE_TIMEOUT=0 ;; esac
-  if [ "$BUILT_NIX_STORE_MODE" = "host-daemon" ] && [ "$NIX_STORE_MODE" != "host-daemon" ]; then
-    echo "note: container was built for host-daemon mode; ignoring NIX_STORE_MODE=$NIX_STORE_MODE" >&2
-    NIX_STORE_MODE=host-daemon
-  fi
-  if [ "$BUILT_NIX_STORE_MODE" != "host-daemon" ] && [ "$NIX_STORE_MODE" = "host-daemon" ]; then
-    echo "error: host-daemon mode requires building mkContainer with nixStore.mode = \"host-daemon\"" >&2
-    exit 2
-  fi
-
-  # Lowerdir/source for the /nix/store mount. NixOS-host: the host's
-  # real /nix/store (or a relocated store, e.g. nix-portable, via the
-  # build-time hostStore default or the NIX_STORE_LOWER env). Portable:
-  # the rootfs-embedded /nix/store (set by mount_rootfs_lower). The
-  # :=-assignment leaves an override untouched.
-  : "''${NIX_STORE_LOWER:=${hostStore}}"
-  # host-daemon: path to the host's nix-daemon socket. Bound into the
-  # container at /nix/var/nix/daemon-socket/socket. Override for a
-  # relocated daemon (e.g. nix-portable's socket).
-  : "''${NIX_DAEMON_SOCKET:=${daemonSocket}}"
 
   UPPER="$STATE_DIR/upper"
   WORK="$STATE_DIR/work"
@@ -172,6 +201,11 @@ in
   NIX_WORK="$STATE_DIR/nix-store-work"
   PODMAN_ROOT="$STATE_DIR/podman-root"
   PODMAN_RUNROOT="$STATE_DIR/podman-runroot"
+  # host-store only: indirect GC root pinning the symlink-farm closure
+  # ($NIX_STORE_LOWER) for the container's lifetime, so the host daemon
+  # can't collect the store paths the FUSE serves. Planted at up,
+  # removed at down/purge.
+  NIX_STORE_LOWER_GCROOT="$STATE_DIR/nix-store-lower.gcroot"
 
   # ----- helpers -------------------------------------------------
 
@@ -189,13 +223,39 @@ in
   # inherit their source's perms (typically 0755 for Wayland,
   # 0777 for X11), which is what gates actual access.
   SOCKET_MOUNTS="$STATE_DIR/socket-mounts"
-  # host-daemon only: per-session GC-root directory. Bound into the
+  # HOST_NIX_DAEMON only: per-session GC-root directory. Bound into the
   # container at the IDENTICAL absolute path so a store-pointing
   # symlink created here resolves the same in both namespaces; the
   # host nix-daemon then protects those paths from
   # nix-collect-garbage for the session lifetime. Each develop
   # session gets a 0700 root-owned subdir $SESSION_GCROOTS/<mount_id>.
   SESSION_GCROOTS="$STATE_DIR/session-gcroots"
+
+  # plant_store_gcroot / drop_store_gcroot: host-side GC-root lifecycle
+  # for HOST_NIX_STORE mode. The symlink farm ($NIX_STORE_LOWER) and its
+  # closure live in the HOST store; an indirect root keeps the host
+  # daemon from collecting them while the container exists. No-op unless
+  # HOST_NIX_STORE=1 (self-contained / daemon modes don't need it).
+  plant_store_gcroot() {
+    [ "$HOST_NIX_STORE" = "1" ] || return 0
+    [ -n "$NIX_STORE_LOWER" ] || return 0
+    nix-store --realise --add-root "$NIX_STORE_LOWER_GCROOT" \
+      "$NIX_STORE_LOWER" >/dev/null 2>&1 || true
+  }
+  drop_store_gcroot() {
+    rm -f -- "$NIX_STORE_LOWER_GCROOT" 2>/dev/null || true
+  }
+  # store_summary: one-word description of the /nix provisioning for
+  # status / up output, derived from the resolved axes.
+  store_summary() {
+    if [ "$HOST_NIX_DAEMON" = "1" ]; then
+      echo "host-daemon"
+    elif [ "$HOST_NIX_STORE" = "1" ]; then
+      echo "host-store"
+    else
+      echo "self-contained"
+    fi
+  }
 
   # Idempotent: create $STATE_DIR layout, pre-populate UPPER with
   # writable copies of every directory NixOS activation chmods or
@@ -210,11 +270,36 @@ in
     chmod 0700 -- "$WORK_SHARED"
     chmod 0711 -- "$SOCKET_MOUNTS"
 
-    # host-daemon: per-session GC-root parent dir (host side, owned
+    # HOST_NIX_DAEMON: per-session GC-root parent dir (host side, owned
     # by the calling user = container root under default rootless).
-    if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+    if [ "$HOST_NIX_DAEMON" = "1" ]; then
       mkdir -p "$SESSION_GCROOTS"
       chmod 0700 -- "$SESSION_GCROOTS"
+    fi
+
+    # NIX_UPPER / NIX_WORK back the /nix/store overlay, needed for every
+    # combo EXCEPT directory mode (no overlays) and HOST_NIX_DAEMON (whole
+    # /nix rbind). Created here; harmless to skip when unused.
+    _STORE_OVERLAY=0
+    if [ "$STORAGE" != "directory" ] && [ "$HOST_NIX_DAEMON" != "1" ]; then
+      _STORE_OVERLAY=1
+    fi
+
+    if [ "$STORAGE" = "directory" ]; then
+      # No rootfs overlay: materialize $ROOTFS into a writable real copy
+      # at $MERGED. Idempotent - skip if already populated (a non-empty
+      # $MERGED means a prior run already copied it). cp -a preserves the
+      # tree; chmod -R u+w makes the store-derived 0444/0555 files
+      # writable so in-container activation can rewrite them. Run inside
+      # podman unshare for CAP_DAC_OVERRIDE on subuid-owned files.
+      _ROOTFS=$ROOTFS _MERGED=$MERGED \
+        podman unshare ${tools.bash} -c '
+        set -euo pipefail
+        if [ -z "$(ls -A "$_MERGED" 2>/dev/null)" ]; then
+          cp -a "$_ROOTFS"/. "$_MERGED"/
+          chmod -R u+w "$_MERGED"
+        fi
+      '
     fi
 
     # UPPER and NIX_UPPER may already be migrated to host's
@@ -224,11 +309,17 @@ in
     # has CAP_FOWNER + CAP_DAC_OVERRIDE for files owned by
     # uids mapped in the rootless user-ns - covers both the
     # pre-migration (sirati-owned) and post-migration (subuid-
-    # owned) cases.
+    # owned) cases. The UPPER skeleton only backs the rootfs
+    # overlay (ephemeral/overlay); directory mode has none.
     _UPPER=$UPPER _NIX_UPPER=$NIX_UPPER _NIX_WORK=$NIX_WORK \
+    _STORAGE=$STORAGE _STORE_OVERLAY=$_STORE_OVERLAY \
       podman unshare ${tools.bash} -c '
       set -euo pipefail
-      mkdir -p "$_UPPER" "$_NIX_UPPER" "$_NIX_WORK"
+      if [ "$_STORE_OVERLAY" = "1" ]; then
+        mkdir -p "$_NIX_UPPER" "$_NIX_WORK"
+      fi
+      [ "$_STORAGE" = "directory" ] && exit 0
+      mkdir -p "$_UPPER"
       mkdir -p \
         "$_UPPER"/bin "$_UPPER"/sbin \
         "$_UPPER"/etc "$_UPPER"/home "$_UPPER"/root \
@@ -369,16 +460,20 @@ in
     # `develop`) and the in-container watchdogs can rendezvous
     # over `$HOST_WATCHDOG_DIR/<mount_id>/sock`.
     mkdir -p "$HOST_WATCHDOG_DIR"
+    # HOST_NIX_STORE: pin the symlink-farm closure in the host store with
+    # an indirect GC root for the container's lifetime (no-op otherwise).
+    plant_store_gcroot
     migrate_to_keepid
     export USE_KEEP_ID KEEPID_UID KEEPID_GID
-    export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK NIX_STORE_LOWER
-    export NIX_DAEMON_SOCKET
+    export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK STATE_DIR
+    # New /nix provisioning axes (consumed by store.nix mountAll).
+    export STORAGE HOST_NIX_STORE HOST_NIX_DAEMON
+    export FUSE_BIN REDIRECT_ROOT NIX_STORE_LOWER
     export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS
     export HOST_WATCHDOG_DIR
     export SESSION_GCROOTS
     export LXCFS_FLAGS
     LXCFS_FLAGS=$(lxcfs_flags)
-    export NIX_STORE_MODE
     # GPU / OpenGL flags from --gpu / --opengl (computed by caller).
     export GPU_FLAGS_STR
     GPU_FLAGS_STR=$(accelerator_flags \
@@ -391,7 +486,8 @@ in
     podman unshare "${tools.bash}" <<'INNER'
   set -euo pipefail
 
-  # Mount the rootfs overlay + /nix/store (per NIX_STORE_MODE).
+  # Mount the rootfs base + provision /nix (per the storage/host-nix
+  # axes; see nix/scripts/lib/store.nix).
   ${storeLib.mountAll}
 
   # WORK_SHARED and SOCKET_MOUNTS must be shared mounts so
@@ -406,12 +502,12 @@ in
   fi
   mount --make-rshared "$SOCKET_MOUNTS"
 
-  # host-daemon: bind the per-session GC-root dir at the IDENTICAL
+  # HOST_NIX_DAEMON: bind the per-session GC-root dir at the IDENTICAL
   # absolute path in the container, so symlinks created there by the
   # gcroot-keeper resolve the same in both namespaces and the host
   # daemon protects the referenced store paths.
   GCROOTS_BIND=()
-  if [ "''${NIX_STORE_MODE:-}" = "host-daemon" ]; then
+  if [ "''${HOST_NIX_DAEMON:-0}" = "1" ]; then
     GCROOTS_BIND=(-v "$SESSION_GCROOTS:$SESSION_GCROOTS")
   fi
 
@@ -501,8 +597,8 @@ in
   # maybe_start_idle_monitor: spawn the host-side __idle-monitor loop
   # detached, but only when an idle timeout is configured. The monitor
   # re-execs THIS script and recomputes every path from the prologue;
-  # we hand it STATE_DIR/NAME/NIX_STORE_MODE + the timeout in the env so
-  # it lands on the identical paths. setsid + redirections + disown
+  # we hand it STATE_DIR/NAME + the resolved /nix axes + the timeout in
+  # the env so it lands on the identical paths. setsid + redirections + disown
   # fully detach it from the foreground command; the monitor's own
   # flock keeps a single instance even across repeated calls.
   # mark_activity: bump the idle-monitor's activity marker. Called
@@ -515,7 +611,11 @@ in
   maybe_start_idle_monitor() {
     [ "''${IDLE_TIMEOUT:-0}" -gt 0 ] || return 0
     mark_activity
-    STATE_DIR="$STATE_DIR" NAME="$NAME" NIX_STORE_MODE="$NIX_STORE_MODE" \
+    STATE_DIR="$STATE_DIR" NAME="$NAME" \
+      STORAGE="$STORAGE" HOST_NIX_STORE="$HOST_NIX_STORE" \
+      HOST_NIX_DAEMON="$HOST_NIX_DAEMON" \
+      FUSE_BIN="$FUSE_BIN" REDIRECT_ROOT="$REDIRECT_ROOT" \
+      NIX_STORE_LOWER="$NIX_STORE_LOWER" \
       NIXCT_IDLE_TIMEOUT="$IDLE_TIMEOUT" \
       setsid "$0" __idle-monitor </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
@@ -531,9 +631,13 @@ in
     # Container's mount-ns dying releases the overlays. Clean up
     # any per-session $WORK_SHARED binds and the rshared self-bind.
     _WS=$WORK_SHARED _MG=$MERGED _SM=$SOCKET_MOUNTS \
+    _STATE_DIR=$STATE_DIR _HOST_NIX_DAEMON=$HOST_NIX_DAEMON \
       podman unshare "${tools.bash}" -c '
       set +e
       MERGED="$_MG"
+      # store.nix unmount fragment reads these.
+      STATE_DIR="$_STATE_DIR"
+      HOST_NIX_DAEMON="$_HOST_NIX_DAEMON"
       # socat-proxied socket binds: $WS/.sockets/<ns>/<name>
       if [ -d "$_WS/.sockets" ]; then
         for d in "$_WS"/.sockets/*/; do
@@ -564,6 +668,9 @@ in
       ${storeLib.unmount}
       exit 0
     ' || true
+    # Release the host-store GC root so the closure can be collected
+    # again (no-op unless HOST_NIX_STORE planted one).
+    drop_store_gcroot
   }
 
   # ----- subcommand dispatch ------------------------------------
@@ -593,7 +700,7 @@ in
       tags=""
       [ "$ENABLE_GPU"    = "1" ] && tags="$tags gpu"
       [ "$ENABLE_OPENGL" = "1" ] && tags="$tags opengl"
-      echo "$NAME: up''${tags:+ (''${tags# })} [store: $NIX_STORE_MODE]"
+      echo "$NAME: up''${tags:+ (''${tags# })} [storage: $STORAGE, nix: $(store_summary)]"
       maybe_start_idle_monitor
       ;;
     down|stop)
@@ -856,7 +963,7 @@ in
       # user (enforced by systemd-run --uid/--gid below), preserving
       # trust separation. Other modes keep plain `nix develop`.
       develop_cmd='nix develop'
-      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+      if [ "$HOST_NIX_DAEMON" = "1" ]; then
         # $HOME expands inside the inner `bash -lc` as the session
         # user, not here - keep it single-quoted.
         # shellcheck disable=SC2016
@@ -931,14 +1038,14 @@ in
             "$mount_id" "$session_user" >/dev/null
       fi
 
-      # host-daemon: create the per-session GC-root subdir (as
+      # HOST_NIX_DAEMON: create the per-session GC-root subdir (as
       # container root, mode 0700 - outside /develop-home so the
       # session user can't reach it) and spawn the gcroot-keeper.
       # The keeper watches the session HOME, registers store-pointing
       # symlinks here, and (because this dir is bound at an identical
       # path host-side) the host nix-daemon protects those paths from
       # nix-collect-garbage for the session lifetime.
-      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
+      if [ "$HOST_NIX_DAEMON" = "1" ]; then
         pm exec -u root "$NAME" \
           /run/current-system/sw/bin/mkdir -p "$SESSION_GCROOTS/$mount_id"
         pm exec -u root "$NAME" \
@@ -996,19 +1103,21 @@ in
       ensure_state
       mount_rootfs_lower
       mkdir -p "$HOST_WATCHDOG_DIR"
+      plant_store_gcroot
       export ENABLE_OPENGL
       GPU_FLAGS_STR=$(accelerator_flags "$ENABLE_GPU" "$ENABLE_OPENGL")
       export GPU_FLAGS_STR
       migrate_to_keepid
       export USE_KEEP_ID KEEPID_UID KEEPID_GID
-      export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK NIX_STORE_LOWER
-      export NIX_DAEMON_SOCKET
-      export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS NIX_STORE_MODE
+      export ROOTFS UPPER WORK MERGED NIX_UPPER NIX_WORK STATE_DIR
+      export STORAGE HOST_NIX_STORE HOST_NIX_DAEMON
+      export FUSE_BIN REDIRECT_ROOT NIX_STORE_LOWER
+      export PODMAN_ROOT PODMAN_RUNROOT NAME WORK_SHARED SOCKET_MOUNTS
       export HOST_WATCHDOG_DIR
       podman unshare "${tools.bash}" <<'INNER'
   set -euo pipefail
 
-  # Mount the rootfs overlay + /nix/store (per NIX_STORE_MODE).
+  # Mount the rootfs base + provision /nix (per the storage/host-nix axes).
   ${storeLib.mountAll}
 
   # WORK_SHARED + SOCKET_MOUNTS rshared so develop binds propagate.
@@ -1070,10 +1179,10 @@ in
         echo "$NAME: not created"
       fi
       echo "shell user: $SHELL_USER"
-      echo "store mode: $NIX_STORE_MODE"
-      if [ "$NIX_STORE_MODE" = "host-daemon" ]; then
-        echo "host store: $NIX_STORE_LOWER (ro)"
-        echo "daemon sock:$NIX_DAEMON_SOCKET"
+      echo "storage:    $STORAGE"
+      echo "nix store:  $(store_summary)"
+      if [ "$HOST_NIX_DAEMON" = "1" ]; then
+        echo "  host /nix mounted ro (store + db + daemon socket)"
         if [ -d "$SESSION_GCROOTS" ]; then
           echo "session gcroots:"
           for d in "$SESSION_GCROOTS"/*; do
@@ -1083,6 +1192,15 @@ in
             n=$(find "$d" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d '[:space:]') || n=0
             echo "  $(basename "$d") ($n roots)"
           done
+        fi
+      elif [ "$HOST_NIX_STORE" = "1" ]; then
+        echo "  farm:       $NIX_STORE_LOWER"
+        echo "  redirect:   $REDIRECT_ROOT"
+        echo "  fuse bin:   $FUSE_BIN"
+        if [ -e "$NIX_STORE_LOWER_GCROOT" ]; then
+          echo "  gc root:    planted ($NIX_STORE_LOWER_GCROOT)"
+        else
+          echo "  gc root:    absent"
         fi
       fi
       echo "rootfs:     $ROOTFS"
@@ -1138,7 +1256,7 @@ in
                                 session HOME (/develop-home/<user>) is a
                                 separate writable dir for home-level files.
                                 Re-running on the same hostpath reuses the user.
-                                In host-daemon mode the session auto-manages
+                                When HOST_NIX_DAEMON the session auto-manages
                                 GC roots: host store paths used by the
                                 session are protected from
                                 nix-collect-garbage for the session
@@ -1183,20 +1301,31 @@ in
   env:
     NAME             container name              (default $DEFAULT_NAME)
     STATE_DIR        host state directory        (default \$XDG_STATE_HOME/nix-dev-container/\$NAME)
-    NIX_STORE_MODE   overlay|passthrough|ro|host-daemon (build default: $BUILT_NIX_STORE_MODE)
-                       overlay     - host store stays untouched; in-container
-                                     installs land in a private overlay upper
-                       passthrough - container writes land in host store
-                       ro          - no installs from inside
-                       host-daemon - host /nix/store mounted ro AND the host
-                                     nix-daemon socket bound in; builds are
-                                     delegated to the host daemon. Coupled to
-                                     build-time NixOS config (no in-container
-                                     daemon / nixbld users); cannot be toggled
-                                     at runtime.
-    NIX_STORE_LOWER  source for the /nix/store mount (default $NIX_STORE_LOWER)
-    NIX_DAEMON_SOCKET host nix-daemon socket for host-daemon mode
-                       (default $NIX_DAEMON_SOCKET)
+    The /nix provisioning is driven by three ORTHOGONAL axes. STORAGE and
+    HOST_NIX_STORE are runtime-overridable; HOST_NIX_DAEMON is fixed at
+    build time (coupled to the NixOS host-daemon profile).
+    STORAGE          ephemeral|overlay|directory (build default: $STORAGE)
+                       ephemeral - rootfs overlay upper/work on tmpfs
+                                   (wiped on stop)
+                       overlay   - rootfs overlay upper/work on disk
+                                   (persists across stop/start)
+                       directory - no overlay; \$MERGED is a materialized
+                                   writable real copy of the rootfs
+    HOST_NIX_STORE   0|1 (build default: $BUILT_HOST_NIX_STORE). When 1, the
+                       host store is served through the nix-store-shared-fuse
+                       symlink farm (RO) with a writable fuse-overlayfs upper
+                       (RO bind in directory mode). Requires FUSE_BIN +
+                       NIX_STORE_LOWER. Ignored when HOST_NIX_DAEMON=1.
+    HOST_NIX_DAEMON  0|1 (build default: $BUILT_HOST_NIX_DAEMON, FIXED). When 1,
+                       the whole host /nix is rbind-mounted read-only (store +
+                       db + daemon socket) and builds delegate to the host
+                       daemon. Coupled to the NixOS host-daemon module profile
+                       (no in-container daemon / nixbld users); cannot be
+                       toggled at runtime.
+    FUSE_BIN         absolute path to nix-store-shared-fuse (HOST_NIX_STORE).
+    REDIRECT_ROOT    physical store root the FUSE reads from (default $REDIRECT_ROOT).
+    NIX_STORE_LOWER  symlink-farm store path = FUSE bind_target and GC-root
+                       target (HOST_NIX_STORE; empty otherwise).
     NIXCT_IDLE_TIMEOUT idle-stop timeout in seconds (build default: $BUILT_IDLE_TIMEOUT,
                        0 = disabled). When > 0 the container auto-stops
                        after that many seconds with no active develop session.
