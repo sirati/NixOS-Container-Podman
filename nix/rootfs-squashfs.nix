@@ -23,7 +23,7 @@ let
     inherit pkgs systemLower nixStoreLower includeStore name;
   };
 in
-pkgs.runCommand "nix-container-rootfs-squashfs"
+pkgs.runCommand "${name}-rootfs-squashfs"
   {
     nativeBuildInputs = [ pkgs.squashfsTools pkgs.coreutils ];
     # Re-export the inner folder (and its layers) for debugging.

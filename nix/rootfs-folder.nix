@@ -29,7 +29,7 @@
 
 { pkgs, systemLower, nixStoreLower, includeStore ? false, name ? "nixct" }:
 
-pkgs.runCommand "nix-container-rootfs-folder"
+pkgs.runCommand "${name}-rootfs-folder"
   {
     nativeBuildInputs = [ pkgs.coreutils ];
     # Re-export the layers and the chosen mode for composition/debugging,

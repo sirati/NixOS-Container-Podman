@@ -134,9 +134,11 @@
           keepIdUid                   = keepId.uid or 1000;
           keepIdGid                   = keepId.gid or 100;
 
-          # Normalise the storage axis.
-          isOverlayStorage = builtins.isAttrs storage && (storage._type or null) == "overlay";
-          isEphemeral      = storage == "ephemeral";
+          # Normalise the storage axis. Only `isEphemeral` is consumed by
+          # the legacy bridge today (it selects the tmpfs stateDirLine);
+          # the full overlay-persistent vs "directory" runtime distinction
+          # is wired in the runtime phase alongside the FUSE topology.
+          isEphemeral = storage == "ephemeral";
 
           # hostNixDaemon supersedes hostNixStore: the whole /nix comes
           # from the host, so a separate host-store toggle is meaningless.
@@ -171,7 +173,7 @@
               ./nix/container-module.nix
               # Toggle the host-daemon NixOS profile (no in-container
               # daemon / nixbld users, store = daemon) to match the
-              # selected nixStore.mode.
+              # hostNixDaemon axis.
               { nixDevContainer.hostDaemon.enable = hostDaemon; }
             ] ++ modules;
           };
@@ -335,10 +337,9 @@
             inherit pkgs systemLower nixStoreLower includeStore name;
           };
 
-          # Portable tarball. Named distinctly from the `portable` function
-          # argument above: a `portable` let-binding would shadow the
-          # argument, so `portable.format` (read above for portableFormat)
-          # would point back here and recurse infinitely.
+          # Portable tarball. Named `portableTarball` (not `portable`) so it
+          # does not collide with the `portable` attr exposed in the result
+          # set below.
           portableTarball = import ./nix/portable-tarball.nix {
             inherit pkgs name shellUser rootfsFolder rootfsSquashfs
                     hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
@@ -452,7 +453,7 @@
       #       packages.x86_64-linux.myct = ct.packages;
       #       # `nix run .#myct.enter`, `.#myct.boot`, `.#myct.purge`, ...
       #     };
-      lib.${system} = { inherit mkContainer mkNixct; };
+      lib.${system} = { inherit mkContainer mkNixct overlay; };
 
       # Flat outputs (validated by nix flake check). These all resolve to a
       # derivation; running them invokes nix-dev-container with the matching
