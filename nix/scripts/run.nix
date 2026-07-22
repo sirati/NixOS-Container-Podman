@@ -90,6 +90,7 @@ let
   watchdogFns   = import ./lib/watchdog.nix { inherit hostWatchdogPath; };
   forwardingFns = import ./lib/forwarding.nix { inherit tools; };
   wprsFns       = import ./lib/wprs.nix { inherit tools; };
+  dbusFns       = import ./lib/dbus.nix { inherit tools; };
 in
 
 ''
@@ -147,6 +148,15 @@ in
   KEEPID_GID=${toString keepIdGid}
 
   NAME=''${NAME:-$DEFAULT_NAME}
+  # NAME feeds directly into $STATE_DIR (a path `purge` rm -rf's) as a
+  # bare string-concatenated segment, not a shell token - a NAME
+  # containing `/` (e.g. "../../../../tmp/evil") would let $STATE_DIR
+  # resolve outside the nix-dev-container state tree entirely. NAME is
+  # runtime-overridable via the NAME env var, so this can't be caught
+  # at Nix eval time; reject it here before it touches any path.
+  case "$NAME" in
+    */*|"") echo "error: NAME must not be empty or contain '/' (got: '$NAME')" >&2; exit 1 ;;
+  esac
   ${stateDirLine}
 
   # ----- /nix provisioning axes (build-time defaults; env overrides) ----
@@ -585,8 +595,16 @@ in
     # podman defaults can yield EAGAIN when large apps spawn
     # threads (Firefox, ML toolkits). Capped by host's hard
     # limit for the invoking user.
-    --ulimit nproc=65535
+    --ulimit nproc=-1:-1
     --ulimit nofile=1024:524288
+    # podman's own default (--pids-limit=2048) is a SEPARATE
+    # cgroup-level ceiling from the ulimits above - it's sized for
+    # podman's typical single-process-container use case, not a full
+    # systemd system plus whatever heavy multi-process apps (browsers,
+    # ML toolkits) run inside a develop session. All of it - systemd,
+    # every service, every session - shares ONE pids.max here, so
+    # unlimited matches a normal PC's lack of an artificial ceiling.
+    --pids-limit=-1
     --hostname "$NAME"
     -v "$WORK_SHARED:/hostmnts:rshared"
     -v "$SOCKET_MOUNTS:/var/socket-mounts:rshared"
@@ -674,6 +692,9 @@ in
 
   # ----- optional wprs (proxied Wayland) integration -------------
   ${wprsFns}
+
+  # ----- optional per-session D-Bus session bus -------------------
+  ${dbusFns}
 
   # compute_mount_id <hostpath>: sanitised basename + short hash,
   # shared by `develop` and the wayland-attach/wayland-detach
@@ -897,6 +918,7 @@ in
       x11_mode=""
       wayland=0
       wprs=0
+      dbus=0
       mount_bashrc=0
       mount_gitconfig=0
       sock_specs=()
@@ -907,6 +929,7 @@ in
           --x11-untrusted)   x11_mode=untrusted; shift ;;
           --wayland)         wayland=1; shift ;;
           --wprs)            wprs=1; shift ;;
+          --dbus)            dbus=1; shift ;;
           --mount-bashrc)    mount_bashrc=1; shift ;;
           --mount-gitconfig) mount_gitconfig=1; shift ;;
           -S|--socket)
@@ -1087,6 +1110,15 @@ in
         echo "forward: wprs (proxied Wayland; '$(basename "$0") wayland-attach $hostpath' to view)"
       fi
 
+      if [ "$dbus" -eq 1 ]; then
+        dbus_out=$(start_session_dbus "$mount_id" "$uid" "$gid") || exit 2
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          extra_setenv+=(--setenv="$line")
+        done <<<"$dbus_out"
+        echo "forward: session D-Bus"
+      fi
+
       # Spawn the per-session HOST watchdog (waits on a socket
       # uniquely named for this mount_id; tears down host-side
       # binds on receipt of any connection).
@@ -1250,6 +1282,9 @@ in
     --security-opt unmask=/sys/fs/cgroup \
     --security-opt systempaths=unconfined \
     --security-opt label=disable \
+    --ulimit nproc=-1:-1 \
+    --ulimit nofile=1024:524288 \
+    --pids-limit=-1 \
     --hostname "$NAME" \
     -v "$WORK_SHARED:/hostmnts:rshared" \
     -v "$SOCKET_MOUNTS:/var/socket-mounts:rshared" \
@@ -1261,9 +1296,55 @@ in
       ;;
     purge)
       tear_down
-      podman unshare ${tools.bash} -c "
-        rm -rf -- '$STATE_DIR'
-      " || rm -rf -- "$STATE_DIR"
+      # Defense in depth beyond the NAME check above: STATE_DIR itself
+      # is also directly runtime-overridable (the `${"\${STATE_DIR:-...}"}`
+      # in stateDirLine), so a mistyped/misconfigured env var could
+      # otherwise point this rm -rf at an arbitrary path. The one thing
+      # guaranteed true across every stateDirLine variant (default,
+      # ephemeral/nixct, portable) is that it ends in "/$NAME" - NAME
+      # itself is already validated non-empty and slash-free above.
+      case "$STATE_DIR" in
+        */"$NAME") ;;
+        *) echo "error: refusing to purge STATE_DIR that doesn't end in /\$NAME: '$STATE_DIR'" >&2; exit 1 ;;
+      esac
+      # Further defense in depth: rm -rf recurses into whatever is
+      # actually there, trusting the checks above alone to have gotten
+      # STATE_DIR right. Instead, enumerate its TOP-LEVEL entries and
+      # refuse to touch anything if even one isn't in the closed set
+      # this framework is known to create there - if STATE_DIR were
+      # ever misdirected despite the checks above, real user files
+      # wouldn't match this allowlist and purge would abort instead of
+      # deleting them. Contents *below* the top level are framework-
+      # generated (nix store paths, container ids, ...) and can't be
+      # enumerated the same way, so this bounds the blast radius to
+      # exactly the directories nix-dev-container itself creates.
+      podman unshare ${tools.bash} -c '
+        set -euo pipefail
+        state_dir=$1
+        [ -d "$state_dir" ] || exit 0
+        allowed="
+          upper work merged nix-store-upper nix-store-work
+          nix-store-lower.gcroot work-shared socket-mounts
+          podman-root podman-runroot host-watchdog session-gcroots
+          wprs-viewers wayland-acl lower-mount fuse-store fuse-store.log
+          .idle-activity .idle-monitor.lock .keepid-migrated
+        "
+        for entry in "$state_dir"/* "$state_dir"/.[!.]*; do
+          [ -e "$entry" ] || continue
+          name=$(basename -- "$entry")
+          case " $allowed " in
+            *" $name "*) ;;
+            *)
+              printf "error: purge: unexpected entry in STATE_DIR, refusing to delete anything: %s\n" "$entry" >&2
+              exit 1
+              ;;
+          esac
+        done
+        for name in $allowed; do
+          rm -rf -- "$state_dir/$name"
+        done
+        rmdir -- "$state_dir" 2>/dev/null || true
+      ' bash "$STATE_DIR"
       ;;
     status)
       if container_running; then
@@ -1409,6 +1490,14 @@ in
                                 Native-Wayland apps only for now (XWayland
                                 is disabled to avoid a wprsd hard-crash
                                 when it's not on the container's \$PATH).
+    --dbus                      start a per-session D-Bus session daemon
+                                and set DBUS_SESSION_BUS_ADDRESS. Many
+                                GUI apps assume a working session bus
+                                and misbehave without one in ways that
+                                don't look like a D-Bus error (e.g.
+                                broken keyboard/IME handling). Requires
+                                a dbus package (dbus-daemon) in this
+                                container's package set.
 
   env:
     NAME             container name              (default $DEFAULT_NAME)

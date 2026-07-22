@@ -89,6 +89,21 @@
     ' bash "$dst" "$src"
   }
 
+  # grant_wayland_acl <ns> <uid> <host-sock>: grant <uid> (a develop
+  # session's throwaway uid, seen from the SAME namespace podman
+  # unshare operates in - no translation needed) an rw ACL entry on
+  # the real compositor socket, and record the socket path under
+  # $STATE_DIR so the session teardown can revoke it. Idempotent
+  # (setfacl -m on an existing entry just updates it).
+  grant_wayland_acl() {
+    local ns=$1 uid=$2 sock=$3
+    mkdir -p "$STATE_DIR/wayland-acl"
+    printf '%s\n' "$sock" > "$STATE_DIR/wayland-acl/$ns"
+    podman unshare "${tools.bash}" -c '
+      setfacl -m "u:$1:rw" -- "$2" 2>/dev/null || true
+    ' bash "$uid" "$sock"
+  }
+
   # spawn_socket_proxy <namespace> <name> <uid> <gid> [bind_to]:
   # ensure a socat proxy is running inside the container that
   # listens on /run/sockets/<ns>/<name> owned by the session
@@ -256,6 +271,18 @@
     # heavily uses SCM_RIGHTS fd-passing for shm pools,
     # dma-buf imports, etc.
     bind_raw_socket "$ns" wayland "$host_sock"
+
+    # The session uid is not the socket's owning uid (develop's
+    # throwaway users in particular), so connect() would otherwise
+    # EACCES - AF_UNIX requires write permission on the socket file,
+    # and the host compositor socket is normally 0755 owner-only-write.
+    # Grant that uid an ACL entry instead of loosening the mode bits
+    # (which would expose it to every uid, including other sessions).
+    # This modifies the REAL host socket (bind mounts share one inode,
+    # so there is no way to permission only the bound alias) - recorded
+    # under $STATE_DIR so the session teardown can revoke it; see
+    # revoke_wayland_acl in host-watchdog.nix.
+    grant_wayland_acl "$ns" "$uid" "$host_sock"
 
     ensure_xdg_runtime "$uid" "$gid"
 

@@ -219,6 +219,11 @@
               # nix: host-side `nix-store --realise --add-root` plants the
               # per-instance gc root on the store-lower in hostNixStore mode.
               nix
+              # acl: setfacl grants a develop session's throwaway uid
+              # access to the raw-bound Wayland socket in setup_wayland
+              # (it isn't the socket owner's uid, so it can't connect()
+              # without an explicit ACL entry).
+              acl
             ];
             bashOptions = [ "errexit" "pipefail" ];
             # Script body extracted to nix/scripts/run.nix. Same text body

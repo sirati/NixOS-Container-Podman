@@ -101,6 +101,27 @@ wprsd's embedded XWayland/X11 support is disabled by default (it otherwise
 hard-crashes if the container doesn't also have an Xwayland binary on
 `$PATH`) — native-Wayland apps only, for now.
 
+**Known limitation**: the current wprs snapshot only supports shared-memory
+buffers — it has no `linux-dmabuf`/hardware-rendering support (this is
+documented upstream). Simple Wayland clients work fine; complex GUI apps that
+lean on GPU-accelerated compositing or D-Bus-dependent subsystems (e.g.
+keyboard/IME handling) may be unstable regardless of `--gpu`/`--opengl` on the
+container — that's the client or wprs itself, not this framework's plumbing.
+`--dbus` (below) fixes the D-Bus-shaped half of that.
+
+### `--dbus` (`develop` only) — per-session D-Bus session bus
+
+Starts a per-session `dbus-daemon --session` and sets
+`DBUS_SESSION_BUS_ADDRESS`. Many GUI apps assume a working session bus and
+misbehave without one in ways that don't look like a D-Bus problem on the
+surface — Chrome's keyboard/IME handling is one example. Requires a
+`dbus`-providing package in the container's package set. Commonly combined
+with `--wprs`:
+
+```sh
+nixct develop --wprs --dbus ~/project
+```
+
 ## Configuration axes
 
 `mkContainer` is configured along **orthogonal axes** — each controls one

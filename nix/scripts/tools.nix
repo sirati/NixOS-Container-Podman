@@ -38,6 +38,7 @@
     # Forwarding / X11 / sockets
     socat         = "${pkgs.socat}/bin/socat";
     xauth         = "${pkgs.xauth}/bin/xauth";
+    setfacl       = "${pkgs.acl}/bin/setfacl";
 
     # Standard textproc
     sed           = "${pkgs.gnused}/bin/sed";
@@ -64,6 +65,7 @@
 
     socat         = "socat";
     xauth         = "xauth";
+    setfacl       = "setfacl";
 
     sed           = "sed";
     awk           = "awk";

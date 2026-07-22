@@ -99,6 +99,24 @@ in
   WPRS_SHORT_HASH=$(printf '%s' "$MOUNT_ID" | ${bin "sha256sum"} | ${bin "cut"} -c1-16)
   ${bin "rm"} -f -- "''${XDG_RUNTIME_DIR:-/tmp}/nixct-wprs-''${WPRS_SHORT_HASH}.sock"
 
+  # Revoke the ACL grant_wayland_acl (forwarding.nix) placed on the REAL
+  # host Wayland socket for --wayland develop sessions (the throwaway
+  # session uid isn't the socket's owner, so it needed an explicit grant
+  # to connect() at all). This modifies the actual host socket - not
+  # cleaning it up would leave a permanent ACL entry on the user's live
+  # compositor socket after the session ends.
+  WAYLAND_ACL_FILE="$STATE_DIR/wayland-acl/$MOUNT_ID"
+  if [ -f "$WAYLAND_ACL_FILE" ]; then
+    WAYLAND_HOST_SOCK=$(${bin "cat"} "$WAYLAND_ACL_FILE" 2>/dev/null)
+    if [ -n "$WAYLAND_HOST_SOCK" ]; then
+      export _SOCK="$WAYLAND_HOST_SOCK"
+      ${tools.podman} unshare ${tools.bash} -c '
+        ${tools.setfacl} -b -- "$_SOCK" 2>/dev/null || true
+      '
+    fi
+    ${bin "rm"} -f -- "$WAYLAND_ACL_FILE"
+  fi
+
   ${bin "rm"} -f "$SOCK"
   ${bin "rmdir"} "$SOCK_DIR" 2>/dev/null || true
 ''

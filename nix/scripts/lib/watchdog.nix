@@ -47,11 +47,26 @@
       [ -d "$d" ] || continue
       local pid_file="$d/pid"
       if [ -f "$pid_file" ]; then
-        kill "$(cat "$pid_file")" 2>/dev/null || true
-        rm -f "$pid_file"
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$pid" ]; then
+          kill "$pid" 2>/dev/null || true
+          # A watchdog blocked in socat can miss a bare SIGTERM long
+          # enough to still be listening when a LATER `up` + `develop`
+          # on the same mount_id (STATE_DIR persists across down/up -
+          # only purge wipes it) reuses this exact socket path: its
+          # fresh inner-watchdog connects to what it thinks is ITS
+          # notification socket, and the stale watchdog tears down
+          # state out from under the brand new session. Force it.
+          sleep 0.2
+          kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        fi
       fi
-      rm -f "$d/sock"
-      rmdir "$d" 2>/dev/null || true
+      # rmdir silently no-ops on a non-empty dir (the redirected
+      # nohup log lives here too) - rm -rf guarantees the socket
+      # path is really gone, not just pid/sock individually, so a
+      # later session can never reconnect to a leftover listener.
+      rm -rf -- "$d"
     done
   }
 ''
