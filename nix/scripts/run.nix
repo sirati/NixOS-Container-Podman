@@ -89,6 +89,7 @@ let
   gpuFns        = import ./lib/gpu.nix { };
   watchdogFns   = import ./lib/watchdog.nix { inherit hostWatchdogPath; };
   forwardingFns = import ./lib/forwarding.nix { inherit tools; };
+  wprsFns       = import ./lib/wprs.nix { inherit tools; };
 in
 
 ''
@@ -671,6 +672,25 @@ in
   # ----- socket / X11 / Wayland forwarding ----------------------
   ${forwardingFns}
 
+  # ----- optional wprs (proxied Wayland) integration -------------
+  ${wprsFns}
+
+  # compute_mount_id <hostpath>: sanitised basename + short hash,
+  # shared by `develop` and the wayland-attach/wayland-detach
+  # subcommands so they agree on which session a hostpath maps to.
+  # The sanitiser strips anything outside [A-Za-z0-9._-] and forbids
+  # leading `-` or `.`, so the id cannot smuggle shell metacharacters
+  # or option prefixes into useradd, mount, bindfs, or similar calls.
+  compute_mount_id() {
+    local hostpath=$1 base hash mount_id
+    base=$(basename -- "$hostpath" | sed 's/[^A-Za-z0-9._-]/_/g; s/^[-.]/_/')
+    if [ -z "$base" ]; then base=project; fi
+    hash=$(printf '%s' "$hostpath" | sha256sum | cut -c1-8)
+    mount_id="''${base}-''${hash}"
+    case "$mount_id" in -*) mount_id="_$mount_id" ;; esac
+    printf '%s\n' "$mount_id"
+  }
+
   tear_down() {
     if container_running; then pm stop -t 5 "$NAME" >/dev/null || true; fi
     if container_exists; then pm rm -f "$NAME" >/dev/null || true; fi
@@ -876,6 +896,7 @@ in
       forward_agent=0
       x11_mode=""
       wayland=0
+      wprs=0
       mount_bashrc=0
       mount_gitconfig=0
       sock_specs=()
@@ -885,6 +906,7 @@ in
           --x11)             x11_mode=trusted; shift ;;
           --x11-untrusted)   x11_mode=untrusted; shift ;;
           --wayland)         wayland=1; shift ;;
+          --wprs)            wprs=1; shift ;;
           --mount-bashrc)    mount_bashrc=1; shift ;;
           --mount-gitconfig) mount_gitconfig=1; shift ;;
           -S|--socket)
@@ -897,6 +919,10 @@ in
           *)  break ;;
         esac
       done
+      if [ "$wayland" -eq 1 ] && [ "$wprs" -eq 1 ]; then
+        echo "develop: --wayland and --wprs are mutually exclusive (--wayland shares the raw compositor socket; --wprs proxies it through wprsd)" >&2
+        exit 2
+      fi
       if [ -z "''${1:-}" ]; then
         echo "usage: $(basename "$0") develop [-A] <host-path>" >&2
         exit 2
@@ -910,16 +936,7 @@ in
 
       ensure_running
 
-      # mount_id: sanitised basename + short hash. The sanitiser
-      # strips anything outside [A-Za-z0-9._-] and forbids
-      # leading `-` or `.`, so the id cannot smuggle shell
-      # metacharacters or option prefixes into useradd, mount,
-      # bindfs, or similar calls.
-      base=$(basename -- "$hostpath" | sed 's/[^A-Za-z0-9._-]/_/g; s/^[-.]/_/')
-      if [ -z "$base" ]; then base=project; fi
-      hash=$(printf '%s' "$hostpath" | sha256sum | cut -c1-8)
-      mount_id="''${base}-''${hash}"
-      case "$mount_id" in -*) mount_id="_$mount_id" ;; esac
+      mount_id=$(compute_mount_id "$hostpath")
 
       bind_workdir "$hostpath" "$mount_id"
 
@@ -1061,6 +1078,15 @@ in
         echo "forward: Wayland"
       fi
 
+      if [ "$wprs" -eq 1 ]; then
+        wprs_out=$(start_wprsd "$mount_id" "$uid" "$gid") || exit 2
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          extra_setenv+=(--setenv="$line")
+        done <<<"$wprs_out"
+        echo "forward: wprs (proxied Wayland; '$(basename "$0") wayland-attach $hostpath' to view)"
+      fi
+
       # Spawn the per-session HOST watchdog (waits on a socket
       # uniquely named for this mount_id; tears down host-side
       # binds on receipt of any connection).
@@ -1131,6 +1157,28 @@ in
           --setenv="HOME=$home_dir" \
           "''${extra_setenv[@]+''${extra_setenv[@]}}" \
           ${tools.bash} -lc "$develop_cmd"
+      ;;
+    wayland-attach)
+      if [ -z "''${1:-}" ]; then
+        echo "usage: $(basename "$0") wayland-attach <host-path>" >&2
+        exit 2
+      fi
+      if ! hostpath=$(realpath -- "$1" 2>/dev/null); then
+        echo "wayland-attach: cannot resolve $1" >&2; exit 2
+      fi
+      mount_id=$(compute_mount_id "$hostpath")
+      wprs_attach "$mount_id"
+      ;;
+    wayland-detach)
+      if [ -z "''${1:-}" ]; then
+        echo "usage: $(basename "$0") wayland-detach <host-path>" >&2
+        exit 2
+      fi
+      if ! hostpath=$(realpath -- "$1" 2>/dev/null); then
+        echo "wayland-detach: cannot resolve $1" >&2; exit 2
+      fi
+      mount_id=$(compute_mount_id "$hostpath")
+      wprs_detach "$mount_id"
       ;;
     boot)
       # ephemeral foreground systemd boot, for debugging the
@@ -1276,7 +1324,7 @@ in
       ;;
     *)
       cat >&2 <<EOF
-  usage: $(basename "$0") {up|down|enter|develop|exec|boot|status|logs|purge} [args]
+  usage: $(basename "$0") {up|down|enter|develop|wayland-attach|wayland-detach|exec|boot|status|logs|purge} [args]
 
   subcommands:
     up [--gpu] [--opengl]       start the persistent container (idempotent).
@@ -1309,6 +1357,11 @@ in
                                 nix-collect-garbage for the session
                                 lifetime, and a .nixct/ dir is created in
                                 the project home for the dev-shell profile.
+    wayland-attach <hostpath>    start (or reuse) a host-side wprsc viewer
+                                for a develop session started with --wprs.
+                                Requires wprsc on the host's \$PATH.
+    wayland-detach <hostpath>    stop the wprsc viewer for that session;
+                                the session's apps and wprsd keep running.
     exec -- CMD...              run CMD inside the container as $SHELL_USER.
     boot                        ephemeral foreground systemd (debugging);
                                 wipes any existing persistent container first.
@@ -1344,6 +1397,18 @@ in
     --mount-gitconfig           copy the host \$HOME/.gitconfig into the
                                 session HOME (0444). Both skip silently
                                 if the host file is absent.
+    --wprs                      run wprsd INSIDE the session instead of
+                                sharing the real Wayland socket (what
+                                --wayland does): the untrusted session
+                                user only ever talks to its own proxied
+                                compositor. Requires a wprs package
+                                (wprsd) in this container's package set.
+                                Mutually exclusive with --wayland. View
+                                with \`wayland-attach <hostpath>\` from
+                                another terminal once the session is up.
+                                Native-Wayland apps only for now (XWayland
+                                is disabled to avoid a wprsd hard-crash
+                                when it's not on the container's \$PATH).
 
   env:
     NAME             container name              (default $DEFAULT_NAME)

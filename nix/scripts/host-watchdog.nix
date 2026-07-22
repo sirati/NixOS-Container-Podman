@@ -85,6 +85,20 @@ in
   # and `--`-terminated, so this can never escape the session subdir.
   ${bin "rm"} -rf -- "$STATE_DIR/session-gcroots/$MOUNT_ID"
 
+  # Any attached wprsc viewer (nixct wayland-attach) would otherwise be
+  # left running against a socket that just got torn down above. The
+  # short-path symlink alias (see wprs_short_sock_path in wprs.nix -
+  # AF_UNIX connect() caps sun_path at ~108 bytes, well under a real
+  # $STATE_DIR-derived path) is keyed by the SAME sha256(mount_id)
+  # computation so it's found here without sharing bash functions.
+  WPRS_PID_FILE="$STATE_DIR/wprs-viewers/$MOUNT_ID.pid"
+  if [ -f "$WPRS_PID_FILE" ]; then
+    kill "$(${bin "cat"} "$WPRS_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+    ${bin "rm"} -f -- "$WPRS_PID_FILE"
+  fi
+  WPRS_SHORT_HASH=$(printf '%s' "$MOUNT_ID" | ${bin "sha256sum"} | ${bin "cut"} -c1-16)
+  ${bin "rm"} -f -- "''${XDG_RUNTIME_DIR:-/tmp}/nixct-wprs-''${WPRS_SHORT_HASH}.sock"
+
   ${bin "rm"} -f "$SOCK"
   ${bin "rmdir"} "$SOCK_DIR" 2>/dev/null || true
 ''

@@ -18,7 +18,7 @@ pkgs.writeTextFile {
 
       if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W \
-          "up down stop enter shell develop exec boot logs status purge check-host-compat" \
+          "up down stop enter shell develop wayland-attach wayland-detach exec boot logs status purge check-host-compat" \
           -- "$cur") )
         return
       fi
@@ -37,7 +37,7 @@ pkgs.writeTextFile {
           case "$cur" in
             -*)
               COMPREPLY=( $(compgen -W \
-                "-A --forward-agent --x11 --x11-untrusted --wayland -S --socket --mount-bashrc --mount-gitconfig" \
+                "-A --forward-agent --x11 --x11-untrusted --wayland --wprs -S --socket --mount-bashrc --mount-gitconfig" \
                 -- "$cur") )
               ;;
             *)
@@ -48,6 +48,9 @@ pkgs.writeTextFile {
               fi
               ;;
           esac
+          ;;
+        wayland-attach|wayland-detach)
+          COMPREPLY=( $(compgen -d -- "$cur") )
           ;;
         exec)
           # exec passes the rest to the container as a command.

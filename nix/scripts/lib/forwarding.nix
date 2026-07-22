@@ -63,6 +63,32 @@
     '
   }
 
+  # bind_raw_socket_from_container <namespace> <name> <container-src-path>:
+  # the REVERSE of bind_raw_socket - the socket already exists INSIDE
+  # the container (e.g. a daemon listening there), and this exposes it
+  # to the HOST at $SOCKET_MOUNTS/<ns>/<name>. Works because
+  # /var/socket-mounts is bind-mounted from $SOCKET_MOUNTS with
+  # `rshared` propagation (see run.nix): a new mount created on
+  # EITHER side of an rshared peer relationship propagates to the
+  # other side automatically, so bind-mounting the in-container
+  # socket onto the container's own view of that shared dir makes it
+  # appear at the host path too, with no separate host-side mount.
+  bind_raw_socket_from_container() {
+    local ns=$1 name=$2 src=$3
+    local dst="/var/socket-mounts/$ns/$name"
+    # shellcheck disable=SC2016
+    pm exec -u root "$NAME" "${tools.bash}" -lc '
+      set -euo pipefail
+      dst=$1; src=$2
+      mkdir -p -- "$(dirname -- "$dst")"
+      chmod 0711 -- "$(dirname -- "$dst")"
+      [ -e "$dst" ] || : > "$dst"
+      if ! mountpoint -q -- "$dst"; then
+        mount --bind -- "$src" "$dst"
+      fi
+    ' bash "$dst" "$src"
+  }
+
   # spawn_socket_proxy <namespace> <name> <uid> <gid> [bind_to]:
   # ensure a socat proxy is running inside the container that
   # listens on /run/sockets/<ns>/<name> owned by the session

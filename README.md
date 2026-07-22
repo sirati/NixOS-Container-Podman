@@ -48,6 +48,11 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `develop <hostpath>` — bind-mount `<hostpath>` into the running container and
   `nix develop` there as a fresh per-session user. Re-running on the same path
   reuses the user.
+- `wayland-attach <hostpath>` — start (or reuse) a host-side `wprsc` viewer for
+  a `develop` session started with `--wprs`. Requires `wprsc` on the host's
+  `$PATH`.
+- `wayland-detach <hostpath>` — stop that viewer; the session's apps and
+  `wprsd` keep running untouched.
 - `exec -- CMD...` — run `CMD` inside the container as `shellUser`.
 - `boot` — ephemeral foreground systemd boot for debugging; wipes any existing
   persistent container first.
@@ -65,6 +70,36 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `--wayland` — forward `$WAYLAND_DISPLAY`.
 - `-S name=path` — generic socket forward; container side is
   `/run/sockets/<ns>/<name>` (no env auto-set).
+
+### `--wprs` (`develop` only) — proxied Wayland instead of a raw socket share
+
+`--wayland` shares the host's real compositor socket directly with the
+session — full protocol access (SCM_RIGHTS fd-passing, and whatever else the
+compositor exposes to any client) granted to a throwaway, untrusted
+per-session user. `--wprs` avoids that: it runs
+[wprs](https://github.com/wayland-transpositor/wprs)'s `wprsd` **inside** the
+session as its own tiny compositor, and only forwards wprsd's own wire
+protocol out to the host — the session never touches the real socket.
+
+wprs is **not** a dependency of this flake; it's optional and BYO on both
+ends:
+
+- the container needs a `wprsd`-providing package in its own package set
+  (e.g. `programs.nixct.packages = [ pkgs.wprs ];` for `nixct`, or via
+  `modules` for a plain `mkContainer`);
+- the host needs `wprsc` on `$PATH`.
+
+Usage:
+
+```sh
+nixct develop --wprs ~/project     # inside: WAYLAND_DISPLAY=wprs-0
+nixct wayland-attach ~/project     # from another terminal: view it
+nixct wayland-detach ~/project     # stop viewing; session keeps running
+```
+
+wprsd's embedded XWayland/X11 support is disabled by default (it otherwise
+hard-crashes if the container doesn't also have an Xwayland binary on
+`$PATH`) — native-Wayland apps only, for now.
 
 ## Configuration axes
 

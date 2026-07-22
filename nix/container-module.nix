@@ -233,6 +233,12 @@ in
           # BindsTo=$scope; just clean up the leftover socket files.
           rm -rf -- "$socket_dir" 2>/dev/null || true
 
+          # wprsd (nixct develop --wprs) is NOT BindsTo=$scope - the scope
+          # doesn't exist yet when wprsd starts (systemd-run refuses to
+          # create a unit whose BindsTo= target doesn't exist), so it's
+          # stopped explicitly here instead. Harmless no-op if absent.
+          systemctl stop "wprsd-''${mount_id}.service" 2>/dev/null || true
+
           userdel -- "$session_user" 2>/dev/null || true
           groupdel -- "$session_user" 2>/dev/null || true
 
