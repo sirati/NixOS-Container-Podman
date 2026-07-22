@@ -373,6 +373,23 @@ in
       : > "$_UPPER"/etc/hosts
       : > "$_UPPER"/etc/resolv.conf
       : > "$_UPPER"/run/.containerenv
+      # Stage a real, persistent /etc/machine-id into the upper. The
+      # rootfs lower ships it empty (normal for a NixOS image), so
+      # without this systemd finds it empty at every boot and falls
+      # back to its container-transient-ID path: a read-only tmpfs
+      # over /etc/machine-id plus systemd-machine-id-commit.service to
+      # persist it later. That commit step relies on container-runtime
+      # integration podman does not provide, so it always fails
+      # (degraded, not running). Pre-seeding a non-empty ID here means
+      # systemd never creates the transient mount, so the commit unit
+      # condition (ConditionPathIsMountPoint=/etc/machine-id) is false
+      # and it is skipped instead of run. Generated once and kept
+      # stable across restarts (not regenerated if already present).
+      if [ ! -s "$_UPPER"/etc/machine-id ]; then
+        { head -c 16 /dev/urandom | od -An -tx1 | tr -d " \n"; echo; } \
+          > "$_UPPER"/etc/machine-id
+        chmod 0444 "$_UPPER"/etc/machine-id
+      fi
     '
   }
 
