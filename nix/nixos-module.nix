@@ -20,11 +20,16 @@ in {
       hostHasToolkit = lib.mkEnableOption "use the host's nvidia-container-toolkit (CDI) for --gpu";
     };
     service.enable = lib.mkEnableOption "a per-user systemd service that starts nixct on login and keeps it running (disables idle shutdown)";
+    packages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      description = "Extra packages available inside the nixct develop-session environment.";
+    };
     package = lib.mkOption {
       type = lib.types.package;
       description = "The built nixct package (binary `nixct`). Defaults to one built from the options above.";
       default = (mkNixct {
-        inherit (cfg) name;
+        inherit (cfg) name packages;
         idleTimeout = if cfg.service.enable then 0 else cfg.idleTimeoutSeconds;
         gpuHasToolkit = cfg.gpu.hostHasToolkit;
       }).run;

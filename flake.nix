@@ -204,7 +204,7 @@
             '' + (import ./nix/scripts/check-host-compat.nix { });
           };
 
-          run = pkgs.writeShellApplication {
+          rawRun = pkgs.writeShellApplication {
             name = runName;
             runtimeInputs = with pkgs; [
               # Existing tools.
@@ -244,6 +244,17 @@
             } // nixpkgs.lib.optionalAttrs (storageMode == "ephemeral") {
               stateDirLine = "STATE_DIR=\${STATE_DIR:-\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nixct/$NAME}";
             });
+          };
+
+          # rawRun + bash completions for `runName`, merged into one
+          # derivation so `${run}/bin/${runName}` still works everywhere
+          # (mkSubcommandPkg, apps.default, programs.nixct) while also
+          # carrying share/bash-completion/completions/${runName} so
+          # NixOS's bash-completion machinery picks it up automatically
+          # once the package is in environment.systemPackages.
+          run = pkgs.symlinkJoin {
+            name = runName;
+            paths = [ rawRun (import ./nix/scripts/completion.nix { inherit pkgs; cmdName = runName; }) ];
           };
           # Per-container subcommand packages. Each is a derivation named for
           # the subcommand with a single bin/<name> binary, so
@@ -382,10 +393,12 @@
         { name ? "nixct"
         , idleTimeout ? 600          # seconds; 0 disables idle shutdown
         , gpuHasToolkit ? false      # CDI via host nvidia-container-toolkit
+        , packages ? [ ]             # extra packages in the develop-session environment
         }:
         mkContainer {
           inherit name idleTimeout;
-          modules = [ ./nix/nixct-system.nix ];
+          modules = [ ./nix/nixct-system.nix ]
+            ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; };
           shellUser = "root";        # no dev user; entry is `nixct develop`
           runName = "nixct";
           hostNixDaemon = true;      # /nix from the host daemon, no nixbld

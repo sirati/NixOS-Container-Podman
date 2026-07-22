@@ -180,60 +180,7 @@ let
 
   # Bash completion. Source from ~/.bashrc or symlink to
   # ~/.local/share/bash-completion/completions/nixct.
-  completionText = ''
-    # Bash completion for nixct. To enable interactively:
-    #   source <extracted>/share/bash-completion/completions/nixct
-    # Or permanently (preferred):
-    #   ln -s <extracted>/share/bash-completion/completions/nixct \
-    #     ~/.local/share/bash-completion/completions/nixct
-
-    _nixct() {
-      local cur prev
-      cur=''${COMP_WORDS[COMP_CWORD]}
-      prev=''${COMP_WORDS[COMP_CWORD-1]}
-
-      if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W \
-          "up down stop enter shell develop exec boot logs status purge check-host-compat" \
-          -- "$cur") )
-        return
-      fi
-
-      local subcmd=''${COMP_WORDS[1]}
-      case "$subcmd" in
-        up|boot)
-          COMPREPLY=( $(compgen -W "--gpu --opengl" -- "$cur") )
-          ;;
-        enter|shell)
-          COMPREPLY=( $(compgen -W \
-            "-A --forward-agent --x11 --x11-untrusted --wayland -S --socket" \
-            -- "$cur") )
-          ;;
-        develop)
-          case "$cur" in
-            -*)
-              COMPREPLY=( $(compgen -W \
-                "-A --forward-agent --x11 --x11-untrusted --wayland -S --socket --mount-bashrc --mount-gitconfig" \
-                -- "$cur") )
-              ;;
-            *)
-              # Only complete dirs when not directly after -S/--socket
-              # (which expects name=path).
-              if [ "$prev" != "-S" ] && [ "$prev" != "--socket" ]; then
-                COMPREPLY=( $(compgen -d -- "$cur") )
-              fi
-              ;;
-          esac
-          ;;
-        exec)
-          # exec passes the rest to the container as a command.
-          COMPREPLY=( $(compgen -c -- "$cur") )
-          ;;
-      esac
-    }
-
-    complete -F _nixct nixct
-  '';
+  completionPkg = import ./scripts/completion.nix { inherit pkgs; cmdName = "nixct"; };
 
   readme = pkgs.writeText "README.md" ''
     # ${name}-portable (${format} format)
@@ -355,7 +302,7 @@ pkgs.runCommand "${name}-portable-tarball-${format}"
     chmod 0755 "$stage/bin"/* "$stage/lib"/*
 
     # Bash completion.
-    cp ${pkgs.writeText "nixct.bash" completionText} \
+    cp ${completionPkg}/share/bash-completion/completions/nixct \
       "$stage/share/bash-completion/completions/nixct"
 
     # Rootfs payload.
