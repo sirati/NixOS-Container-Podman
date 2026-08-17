@@ -153,7 +153,9 @@ in
       # so they live in the framework module (not the example config):
       # bindfs (per-session HOME remap), socat (watchdog + socket proxies),
       # fuse3 (fusermount3 for teardown unmounts).
-      environment.systemPackages = with pkgs; [ bindfs socat fuse3 ];
+      # fuse-overlayfs backs `develop --template`: the frozen host lower
+      # plus a session-lifetime upper.
+      environment.systemPackages = with pkgs; [ bindfs socat fuse3 fuse-overlayfs ];
 
       # Container directory layout for develop sessions:
       #   /hostmnts            - bind target for host paths. Owned by the
@@ -217,17 +219,39 @@ in
           # nix profile state). Unmount the project bind FIRST, then wipe the
           # home tree - but only once the bind is truly gone, so `rm -rf` can
           # never recurse into the host's project files.
-          proj_dir="$home_dir/dev"
-          if mountpoint -q -- "$proj_dir"; then
-            fusermount3 -u -- "$proj_dir" 2>/dev/null \
-              || umount -- "$proj_dir" 2>/dev/null || true
-          fi
-          if mountpoint -q -- "$proj_dir"; then
-            # Bind still up - don't risk rm -rf into host files.
-            rmdir -- "$proj_dir" 2>/dev/null || true
-          else
+          # `develop --template` can add further mounts next to <home>/dev,
+          # so unmount EVERY mountpoint directly under the home, not just
+          # the project one - an `rm -rf` that recursed into a still-mounted
+          # directory would write through it instead of just dropping it.
+          #
+          # dotglob is essential, not cosmetic: templates are conventionally
+          # mounted at dot-names (~/.nixct-chrome), and a plain * glob skips
+          # exactly those - which would walk this safety check straight past
+          # the mounts it exists to catch.
+          shopt -s dotglob nullglob
+          for d in "$home_dir"/*; do
+            [ -d "$d" ] || continue
+            if mountpoint -q -- "$d"; then
+              fusermount3 -u -- "$d" 2>/dev/null \
+                || umount -- "$d" 2>/dev/null || true
+            fi
+          done
+          still_bound=0
+          for d in "$home_dir"/*; do
+            [ -d "$d" ] || continue
+            if mountpoint -q -- "$d"; then
+              still_bound=1
+              rmdir -- "$d" 2>/dev/null || true
+            fi
+          done
+          if [ "$still_bound" -eq 0 ]; then
             rm -rf -- "$home_dir" 2>/dev/null || true
           fi
+
+          # Overlay uppers backing this session's `--template` mounts. They
+          # only ever held session-local writes; the frozen host lowers are
+          # untouched by construction.
+          rm -rf -- /run/nixct-templates/"''${mount_id}".* 2>/dev/null || true
 
           # Forwarded-socket proxies (socat units) are killed by their
           # BindsTo=$scope; just clean up the leftover socket files.

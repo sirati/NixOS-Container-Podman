@@ -20,6 +20,12 @@
 , rootfs ? null
 , shellUser
 , name
+  # Host directories every develop session of this container gets as a
+  # TEMPLATE (frozen lower + per-session overlay upper), as a list of
+  # { host, name }. `host` is a shell string expanded at run time (so
+  # "''${XDG_STATE_HOME:-$HOME/.local/state}/foo" works) and is created if
+  # missing. See the `--template` flag for the runtime version.
+, sessionTemplates ? [ ]
 , hostHasNvidiaContainerToolkit ? false
 , useKeepId ? false
 , keepIdUid ? 1000
@@ -91,6 +97,16 @@ let
   forwardingFns = import ./lib/forwarding.nix { inherit tools; };
   wprsFns       = import ./lib/wprs.nix { inherit tools; };
   dbusFns       = import ./lib/dbus.nix { inherit tools; };
+
+  # Container-declared templates, emitted as shell that seeds the same
+  # array `--template` appends to. The host path stays unquoted-expandable
+  # so entries can be written relative to $HOME / $XDG_STATE_HOME.
+  sessionTemplateLines =
+    builtins.concatStringsSep "" (map (t: ''
+      _t="${t.host}"
+      mkdir -p -- "$_t" 2>/dev/null || true
+      template_specs+=("$_t:${t.name}")
+    '') sessionTemplates);
 in
 
 ''
@@ -922,6 +938,11 @@ in
       mount_bashrc=0
       mount_gitconfig=0
       sock_specs=()
+      # Container-declared templates (mkContainer `sessionTemplates`).
+      # Emitted by the flake, so the host paths may reference $HOME /
+      # $XDG_STATE_HOME and are expanded here, at run time.
+      template_specs=()
+      ${sessionTemplateLines}
       while [ $# -gt 0 ]; do
         case "$1" in
           -A|--forward-agent) forward_agent=1; shift ;;
@@ -937,6 +958,11 @@ in
               echo "develop: -S requires name=path" >&2; exit 2
             fi
             sock_specs+=("$2"); shift 2 ;;
+          --template)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --template requires <hostpath>[:<name>]" >&2; exit 2
+            fi
+            template_specs+=("$2"); shift 2 ;;
           --) shift; break ;;
           -*) echo "develop: unknown flag $1" >&2; exit 2 ;;
           *)  break ;;
@@ -946,12 +972,10 @@ in
         echo "develop: --wayland and --wprs are mutually exclusive (--wayland shares the raw compositor socket; --wprs proxies it through wprsd)" >&2
         exit 2
       fi
-      if [ -z "''${1:-}" ]; then
-        echo "usage: $(basename "$0") develop [-A] <host-path>" >&2
-        exit 2
-      fi
-      if ! hostpath=$(realpath -- "$1" 2>/dev/null); then
-        echo "develop: cannot resolve $1" >&2; exit 2
+      # No path given: develop the current working directory.
+      target=''${1:-.}
+      if ! hostpath=$(realpath -- "$target" 2>/dev/null); then
+        echo "develop: cannot resolve $target" >&2; exit 2
       fi
       if [ ! -d "$hostpath" ]; then
         echo "develop: not a directory: $hostpath" >&2; exit 2
@@ -1041,6 +1065,83 @@ in
       home_dir="/develop-home/$session_user"
       proj_dir="$home_dir/dev"
       extra_setenv=()
+
+      # `--template <hostpath>[:<name>]`: a host directory handed to the
+      # session as a TEMPLATE at ~/<name>, next to ~/dev.
+      #
+      # A session HOME is wiped on teardown, so state a disposable container
+      # must INHERIT (browser profiles, tool logins, caches) has to come
+      # from the host. Handing that state over as a plain read-write bind
+      # would hand every throwaway session a channel into shared, credential-
+      # bearing state - it could corrupt it for every later session, or
+      # persist into it. So the host copy is never writable here:
+      #
+      #   lower  = the host dir, bound in read-only (frozen source)
+      #   upper  = a fresh per-session dir on the container's own (with
+      #            ephemeral storage: tmpfs) filesystem
+      #   result = fuse-overlayfs at ~/<name>
+      #
+      # The session sees an ordinary writable directory - which is what a
+      # browser profile needs - but every write lands in the upper and is
+      # discarded with the session. Two sessions never see each other's
+      # writes, and the template on the host cannot be touched at all.
+      # Templates are repeatable, and repeating the SAME name stacks: each
+      # host dir becomes another overlay lower under that one mount point,
+      # earlier entries winning over later ones (overlayfs order). That is
+      # how a session can get, say, a base profile plus a project-specific
+      # layer on top without either being writable.
+      declare -A tpl_lowers=()
+      tpl_names=()
+      tpl_idx=0
+      for spec in "''${template_specs[@]+''${template_specs[@]}}"; do
+        case "$spec" in
+          *:*) t_host=''${spec%:*}; t_name=''${spec##*:} ;;
+          *)   t_host=$spec;        t_name=$(basename -- "$spec") ;;
+        esac
+        case "$t_name" in
+          ""|.|..|dev|.bashrc|.bashrc.user|.gitconfig|.nixct|*/*|-*)
+            echo "develop: --template: refusing name '$t_name'" >&2
+            echo "  (must not be empty, contain '/', start with '-', or" >&2
+            echo "   collide with a framework-managed entry)" >&2
+            exit 2 ;;
+        esac
+        if ! t_host=$(realpath -- "$t_host" 2>/dev/null) || [ ! -d "$t_host" ]; then
+          echo "develop: --template: not a directory: ''${spec%:*}" >&2; exit 2
+        fi
+        tpl_idx=$((tpl_idx + 1))
+        bind_workdir "$t_host" "$mount_id.$t_name.$tpl_idx"
+        if [ -z "''${tpl_lowers[$t_name]:-}" ]; then
+          tpl_names+=("$t_name")
+          tpl_lowers[$t_name]="/hostmnts/$mount_id.$t_name.$tpl_idx"
+        else
+          tpl_lowers[$t_name]="''${tpl_lowers[$t_name]}:/hostmnts/$mount_id.$t_name.$tpl_idx"
+        fi
+        echo "template: $t_host -> $home_dir/$t_name (overlay; writes are session-local)"
+      done
+      for t_name in "''${tpl_names[@]+''${tpl_names[@]}}"; do
+        # shellcheck disable=SC2016
+        pm exec -u root "$NAME" \
+          /run/current-system/sw/bin/bash -lc '
+            set -e
+            session_user=$1; lowers=$2; uid=$3; gid=$4; tname=$5; id=$6
+            dst=/develop-home/$session_user/$tname
+            scratch=/run/nixct-templates/$id.$tname
+            mkdir -p "$dst" "$scratch/upper" "$scratch/work"
+            chown "$uid:$gid" "$scratch/upper"
+            chmod 0700 "$scratch" "$scratch/upper"
+            if ! mountpoint -q "$dst"; then
+              # squash_to_uid presents the frozen lower as owned by the
+              # session user (the host files map to container root), so it
+              # can read them and copy-up on write.
+              fuse-overlayfs \
+                -o "lowerdir=$lowers,upperdir=$scratch/upper,workdir=$scratch/work" \
+                -o "squash_to_uid=$uid,squash_to_gid=$gid" \
+                -o allow_other \
+                "$dst"
+              chown "$uid:$gid" "$dst" 2>/dev/null || true
+            fi
+          ' bash "$session_user" "''${tpl_lowers[$t_name]}" "$uid" "$gid" "$t_name" "$mount_id"
+      done
 
       # Dev-shell command. In host-daemon mode, build the dev shell
       # through a discoverable profile under the session HOME so the
@@ -1329,10 +1430,16 @@ in
           wprs-viewers wayland-acl lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated
         "
+        # Collapse the list to single-space-separated words: the literal
+        # above is multi-line, and the membership test below matches on
+        # " $name " - without this, every entry sitting at the end of a
+        # line (session-gcroots, socket-mounts, ...) is followed by a
+        # newline rather than a space and never matches, so purge aborts.
+        allowed=" $(printf "%s" "$allowed" | tr -s "[:space:]" " ") "
         for entry in "$state_dir"/* "$state_dir"/.[!.]*; do
           [ -e "$entry" ] || continue
           name=$(basename -- "$entry")
-          case " $allowed " in
+          case "$allowed" in
             *" $name "*) ;;
             *)
               printf "error: purge: unexpected entry in STATE_DIR, refusing to delete anything: %s\n" "$entry" >&2
@@ -1425,8 +1532,9 @@ in
     enter [-A] [-S name=path]   open a login shell as $SHELL_USER;
                                 auto-runs up if not running.
       shell                     alias for enter.
-    develop [-A] [-S name=path] <hostpath>
-                                bind-mount <hostpath> at /develop-home/<user>/dev
+    develop [-A] [-S name=path] [hostpath]
+                                bind-mount <hostpath> (default: the current
+                                working directory) at /develop-home/<user>/dev
                                 (~/dev) in the running container, exec nix
                                 develop there as a per-session user. The
                                 session HOME (/develop-home/<user>) is a
@@ -1472,6 +1580,19 @@ in
                                 env is auto-set (do it in your shell).
 
   develop-only flags:
+    --template hostpath[:name]  hand a host directory to the session at
+                                ~/<name> (default: its basename) as a
+                                frozen template: the host dir is the
+                                read-only lower of an overlay whose upper
+                                lives only as long as the session. The
+                                session can write freely; nothing reaches
+                                the host copy and nothing survives the
+                                session. Use for state a disposable
+                                container must INHERIT (browser profiles,
+                                tool logins, caches). Repeatable: different
+                                names give separate templates, the same
+                                name twice stacks the host dirs as overlay
+                                lowers (earlier wins).
     --mount-bashrc              copy the host \$HOME/.bashrc into the
                                 session HOME as ~/.bashrc.user (0444),
                                 sourced by the framework ~/.bashrc.

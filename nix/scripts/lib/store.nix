@@ -207,6 +207,16 @@
     fi
     # The rootfs base overlay (directory mode never has one; the umount
     # is a harmless no-op there).
-    umount -- "$MERGED" 2>/dev/null || true
+    #
+    # The lazy fallback is not cosmetic: in host-daemon mode $MERGED/nix is
+    # an rbind of the host /nix, and a rootless user namespace marks the
+    # child mounts it copied in (here /nix/store) MNT_LOCKED. A locked child
+    # cannot be unmounted on its own (umount reports "not mounted", EINVAL),
+    # which in turn makes the plain umount of $MERGED fail with EBUSY - so
+    # tear_down would leave the whole tree mounted and `purge` could never
+    # remove $STATE_DIR. A lazy umount of the parent detaches the locked
+    # subtree in one go, which is exactly what teardown wants.
+    umount -- "$MERGED" 2>/dev/null \
+      || umount -l -- "$MERGED" 2>/dev/null || true
   '';
 }

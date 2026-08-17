@@ -37,7 +37,7 @@ pkgs.writeTextFile {
           case "$cur" in
             -*)
               COMPREPLY=( $(compgen -W \
-                "-A --forward-agent --x11 --x11-untrusted --wayland --wprs --dbus -S --socket --mount-bashrc --mount-gitconfig" \
+                "-A --forward-agent --x11 --x11-untrusted --wayland --wprs --dbus -S --socket --template --mount-bashrc --mount-gitconfig" \
                 -- "$cur") )
               ;;
             *)

@@ -128,6 +128,13 @@
         , keepId ? { }
         , runName ? "nix-dev-container"
         , idleTimeout ? 0
+          # Host dirs every develop session gets as a frozen template
+          # (read-only lower + session-lifetime overlay upper):
+          #   [ { host = "\${XDG_STATE_HOME:-$HOME/.local/state}/foo";
+          #       name = ".foo"; } ]
+          # `host` is expanded by the run script at run time and created if
+          # missing. Same mechanism as the `--template` flag.
+        , sessionTemplates ? [ ]
         }:
         let
           hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
@@ -230,7 +237,7 @@
             # drives both NixOS and portable tarball targets; the `tools`
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
-              inherit tools rootfs shellUser name idleTimeout
+              inherit tools rootfs shellUser name idleTimeout sessionTemplates
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
                       hostNixDaemon;
               storage = storageMode;
@@ -399,13 +406,16 @@
         , idleTimeout ? 600          # seconds; 0 disables idle shutdown
         , gpuHasToolkit ? false      # CDI via host nvidia-container-toolkit
         , packages ? [ ]             # extra packages in the develop-session environment
+        , modules ? [ ]              # extra NixOS modules for the container system
+        , runName ? "nixct"          # basename of the run-script binary
+        , sessionTemplates ? [ ]     # frozen host dirs every session inherits
         }:
         mkContainer {
-          inherit name idleTimeout;
+          inherit name idleTimeout runName sessionTemplates;
           modules = [ ./nix/nixct-system.nix ]
-            ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; };
+            ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; }
+            ++ modules;
           shellUser = "root";        # no dev user; entry is `nixct develop`
-          runName = "nixct";
           hostNixDaemon = true;      # /nix from the host daemon, no nixbld
           storage = "ephemeral";     # overlay upper/work on tmpfs (no state)
           gpu.hostHasToolkit = gpuHasToolkit;

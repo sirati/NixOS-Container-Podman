@@ -35,6 +35,13 @@ This repo ships example containers: `.#testcontainer` (default persistent
 overlay), `.#testdaemon` (host nix-daemon), `.#testnvidia`, and
 `.#nixct-nvidia`.
 
+`mkNixct` additionally takes `modules` (extra NixOS modules for the container
+system) and `runName` (name of the installed binary), which is how
+out-of-tree presets extend it — see [`nixct-chrome/`](nixct-chrome), a
+self-contained subproject (own flake, destined for its own repository) whose
+containers ship Google Chrome with the Claude in Chrome extension
+preinstalled.
+
 ## Subcommands
 
 Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
@@ -45,9 +52,9 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
   passthrough. Both must be set at `up` time; auto-up never enables either.
 - `down` / `stop` — stop and remove the container; state in `$STATE_DIR` persists.
 - `enter` / `shell` — open a login shell as `shellUser`; auto-runs `up` if needed.
-- `develop <hostpath>` — bind-mount `<hostpath>` into the running container and
-  `nix develop` there as a fresh per-session user. Re-running on the same path
-  reuses the user.
+- `develop [hostpath]` — bind-mount `<hostpath>` into the running container and
+  `nix develop` there as a fresh per-session user. Defaults to the current
+  working directory. Re-running on the same path reuses the user.
 - `wayland-attach <hostpath>` — start (or reuse) a host-side `wprsc` viewer for
   a `develop` session started with `--wprs`. Requires `wprsc` on the host's
   `$PATH`.
@@ -70,6 +77,54 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `--wayland` — forward `$WAYLAND_DISPLAY`.
 - `-S name=path` — generic socket forward; container side is
   `/run/sockets/<ns>/<name>` (no env auto-set).
+
+### `--template hostpath[:name]` (`develop` only) — inherited state, frozen
+
+A session HOME is wiped when the session ends, and with ephemeral storage the
+whole container goes with it. So state that a *disposable* container must
+**inherit** — tool logins, browser profiles, caches — has to live on the host.
+Handing it over as a plain read-write bind would be the easy answer and the
+wrong one: every throwaway session would get a writable channel into shared,
+credential-bearing state, able to corrupt it for later sessions or persist
+into it.
+
+`--template` hands it over frozen instead:
+
+```
+lower  = the host directory, bound in read-only
+upper  = a fresh per-session dir on the container's own filesystem
+         (tmpfs, with ephemeral storage)
+mount  = fuse-overlayfs at ~/<name>
+```
+
+The session sees an ordinary writable directory — which is what a browser
+profile or a tool's state dir needs — but every write lands in the upper and
+is discarded when the session ends. Two sessions never see each other's
+writes, and the host copy cannot be modified at all.
+
+```sh
+nixct develop --template ~/.local/state/mytool:.mytool ~/project
+```
+
+Repeatable: different names give separate templates; **the same name twice
+stacks** the host dirs as overlay lowers (earlier wins), so a base template
+can be layered with a more specific one. Names colliding with
+framework-managed entries (`dev`, `.bashrc`, `.nixct`, …) are rejected, and
+teardown unmounts every mount under the home — dot-named ones included —
+before wiping it.
+
+A container can also declare templates every session gets, via `mkContainer`:
+
+```nix
+sessionTemplates = [{
+  host = "\${XDG_STATE_HOME:-$HOME/.local/state}/mytool";  # expanded at run time
+  name = ".mytool";
+}];
+```
+
+Writing the template is deliberately *not* something a dev session can do —
+that is a separate, explicit act (e.g. a session whose project **is** the
+state dir, where the normal read-write project bind applies).
 
 ### `--wprs` (`develop` only) — proxied Wayland instead of a raw socket share
 

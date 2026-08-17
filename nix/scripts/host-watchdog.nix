@@ -42,6 +42,14 @@ in
       [ -d "$t" ] && ${ul "mountpoint"} -q -- "$t" && ${ul "umount"} -- "$t"
       ${bin "rmdir"} -- "$t" 2>/dev/null
 
+      # Extra host dirs bound in with `develop --mount` live alongside the
+      # project bind as $_WS/<mount_id>.<name>.
+      for t in "$_WS/$_MID".*; do
+        [ -d "$t" ] || continue
+        ${ul "mountpoint"} -q -- "$t" && ${ul "umount"} -- "$t"
+        ${bin "rmdir"} -- "$t" 2>/dev/null
+      done
+
       # socat-proxied socket forwards under $_WS/.sockets/$_MID/*
       if [ -d "$_WS/.sockets/$_MID" ]; then
         for s in "$_WS/.sockets/$_MID"/*; do
