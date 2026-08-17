@@ -728,6 +728,46 @@ in
     printf '%s\n' "$mount_id"
   }
 
+  # require_no_live_sessions <subcommand> <force>: refuse to tear the
+  # container down while someone is working in it.
+  #
+  # down/stop/purge/boot kill every process in the container, and with
+  # ephemeral storage they take the session HOMEs with them - so an
+  # ill-timed one costs whatever those sessions were doing. Live sessions
+  # are visible as active session-<id>-<n>.scope units, so ask first and
+  # name the projects; --force keeps the old behavior.
+  require_no_live_sessions() {
+    local subcmd=$1 force=$2
+    [ "$force" = "1" ] && return 0
+    container_running || return 0
+    local units
+    units=$(pm exec -u root "$NAME" \
+      /run/current-system/sw/bin/systemctl list-units --type=scope \
+        --state=active --no-legend 'session-*.scope' 2>/dev/null \
+      | awk '{print $1}' | grep '^session-' || true)
+    [ -n "$units" ] || return 0
+    declare -A counts=()
+    local order=() unit id
+    while IFS= read -r unit; do
+      [ -n "$unit" ] || continue
+      id=''${unit#session-}; id=''${id%.scope}; id=''${id%-*}
+      if [ -z "''${counts[$id]:-}" ]; then order+=("$id"); fi
+      counts[$id]=$(( ''${counts[$id]:-0} + 1 ))
+    done <<<"$units"
+    echo "$subcmd: refusing - $NAME still has live develop session(s):" >&2
+    for id in "''${order[@]}"; do
+      local src
+      # findmnt reports a bind as DEVICE[/sub/path]; the project path is the
+      # bracketed part.
+      src=$(_WS="$WORK_SHARED/$id" podman unshare ${tools.bash} -c \
+              'findmnt -no SOURCE -- "$_WS" 2>/dev/null' 2>/dev/null \
+            | sed -n 's/.*\[\(.*\)\]$/\1/p' | head -1)
+      echo "  $id (''${counts[$id]} shell(s))''${src:+ -> $src}" >&2
+    done
+    echo "  they will lose everything outside the project dir. Re-run with --force to do it anyway." >&2
+    return 1
+  }
+
   tear_down() {
     if container_running; then pm stop -t 5 "$NAME" >/dev/null || true; fi
     if container_exists; then pm rm -f "$NAME" >/dev/null || true; fi
@@ -808,6 +848,14 @@ in
       maybe_start_idle_monitor
       ;;
     down|stop)
+      force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -f|--force) force=1; shift ;;
+          *) echo "$cmd: unknown flag $1" >&2; exit 2 ;;
+        esac
+      done
+      require_no_live_sessions "$cmd" "$force" || exit 1
       tear_down
       echo "$NAME: down"
       ;;
@@ -1399,15 +1447,20 @@ in
       # boot sequence. Wipes any persistent container first.
       ENABLE_GPU=0
       ENABLE_OPENGL=0
+      force=0
       while [ $# -gt 0 ]; do
         case "$1" in
           --gpu)    ENABLE_GPU=1; shift ;;
           --opengl) ENABLE_OPENGL=1; shift ;;
+          -f|--force) force=1; shift ;;
           --) shift; break ;;
           -*) echo "boot: unknown flag $1" >&2; exit 2 ;;
           *)  break ;;
         esac
       done
+      # boot removes the running container outright, so it is as
+      # destructive to live sessions as down/purge.
+      require_no_live_sessions "$cmd" "$force" || exit 1
       if container_exists; then pm rm -f "$NAME" >/dev/null; fi
       ensure_state
       mount_rootfs_lower
@@ -1477,6 +1530,14 @@ in
   INNER
       ;;
     purge)
+      force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -f|--force) force=1; shift ;;
+          *) echo "$cmd: unknown flag $1" >&2; exit 2 ;;
+        esac
+      done
+      require_no_live_sessions "$cmd" "$force" || exit 1
       tear_down
       # Defense in depth beyond the NAME check above: STATE_DIR itself
       # is also directly runtime-overridable (the `${"\${STATE_DIR:-...}"}`
@@ -1609,7 +1670,10 @@ in
                                           libGL.so* directory.
                                 Both must be set at up time; auto-up from
                                 enter/develop never enables either.
-    down/stop                   stop + remove container; state in $STATE_DIR persists.
+    down/stop [--force]         stop + remove container; state in $STATE_DIR persists.
+                                Refuses while develop sessions are live
+                                (they would lose everything outside the
+                                project dir); --force does it anyway.
     enter [-A] [-S name=path]   open a login shell as $SHELL_USER;
                                 auto-runs up if not running.
       shell                     alias for enter.
@@ -1637,11 +1701,12 @@ in
     wayland-detach <hostpath>    stop the wprsc viewer for that session;
                                 the session's apps and wprsd keep running.
     exec -- CMD...              run CMD inside the container as $SHELL_USER.
-    boot                        ephemeral foreground systemd (debugging);
+    boot [--force]              ephemeral foreground systemd (debugging);
                                 wipes any existing persistent container first.
     status                      show container state and disk usage.
     logs                        tail container logs.
-    purge                       down + wipe \$STATE_DIR.
+    purge [--force]             down + wipe \$STATE_DIR. Same live-session
+                                refusal as down.
     check-host-compat           probe host for required binaries,
                                 kernel features, fuse, rootless setup.
 

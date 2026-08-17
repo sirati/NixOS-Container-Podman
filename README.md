@@ -50,7 +50,11 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `up [--gpu] [--opengl]` — start the persistent container (idempotent).
   `--gpu` enables nvidia/CUDA passthrough, `--opengl` enables OpenGL/DRI
   passthrough. Both must be set at `up` time; auto-up never enables either.
-- `down` / `stop` — stop and remove the container; state in `$STATE_DIR` persists.
+- `down` / `stop` `[--force]` — stop and remove the container; state in
+  `$STATE_DIR` persists. Refuses while `develop` sessions are live — tearing
+  the container down kills them and (with ephemeral storage) takes their
+  session HOMEs with it — and names the projects involved. `--force` proceeds
+  anyway. Same for `purge` and `boot`.
 - `enter` / `shell` — open a login shell as `shellUser`; auto-runs `up` if needed.
 - `develop [hostpath]` — bind-mount `<hostpath>` into the running container and
   `nix develop` there as a fresh per-session user. Defaults to the current
