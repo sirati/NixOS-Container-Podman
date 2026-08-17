@@ -54,7 +54,8 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `enter` / `shell` — open a login shell as `shellUser`; auto-runs `up` if needed.
 - `develop [hostpath]` — bind-mount `<hostpath>` into the running container and
   `nix develop` there as a fresh per-session user. Defaults to the current
-  working directory. Re-running on the same path reuses the user.
+  working directory. Re-running on the same path opens another shell in the
+  same session (see [sessions and shells](#sessions-and-shells)).
 - `wayland-attach <hostpath>` — start (or reuse) a host-side `wprsc` viewer for
   a `develop` session started with `--wprs`. Requires `wprsc` on the host's
   `$PATH`.
@@ -68,6 +69,34 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `purge` — `down` plus wipe of `$STATE_DIR`.
 - `check-host-compat` — probe the host for required binaries, kernel features,
   fuse, and rootless setup. Touches no container.
+
+### Sessions and shells
+
+A **session** is per project path — the session user, its HOME, the project
+bind, any templates, the forwards and the watchdogs all belong to it. Each
+`develop` on that path adds a **shell** to that session, in its own scope. So
+running `develop` again while one is live opens a second shell rather than
+failing, and the new shell may carry different flags:
+
+```sh
+nixct develop ~/project        # shell 1
+nixct develop -A ~/project     # shell 2, this one with agent forwarding
+```
+
+Forwards belong to the session, not to the shell that requested them — the
+same shape as sshing into a box twice, once with `-A`:
+
+- only the shell that passed `-A` gets `$SSH_AUTH_SOCK` set; shells already
+  running can still reach the socket by path if they want it (same user);
+- exiting the `-A` shell does **not** take the socket down — it stays for the
+  shells still running;
+- the session (and with it the forwards, the home and the user) is torn down
+  when its **last** shell exits.
+
+Joining and tearing down are serialized against each other under a per-session
+lock: a shell arriving just as the last one leaves either pins the session
+(teardown aborts) or waits for teardown to finish and gets a clean new
+session. It can never land in one that is being dismantled.
 
 ### Forwarding flags (`enter` and `develop`)
 

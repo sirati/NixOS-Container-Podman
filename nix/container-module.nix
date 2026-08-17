@@ -192,23 +192,52 @@ in
 
           mount_id=$1
           session_user=$2
-          scope="session-''${mount_id}.scope"
           home_dir="/develop-home/''${session_user}"
           socket_dir="/run/sockets/''${mount_id}"
 
-          # Stage 1: wait for the scope to actually come into existence.
-          # The watchdog is started before the develop subcommand creates the
-          # scope, so without this wait `is-active` would return inactive
-          # immediately and we'd tear down before the user ever got a shell.
-          for _ in $(seq 1 120); do
-            state=$(systemctl is-active "$scope" 2>/dev/null || true)
-            case "$state" in active|activating|reloading) break ;; esac
-            sleep 0.5
-          done
+          # A session can hold several shells (running `develop` again on the
+          # same path adds one), each in its own session-<id>-<n>.scope. The
+          # session is over only when they are ALL gone - and deciding that
+          # has to be atomic against a shell joining, or we would start
+          # unmounting a session someone is in the middle of entering.
+          #
+          # `develop` registers a joiner marker under the same lock this uses
+          # BEFORE it sets anything up, and the shell drops that marker from
+          # inside its own scope. So "no live scope and no joiner", evaluated
+          # while holding the lock, is a decision no joiner can invalidate:
+          # anyone arriving later blocks on the lock until teardown is done,
+          # then finds no `live` file and builds a fresh session.
+          session_dir="/run/nixct-sessions/''${mount_id}"
+          mkdir -p "$session_dir/joiners"
 
-          # Stage 2: wait for the scope to become inactive (= every process,
-          # including reparented daemons, has exited).
-          while systemctl is-active --quiet "$scope" 2>/dev/null; do
+          live_shells() {
+            systemctl list-units --type=scope --state=active --no-legend \
+              "session-''${mount_id}-*.scope" 2>/dev/null \
+              | grep -c '\.scope' || true
+          }
+          # A joiner that never made it into a scope (develop died during
+          # setup) must not pin the session forever. Its window is seconds;
+          # five minutes is a generous backstop.
+          joiners() {
+            find "$session_dir/joiners" -mindepth 1 -mmin +5 -delete 2>/dev/null || true
+            find "$session_dir/joiners" -mindepth 1 2>/dev/null | grep -c . || true
+          }
+
+          # Wait until the session is genuinely idle, then confirm it while
+          # holding the lock. Everything after this point runs with the lock
+          # held, so teardown and a would-be joiner can never interleave.
+          exec 9>"$session_dir/lock"
+          while true; do
+            if [ "$(live_shells)" -gt 0 ] || [ "$(joiners)" -gt 0 ]; then
+              sleep 2
+              continue
+            fi
+            flock 9
+            if [ "$(live_shells)" -eq 0 ] && [ "$(joiners)" -eq 0 ]; then
+              rm -f "$session_dir/live"
+              break
+            fi
+            flock -u 9
             sleep 2
           done
           # Settle period in case systemd is mid-tear-down.
@@ -229,18 +258,32 @@ in
           # exactly those - which would walk this safety check straight past
           # the mounts it exists to catch.
           shopt -s dotglob nullglob
-          for d in "$home_dir"/*; do
-            [ -d "$d" ] || continue
-            if mountpoint -q -- "$d"; then
+          # Retry: the last shell's processes may still be going away when we
+          # get here, and a single failed unmount used to strand the mount
+          # (and with it the whole home, since the guard below then refuses
+          # to delete anything) for as long as the container lived.
+          still_bound=1
+          for attempt in $(seq 1 10); do
+            still_bound=0
+            for d in "$home_dir"/*; do
+              [ -d "$d" ] || continue
+              mountpoint -q -- "$d" || continue
               fusermount3 -u -- "$d" 2>/dev/null \
                 || umount -- "$d" 2>/dev/null || true
-            fi
+              # Last resort on the final attempt: detach it from the tree so
+              # teardown can finish. MNT_DETACH unlinks it immediately, so
+              # the rm below can no longer traverse into it.
+              if [ "$attempt" -ge 10 ] && mountpoint -q -- "$d"; then
+                umount -l -- "$d" 2>/dev/null || true
+              fi
+              mountpoint -q -- "$d" && still_bound=1
+            done
+            [ "$still_bound" -eq 0 ] && break
+            sleep 1
           done
-          still_bound=0
           for d in "$home_dir"/*; do
             [ -d "$d" ] || continue
             if mountpoint -q -- "$d"; then
-              still_bound=1
               rmdir -- "$d" 2>/dev/null || true
             fi
           done
@@ -253,15 +296,21 @@ in
           # untouched by construction.
           rm -rf -- /run/nixct-templates/"''${mount_id}".* 2>/dev/null || true
 
-          # Forwarded-socket proxies (socat units) are killed by their
-          # BindsTo=$scope; just clean up the leftover socket files.
+          # Forwarded-socket proxies (socat units) belong to the SESSION,
+          # not to any one shell - that is what lets a `develop -A` shell
+          # exit without pulling the agent socket out from under the shells
+          # still running. Nothing else stops them, so do it here, once the
+          # last shell is gone.
+          for u in $(systemctl list-units --type=service --state=active \
+                       --no-legend "socket-proxy-''${mount_id}-*.service" \
+                       2>/dev/null | awk '{print $1}'); do
+            systemctl stop "$u" 2>/dev/null || true
+          done
           rm -rf -- "$socket_dir" 2>/dev/null || true
 
           # wprsd (nixct develop --wprs) and the per-session D-Bus daemon
-          # (develop --dbus) are NOT BindsTo=$scope - the scope doesn't
-          # exist yet when they start (systemd-run refuses to create a
-          # unit whose BindsTo= target doesn't exist), so they're stopped
-          # explicitly here instead. Harmless no-op if absent.
+          # (develop --dbus) are likewise not tied to a shell scope, so
+          # they're stopped explicitly too. Harmless no-op if absent.
           systemctl stop "wprsd-''${mount_id}.service" 2>/dev/null || true
           systemctl stop "session-dbus-''${mount_id}.service" 2>/dev/null || true
 

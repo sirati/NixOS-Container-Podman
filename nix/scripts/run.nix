@@ -987,6 +987,69 @@ in
 
       bind_workdir "$hostpath" "$mount_id"
 
+      # One SESSION per project path (user, home, binds, forwards,
+      # watchdogs - all keyed on $mount_id), but any number of SHELLS in it.
+      # Each shell gets its own scope, so running `develop` again on a path
+      # that already has a live session opens another shell alongside the
+      # first instead of failing on a name clash. The session lives until
+      # its LAST shell exits.
+      #
+      # Joining has to be ATOMIC against teardown. Merely looking for a live
+      # scope would race: the watchdog can decide "no shells left" and start
+      # unmounting while this invocation is between that check and having its
+      # own scope - the new shell would then land in a session being
+      # dismantled underneath it. So both sides take the same per-session
+      # lock, and this side registers a JOINER marker before releasing it.
+      # The watchdog only tears down while holding that lock and only when
+      # there is neither a live scope nor a joiner; the marker is dropped by
+      # the shell itself, from inside its scope, once that scope exists (see
+      # develop_cmd below), leaving no gap between the two.
+      #
+      # Not a login shell, and answers are tagged: /etc/profile emits a
+      # terminal-title escape sequence that would otherwise be captured into
+      # the values (and end up inside a unit name).
+      # shellcheck disable=SC2016
+      join_out=$(pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/bash -c '
+          set -e
+          sw=/run/current-system/sw/bin
+          id=$1
+          dir=/run/nixct-sessions/$id
+          "$sw/mkdir" -p "$dir/joiners"
+          # Sticky-writable, /tmp style: the marker is removed by the shell
+          # itself, which runs as the session user, and unlinking needs write
+          # permission on the DIRECTORY - owning the file is not enough. The
+          # sticky bit still stops one session user from removing markers
+          # belonging to another.
+          "$sw/chmod" 1777 "$dir/joiners"
+          exec 9>"$dir/lock"
+          "$sw/flock" 9
+          if [ -f "$dir/live" ]; then echo "STATE:joined"; else echo "STATE:new"; fi
+          : > "$dir/live"
+          i=1
+          while [ "$i" -le 64 ]; do
+            state=$("$sw/systemctl" show -p LoadState \
+                      --value "session-$id-$i.scope" 2>/dev/null)
+            if [ "$state" = "not-found" ] || [ -z "$state" ]; then
+              if [ ! -e "$dir/joiners/$i" ]; then
+                : > "$dir/joiners/$i"
+                echo "IDX:$i"
+                exit 0
+              fi
+            fi
+            i=$((i + 1))
+          done
+          echo "IDX:0"
+        ' bash "$mount_id")
+      shell_idx=$(printf '%s' "$join_out" | sed -n 's/.*IDX:\([0-9][0-9]*\).*/\1/p' | head -1)
+      join_state=$(printf '%s' "$join_out" | sed -n 's/.*STATE:\([a-z]*\).*/\1/p' | head -1)
+      if [ -z "$shell_idx" ] || [ "$shell_idx" = "0" ]; then
+        echo "develop: too many concurrent shells for this session" >&2
+        exit 1
+      fi
+      scope="session-$mount_id-$shell_idx.scope"
+      joiner_marker="/run/nixct-sessions/$mount_id/joiners/$shell_idx"
+
       # Session user (unique uid, NOT in wheel). Each develop
       # invocation allocates a fresh uid via useradd's auto
       # selection; reused across develop calls on the same path.
@@ -1012,6 +1075,13 @@ in
 
       uid=$(pm exec -u root "$NAME" /run/current-system/sw/bin/id -u -- "$session_user" | tr -d '[:space:]')
       gid=$(pm exec -u root "$NAME" /run/current-system/sw/bin/id -g -- "$session_user" | tr -d '[:space:]')
+
+      # The joiner marker is dropped by the shell itself once its scope is
+      # up (see develop_cmd), and that runs as the session user - so hand it
+      # over now that the uid exists.
+      pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/chown "$uid:$gid" "$joiner_marker" \
+        >/dev/null 2>&1 || true
 
       # Per-session HOME at /develop-home/<session_user>, with the
       # project bind-mounted ONE LEVEL DOWN at <home>/dev. Keeping the
@@ -1158,7 +1228,15 @@ in
         develop_cmd='mkdir -p "$HOME/.nixct" && nix develop --profile "$HOME/.nixct/devshell"'
       fi
 
-      scope="session-$mount_id.scope"
+      # Hand the joiner registration over to the scope itself: by the time
+      # this runs, the scope exists, so the watchdog can see a live shell.
+      # Dropping the marker any earlier would reopen the window this is
+      # meant to close. Runs as the session user, which owns nothing here -
+      # the marker is world-writable-by-owner-root only in /run, so remove
+      # it best-effort and let the watchdog's staleness sweep catch the
+      # rest.
+      develop_cmd="rm -f $joiner_marker 2>/dev/null; $develop_cmd"
+
 
       if [ "$forward_agent" -eq 1 ]; then
         if [ -z "''${SSH_AUTH_SOCK:-}" ] || [ ! -S "$SSH_AUTH_SOCK" ]; then
@@ -1166,26 +1244,27 @@ in
           exit 2
         fi
         bind_socket "$mount_id" "ssh-agent" "$SSH_AUTH_SOCK"
-        spawn_socket_proxy "$mount_id" "ssh-agent" \
-          "$uid" "$gid" "$scope"
+        spawn_socket_proxy "$mount_id" "ssh-agent" "$uid" "$gid"
         extra_setenv+=(--setenv="SSH_AUTH_SOCK=/run/sockets/$mount_id/ssh-agent")
       fi
 
-      # Generic -S socket forwarding. Each forwarded socket gets
-      # a socat proxy in the container BoundTo this session's
-      # scope, so it goes away when the scope dies.
+      # Forwards belong to the SESSION, not to the shell that asked for
+      # them: no BindsTo on this shell's scope, and the inner watchdog
+      # stops them when the last shell is gone. So a second `develop -A`
+      # on a live session adds agent forwarding for the new shell (and
+      # only that shell gets $SSH_AUTH_SOCK set, ssh-style), while exiting
+      # that shell leaves the socket up for the ones still running.
       for spec in "''${sock_specs[@]+''${sock_specs[@]}}"; do
         parsed=$(parse_socket_spec "$spec") || exit 2
         sock_name=$(printf '%s' "$parsed" | sed -n '1p')
         sock_host=$(printf '%s' "$parsed" | sed -n '2p')
         bind_socket "$mount_id" "$sock_name" "$sock_host"
-        spawn_socket_proxy "$mount_id" "$sock_name" \
-          "$uid" "$gid" "$scope"
+        spawn_socket_proxy "$mount_id" "$sock_name" "$uid" "$gid"
         echo "forward: $sock_host -> /run/sockets/$mount_id/$sock_name"
       done
 
       if [ -n "$x11_mode" ]; then
-        x11_out=$(setup_x11 "$x11_mode" "$mount_id" "$uid" "$gid" "$scope") || exit 2
+        x11_out=$(setup_x11 "$x11_mode" "$mount_id" "$uid" "$gid") || exit 2
         while IFS= read -r line; do
           [ -z "$line" ] && continue
           extra_setenv+=(--setenv="$line")
@@ -1194,7 +1273,7 @@ in
       fi
 
       if [ "$wayland" -eq 1 ]; then
-        wl_out=$(setup_wayland "$mount_id" "$uid" "$gid" "$scope") || exit 2
+        wl_out=$(setup_wayland "$mount_id" "$uid" "$gid") || exit 2
         while IFS= read -r line; do
           [ -z "$line" ] && continue
           extra_setenv+=(--setenv="$line")
@@ -1225,13 +1304,12 @@ in
       # binds on receipt of any connection).
       start_session_watchdog "$mount_id"
 
-      # Spawn the per-session IN-CONTAINER watchdog (blocks on
-      # session-<id>.scope; when the LAST process in the scope
-      # exits - including reparented daemons - it unmounts the
-      # in-container bindfs mounts, userdels, and dials the
-      # host watchdog so the host side gets dropped too). Both
+      # Spawn the per-session IN-CONTAINER watchdog (waits for every
+      # session-<id>-*.scope to be gone - i.e. the last shell of this
+      # session exited, including reparented daemons - then unmounts the
+      # in-container mounts, stops the session's forwards, userdels, and
+      # dials the host watchdog so the host side gets dropped too). Both
       # watchdogs are one-shot per session and idempotent.
-      scope="session-$mount_id.scope"
       watchdog_unit="watchdog-$mount_id.service"
       if ! pm exec -u root "$NAME" \
           /run/current-system/sw/bin/systemctl is-active --quiet \
@@ -1280,6 +1358,9 @@ in
       # Final activity bump right before the scope exists, so a tight
       # idle timeout can't fire during the last moments of setup.
       mark_activity
+      if [ "$join_state" = "joined" ]; then
+        echo "develop: joining live session as shell #$shell_idx (its forwards stay up until the last shell exits)"
+      fi
       echo "develop: $hostpath -> $proj_dir (HOME: $home_dir, scope: $scope)"
       pm exec -it -u root "$NAME" \
         /run/current-system/sw/bin/systemd-run \
@@ -1533,6 +1614,10 @@ in
                                 auto-runs up if not running.
       shell                     alias for enter.
     develop [-A] [-S name=path] [hostpath]
+                                run it again on a path that already has a
+                                live session and you get ANOTHER shell in
+                                that same session (see "sessions and
+                                shells" below), not an error.
                                 bind-mount <hostpath> (default: the current
                                 working directory) at /develop-home/<user>/dev
                                 (~/dev) in the running container, exec nix
@@ -1559,6 +1644,18 @@ in
     purge                       down + wipe \$STATE_DIR.
     check-host-compat           probe host for required binaries,
                                 kernel features, fuse, rootless setup.
+
+  sessions and shells (develop):
+    A SESSION is per project path: the session user, its HOME, the project
+    bind, templates, forwards and watchdogs. Each \`develop\` on that path
+    adds a SHELL to it (its own scope), so you can open a second one while
+    the first is running - and give the new one different flags. Forwards
+    belong to the session, not the shell that asked: adding -A later sets
+    \$SSH_AUTH_SOCK for that shell only (shells already running can still
+    reach the socket by path, ssh-style), and exiting it leaves the socket
+    up for the others. The session tears down when its LAST shell exits;
+    joining and tearing down are serialized, so a shell arriving as a
+    session ends either keeps it alive or waits and gets a fresh one.
 
   forwarding flags (enter and develop):
     -A, --forward-agent         forward the host \$SSH_AUTH_SOCK.

@@ -37,9 +37,16 @@
       set -euo pipefail
       mkdir -p -- "$(dirname -- "$_DST")"
       [ -e "$_DST" ] || : > "$_DST"
-      if ! mountpoint -q -- "$_DST"; then
-        mount --bind -- "$_SRC" "$_DST"
+      # Re-bind rather than skip when one is already there: forwards now
+      # outlive the shell that created them, so a later `-A` may well name
+      # a DIFFERENT host socket (a fresh login session means a fresh
+      # ssh-agent). Keeping the old bind would silently forward to a dead
+      # agent. The socat proxy connects per connection, so it picks the new
+      # target up without a restart.
+      if mountpoint -q -- "$_DST"; then
+        umount -- "$_DST" 2>/dev/null || umount -l -- "$_DST" 2>/dev/null || true
       fi
+      mount --bind -- "$_SRC" "$_DST"
     '
   }
 
@@ -104,7 +111,7 @@
     ' bash "$uid" "$sock"
   }
 
-  # spawn_socket_proxy <namespace> <name> <uid> <gid> [bind_to]:
+  # spawn_socket_proxy <namespace> <name> <uid> <gid>:
   # ensure a socat proxy is running inside the container that
   # listens on /run/sockets/<ns>/<name> owned by the session
   # user, forwarding connections to /hostmnts/.sockets/<ns>/<name>.
@@ -113,11 +120,14 @@
   # route AF_UNIX connect() syscalls - bindfs would show the
   # socket inode but `connect` to it returns ECONNREFUSED.
   #
-  # If <bind_to> is given (e.g. session-<id>.scope), socat dies
-  # with that unit via systemd BindsTo. For enter-style forwards
-  # there's no scope; socat persists until container down.
+  # Lifetime is the SESSION's, not any one shell's: a develop session can
+  # hold several shells (`develop` again on the same path adds one), and a
+  # forward set up by one of them must not vanish when that shell exits -
+  # same as sshing in twice, once with -A. The inner watchdog stops these
+  # units once the last shell of the session is gone; for enter-style
+  # forwards (no session) they persist until the container goes down.
   spawn_socket_proxy() {
-    local ns=$1 name=$2 uid=$3 gid=$4 bind_to=''${5:-}
+    local ns=$1 name=$2 uid=$3 gid=$4
     local unit="socket-proxy-''${ns}-''${name}.service"
     # Idempotent: skip if already active.
     if pm exec -u root "$NAME" \
@@ -130,12 +140,6 @@
       --setenv=NS="$ns" --setenv=NAME="$name"
       --setenv=UID_="$uid" --setenv=GID_="$gid"
     )
-    if [ -n "$bind_to" ]; then
-      args+=(
-        --property=BindsTo="$bind_to"
-        --property=After="$bind_to"
-      )
-    fi
     # shellcheck disable=SC2016
     pm exec -u root "$NAME" \
       /run/current-system/sw/bin/systemd-run \
@@ -170,7 +174,7 @@
       ' bash "$uid" "$gid" >/dev/null
   }
 
-  # setup_x11 <mode> <ns> <uid> <gid> [<scope>]: orchestrate the
+  # setup_x11 <mode> <ns> <uid> <gid>: orchestrate the
   # forwarding side of X11. Echoes two lines on stdout for the
   # caller: "DISPLAY=:<n>" and "XCOOKIE=<hex>". Returns 0 on
   # success, 1 if X11 isn't available on the host.
@@ -181,7 +185,7 @@
   #                     (like ssh -X). Requires the host's X
   #                     server to support the SECURITY extension.
   setup_x11() {
-    local mode=$1 ns=$2 uid=$3 gid=$4 scope=''${5:-}
+    local mode=$1 ns=$2 uid=$3 gid=$4
     if [ -z "''${DISPLAY:-}" ]; then
       echo "--x11: \$DISPLAY is not set on the host" >&2
       return 1
@@ -243,14 +247,14 @@
     printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$uid"
   }
 
-  # setup_wayland <ns> <uid> <gid> [<scope>]: forward the
+  # setup_wayland <ns> <uid> <gid>: forward the
   # Wayland compositor socket. Many clients (including Firefox)
   # only accept WAYLAND_DISPLAY as a RELATIVE name and resolve
   # it against XDG_RUNTIME_DIR. So we make
   # /run/user/<uid>/wayland-0 a symlink to the proxied socket
   # and emit XDG_RUNTIME_DIR + WAYLAND_DISPLAY=wayland-0.
   setup_wayland() {
-    local ns=$1 uid=$2 gid=$3 scope=''${4:-}
+    local ns=$1 uid=$2 gid=$3
     local wd=''${WAYLAND_DISPLAY:-wayland-0}
     local host_sock
     case "$wd" in
