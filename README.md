@@ -36,11 +36,11 @@ overlay), `.#testdaemon` (host nix-daemon), `.#testnvidia`, and
 `.#nixct-nvidia`.
 
 `mkNixct` additionally takes `modules` (extra NixOS modules for the container
-system) and `runName` (name of the installed binary), which is how
-out-of-tree presets extend it — see [`nixct-chrome/`](nixct-chrome), a
-self-contained subproject (own flake, destined for its own repository) whose
-containers ship Google Chrome with the Claude in Chrome extension
-preinstalled.
+system), `runName` (name of the installed binary) and `sessionTemplates`
+(host state every session inherits, frozen — see `--template` below). Those
+are the extension points out-of-tree presets build on; `nixct-chrome` is one
+such preset, a separate flake whose containers ship Google Chrome with the
+Claude in Chrome extension preinstalled.
 
 ## Subcommands
 
