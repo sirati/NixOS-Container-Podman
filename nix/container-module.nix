@@ -87,7 +87,15 @@ in
       # hit EAGAIN / "Resource temporarily unavailable" when spawning threads
       # or opening many fds. Match a typical Linux desktop.
       systemd.settings.Manager = {
-        DefaultLimitNOFILE = "1024:524288";
+        # The SOFT limit is what processes actually get. 1024 was far too
+        # low: a `cargo build -j32` holds well over a thousand files open on
+        # its own, and - worse - every file opened through a FUSE mount also
+        # consumes a handle in the FUSE DAEMON, so a 1024-soft bindfs capped
+        # the WHOLE session at ~660 concurrently open files under ~/dev. It
+        # surfaced as EMFILE wherever the build happened to be, e.g. a
+        # half-written .rlib and then "can't find crate" in crates nobody
+        # touched, which costs hours to chase as a dependency problem.
+        DefaultLimitNOFILE = "262144:524288";
         DefaultLimitNPROC = "65535";
         DefaultLimitMEMLOCK = "infinity";
       };

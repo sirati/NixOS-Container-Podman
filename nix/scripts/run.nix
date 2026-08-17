@@ -612,7 +612,14 @@ in
     # threads (Firefox, ML toolkits). Capped by host's hard
     # limit for the invoking user.
     --ulimit nproc=-1:-1
-    --ulimit nofile=1024:524288
+    # The SOFT limit is what processes actually get, and 1024 is far too
+    # low here: a `cargo build -j32` holds well over a thousand files open
+    # by itself. Worse, every open through a FUSE mount also consumes a
+    # handle inside the FUSE DAEMON, so a 1024-soft bindfs became a ~660
+    # file ceiling shared by everything using that project mount - and it
+    # failed as EMFILE in whichever build touched it next, which looks
+    # like a corrupt dependency rather than a limit.
+    --ulimit nofile=262144:524288
     # podman's own default (--pids-limit=2048) is a SEPARATE
     # cgroup-level ceiling from the ulimits above - it's sized for
     # podman's typical single-process-container use case, not a full
@@ -621,6 +628,10 @@ in
     # every service, every session - shares ONE pids.max here, so
     # unlimited matches a normal PC's lack of an artificial ceiling.
     --pids-limit=-1
+    # podman defaults /dev/shm to 64M, which is a desktop-app
+    # footgun in here: Chromium and friends put their shared
+    # buffers there and die in confusing ways when it fills.
+    --shm-size=1g
     --hostname "$NAME"
     -v "$WORK_SHARED:/hostmnts:rshared"
     -v "$SOCKET_MOUNTS:/var/socket-mounts:rshared"
@@ -1144,6 +1155,16 @@ in
       pm exec -u root "$NAME" \
         /run/current-system/sw/bin/bash -lc '
           set -e
+          # A FUSE daemon opens the underlying file for every file opened
+          # through its mount, so ITS rlimit is the ceiling on how many
+          # files everything using this project can hold open at once -
+          # shared, not per process. At the inherited soft limit of 1024
+          # that ceiling is ~660 files for the whole session, which a
+          # single `cargo build -j32` blows through; it then surfaces as
+          # EMFILE in an unrelated-looking place - a half-written .rlib, and
+          # then a missing-crate error in crates nobody touched. Give the
+          # daemon the hard limit.
+          ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
           home_dir=/develop-home/$1
           proj_dir=$home_dir/dev
           src=/hostmnts/$2
@@ -1241,6 +1262,8 @@ in
         pm exec -u root "$NAME" \
           /run/current-system/sw/bin/bash -lc '
             set -e
+            # Same shared-handle-pool reasoning as the project bindfs above.
+            ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
             session_user=$1; lowers=$2; uid=$3; gid=$4; tname=$5; id=$6
             dst=/develop-home/$session_user/$tname
             scratch=/run/nixct-templates/$id.$tname
@@ -1518,8 +1541,9 @@ in
     --security-opt systempaths=unconfined \
     --security-opt label=disable \
     --ulimit nproc=-1:-1 \
-    --ulimit nofile=1024:524288 \
+    --ulimit nofile=262144:524288 \
     --pids-limit=-1 \
+    --shm-size=1g \
     --hostname "$NAME" \
     -v "$WORK_SHARED:/hostmnts:rshared" \
     -v "$SOCKET_MOUNTS:/var/socket-mounts:rshared" \
