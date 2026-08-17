@@ -20,6 +20,23 @@ in {
       hostHasToolkit = lib.mkEnableOption "use the host's nvidia-container-toolkit (CDI) for --gpu";
     };
     service.enable = lib.mkEnableOption "a per-user systemd service that starts nixct on login and keeps it running (disables idle shutdown)";
+    service.restartOnSwitch = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether `nixos-rebuild switch` may restart the container service when
+        the built container changes.
+
+        Off by default, because a restart is not an upgrade-in-place: it tears
+        the container down and takes every live `nixct develop` session with
+        it, along with whatever those sessions were running. The rootfs is
+        baked at build time, so there is no way to swap it under a running
+        container - the new version applies the next time the service starts
+        (a fresh login, or `systemctl --user restart nixct` when nothing is
+        running). Until then the old container keeps serving, unharmed by the
+        rebuild.
+      '';
+    };
     packages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
@@ -41,11 +58,17 @@ in {
     systemd.user.services.nixct = lib.mkIf cfg.service.enable {
       description = "nixct dev container";
       wantedBy = [ "default.target" ];
+      # Emits X-RestartIfChanged=false, which makes switch-to-configuration
+      # skip this unit instead of stop/start-ing it. See the option.
+      restartIfChanged = cfg.service.restartOnSwitch;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = "${cfg.package}/bin/nixct up" + lib.optionalString cfg.gpu.enable " --gpu --opengl";
-        ExecStop  = "${cfg.package}/bin/nixct down";
+        # --force: stopping the unit is an explicit act, so it should not be
+        # blocked by the live-session guard that protects against a stray
+        # `nixct down` on the command line.
+        ExecStop  = "${cfg.package}/bin/nixct down --force";
       };
     };
   };

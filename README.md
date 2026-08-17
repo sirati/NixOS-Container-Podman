@@ -366,8 +366,29 @@ The `programs.nixct` options:
   `--gpu`.
 - `service.enable` — run a per-user systemd service that starts nixct on login
   and keeps it up (disables idle shutdown).
+- `service.restartOnSwitch` — whether `nixos-rebuild switch` may restart that
+  service when the built container changes (default `false`, see below).
 - `package` — the built nixct package; defaults to one built from the options
   above.
+
+### Rebuilds don't disturb a running container
+
+A restart is not an upgrade-in-place: the rootfs is baked at build time, so
+there is nothing to swap under a live container — a restart tears it down and
+takes every `nixct develop` session with it, along with whatever they were
+running. So the service is marked `X-RestartIfChanged=false` and
+`nixos-rebuild switch` **skips** it: the rebuild writes the new unit, the old
+container keeps serving.
+
+The new version applies the next time the service actually starts — a fresh
+login, or deliberately when nothing is running:
+
+```sh
+systemctl --user restart nixct     # picks up the newly built container
+```
+
+Set `service.restartOnSwitch = true` to get the old behaviour (switch restarts
+it, killing live sessions).
 
 ### Lifecycle
 
