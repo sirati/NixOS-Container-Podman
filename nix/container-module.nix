@@ -157,6 +157,21 @@ in
       # plus a session-lifetime upper.
       environment.systemPackages = with pkgs; [ bindfs socat fuse3 fuse-overlayfs ];
 
+      # NixOS makes /etc/ssh/ssh_config `Include` a file from the systemd
+      # STORE PATH. That breaks ssh in here whenever /nix comes from the
+      # host (hostNixStore / hostNixDaemon): host uid 0 is outside this
+      # rootless container's uid map, so the file shows up owned by the
+      # overflow uid (65534) and OpenSSH refuses it outright -
+      #
+      #   Bad owner or permissions on
+      #   /nix/store/...-systemd-*/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf
+      #
+      # which takes every ssh invocation with it, not just proxied ones.
+      # The plugin only serves `ssh vsock/...`-style connections into VMs
+      # and containers, so it has nothing to do in a dev container. mkDefault
+      # so a downstream config can turn it back on knowingly.
+      programs.ssh.systemd-ssh-proxy.enable = lib.mkDefault false;
+
       # Container directory layout for develop sessions:
       #   /hostmnts            - bind target for host paths. Owned by the
       #                          container root (= host user under the
