@@ -598,6 +598,22 @@ in
   # locale archive, and a host locale it lacks (en_GB.UTF-8 against a
   # container built with en_US.UTF-8) would just make every program warn.
   # The container default is UTF-8 already, which is what TUI drawing needs.
+  # Put the terminal back the way we found it when a session ends.
+  #
+  # A TUI in the session drives the HOST terminal - podman only proxies the
+  # pty - so mouse tracking, the alternate screen and alternate scroll are
+  # set on the real terminal. An app that exits abnormally (killed, or the
+  # exec torn down under it) never sends its restore sequences, and the
+  # terminal is left in that mode AFTER the session is gone: the wheel keeps
+  # sending arrow keys, so scrolling walks shell history instead of the
+  # scrollback. Undo the modes a session can plausibly have set.
+  restore_term() {
+    [ -t 1 ] || return 0
+    # alt screen, the mouse reporting modes, alternate scroll, bracketed
+    # paste, cursor visibility, attributes.
+    printf '\033[?1049l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l\033[?1007l\033[?2004l\033[?25h\033[0m'
+  }
+
   term_env() {
     if [ -n "''${TERM:-}" ]; then printf 'TERM=%s\n' "$TERM"; fi
     if [ -n "''${COLORTERM:-}" ]; then printf 'COLORTERM=%s\n' "$COLORTERM"; fi
@@ -1215,6 +1231,9 @@ in
         exec_env+=(--env "$line")
       done <<<"$(term_env)"
 
+      trap restore_term EXIT
+      trap 'restore_term; exit 130' INT
+      trap 'restore_term; exit 143' TERM
       pm exec -it -u "$SHELL_USER" \
         "''${exec_env[@]+''${exec_env[@]}}" \
         "$NAME" \
@@ -1223,6 +1242,9 @@ in
     exec)
       if [ "''${1:-}" = "--" ]; then shift; fi
       ensure_running
+      trap restore_term EXIT
+      trap 'restore_term; exit 130' INT
+      trap 'restore_term; exit 143' TERM
       pm exec -it -u "$SHELL_USER" "$NAME" "$@"
       ;;
     develop)
@@ -1831,6 +1853,9 @@ in
       # Final activity bump right before the scope exists, so a tight
       # idle timeout can't fire during the last moments of setup.
       mark_activity
+      trap restore_term EXIT
+      trap 'restore_term; exit 130' INT
+      trap 'restore_term; exit 143' TERM
       if [ "$join_state" = "joined" ]; then
         echo "develop: joining live session as shell #$shell_idx (its forwards stay up until the last shell exits)"
       fi
