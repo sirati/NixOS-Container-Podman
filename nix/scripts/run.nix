@@ -1444,6 +1444,12 @@ in
           mkdir -p "$proj_dir"
           chown "$3:$4" "$home_dir"
           chmod 0700 "$home_dir"
+          # $XDG_CONFIG_HOME, owned by the session user from the start.
+          # Plenty of tools create things under it without checking, and a
+          # root-owned ~/.config is a confusing failure far from its cause.
+          mkdir -p "$home_dir/.config"
+          chown "$3:$4" "$home_dir/.config"
+          chmod 0755 "$home_dir/.config"
           # Framework-managed ~/.bashrc (enables direnv; sources a
           # mounted-in user bashrc if present). Reinstalled every run so
           # it stays current; user customisation goes in ~/.bashrc.user.
@@ -1486,10 +1492,25 @@ in
           # shellcheck disable=SC2016
           pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
             set -e
-            dest="/develop-home/$1/$2"
-            parent=$(dirname -- "$dest")
-            mkdir -p "$parent"
-            chown "$3:$4" "$parent" 2>/dev/null || true
+            home="/develop-home/$1"
+            dest="$home/$2"
+            # Create EVERY missing level as the session user, not just the
+            # last one. Leaving an intermediate (~/.config) owned by root
+            # means the session can read it but never create anything in it,
+            # which breaks any tool that expects to write under $XDG_CONFIG_HOME
+            # - Chromium putting its crash-reporter state there, for one.
+            rel=$(dirname -- "$2")
+            cur="$home"
+            if [ "$rel" != "." ]; then
+              IFS=/ read -ra _parts <<< "$rel"
+              for _p in "''${_parts[@]}"; do
+                [ -z "$_p" ] && continue
+                cur="$cur/$_p"
+                mkdir -p "$cur"
+                chown "$3:$4" "$cur"
+                chmod 0755 "$cur"
+              done
+            fi
             cat > "$dest"
             chown "$3:$4" "$dest"
             chmod 0444 "$dest"
