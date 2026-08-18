@@ -11,6 +11,13 @@
 # writeShellApplication's runtimeInputs (NixOS) or by the host's
 # /usr/bin (portable, with a sane PATH set at script entry).
 #
+# CARE: much of this script passes shell snippets to the container inside
+# SINGLE-QUOTED strings (`bash -lc '...'`). An apostrophe anywhere in such a
+# snippet - including in a comment, e.g. "cannot" written as a contraction -
+# closes that string early and the result is a confusing syntax error far
+# below. Keep those snippets apostrophe-free. Same rule for `''` inside the
+# surrounding Nix '' string, which ends the Nix string instead.
+#
 # The script body is assembled from cohesive bash fragments under
 # nix/scripts/lib/ (store, gpu, forwarding, watchdog) plus the container
 # lifecycle + dispatch kept here. Splitting keeps each concern editable
@@ -26,6 +33,15 @@
   # "''${XDG_STATE_HOME:-$HOME/.local/state}/foo" works) and is created if
   # missing. See the `--template` flag for the runtime version.
 , sessionTemplates ? [ ]
+  # Host directories every develop session gets SHARED into its HOME, as a
+  # list of { host, name, mode ? "rw" }. Unlike a template these are the
+  # real directory - writes go through to the host and outlive the session.
+  # `host` is a shell string expanded at run time and created if missing.
+  # See the `--share` flag for the runtime version.
+, sessionShares ? [ ]
+  # Extra arguments appended to the `nix develop` the session starts with,
+  # e.g. [ "--impure" ]. See `--develop-arg` for the runtime version.
+, developArgs ? [ ]
 , hostHasNvidiaContainerToolkit ? false
 , useKeepId ? false
 , keepIdUid ? 1000
@@ -107,9 +123,43 @@ let
       mkdir -p -- "$_t" 2>/dev/null || true
       template_specs+=("$_t:${t.name}")
     '') sessionTemplates);
+
+  # Same shape for container-declared shares, plus the ro/rw mode.
+  sessionShareLines =
+    builtins.concatStringsSep "" (map (s: ''
+      _s="${s.host}"
+      mkdir -p -- "$_s" 2>/dev/null || true
+      share_specs+=("$_s:${s.name}:${s.mode or "rw"}")
+    '') sessionShares);
+
+  # Single-quote a string for the shell (run.nix takes no `lib`).
+  shellQuote = a:
+    "'" + builtins.replaceStrings [ "'" ] [ "'\\''" ] a + "'";
+
+  # Container-declared `nix develop` arguments, one array element each so
+  # arguments with spaces survive.
+  developArgLines =
+    builtins.concatStringsSep "" (map (a: ''
+      develop_args+=(${shellQuote a})
+    '') developArgs);
 in
 
 ''
+  # Rootless podman shells out to the SETUID newuidmap/newgidmap to apply a
+  # multi-id mapping. On NixOS those live in /run/wrappers/bin, which is not
+  # on the PATH of a systemd unit - so running this from a service (e.g. the
+  # `programs.nixct` user service) fails at `up` with
+  #   Error: command required for rootless mode with multiple IDs:
+  #          exec: "newuidmap": executable file not found in $PATH
+  # and the container never starts. They cannot come from runtimeInputs
+  # either, since a store copy would lose the setuid bit.
+  if [ -d /run/wrappers/bin ]; then
+    case ":$PATH:" in
+      *:/run/wrappers/bin:*) ;;
+      *) PATH="$PATH:/run/wrappers/bin" ;;
+    esac
+  fi
+
   # ----------------------------------------------------------------
   # Design (rootless, persistent):
   #
@@ -234,6 +284,25 @@ in
   # can't collect the store paths the FUSE serves. Planted at up,
   # removed at down/purge.
   NIX_STORE_LOWER_GCROOT="$STATE_DIR/nix-store-lower.gcroot"
+
+  # File-descriptor limits for the container, derived from the host's own
+  # hard limit rather than hardcoded: podman cannot exceed the invoking
+  # user's hard limit anyway, so this way raising it on the host (systemd
+  # DefaultLimitNOFILE, pam limits) lifts the container and its FUSE daemons
+  # with it and nothing here needs to change. NOFILE_SOFT is what every
+  # process starts with; the FUSE daemons raise themselves to the hard limit
+  # on top, since their handle pool is shared by everything using the mount.
+  NOFILE_HARD=$(ulimit -Hn 2>/dev/null || echo 524288)
+  case "$NOFILE_HARD" in
+    unlimited|"") NOFILE_HARD=1048576 ;;
+  esac
+  NOFILE_SOFT=262144
+  if [ "$NOFILE_HARD" -lt "$NOFILE_SOFT" ] 2>/dev/null; then
+    NOFILE_SOFT=$NOFILE_HARD
+  fi
+  # The podman run invocation lives inside a quoted `podman unshare` heredoc,
+  # which sees only exported variables.
+  export NOFILE_SOFT NOFILE_HARD
 
   # ----- helpers -------------------------------------------------
 
@@ -619,7 +688,12 @@ in
     # file ceiling shared by everything using that project mount - and it
     # failed as EMFILE in whichever build touched it next, which looks
     # like a corrupt dependency rather than a limit.
-    --ulimit nofile=262144:524288
+    #
+    # Derived from the host rather than hardcoded: podman cannot exceed the
+    # invoking user's hard limit anyway, and this way raising it on the host
+    # (systemd DefaultLimitNOFILE / pam limits) lifts the container and its
+    # FUSE daemons with it, with no change here.
+    --ulimit "nofile=$NOFILE_SOFT:$NOFILE_HARD"
     # podman's own default (--pids-limit=2048) is a SEPARATE
     # cgroup-level ceiling from the ulimits above - it's sized for
     # podman's typical single-process-container use case, not a full
@@ -1002,6 +1076,13 @@ in
       # $XDG_STATE_HOME and are expanded here, at run time.
       template_specs=()
       ${sessionTemplateLines}
+      # Container-declared shares (mkContainer `sessionShares`) and the
+      # default `nix develop` arguments (`developArgs`). CLI flags append to
+      # both, so a session can add to what the container already provides.
+      share_specs=()
+      ${sessionShareLines}
+      develop_args=()
+      ${developArgLines}
       while [ $# -gt 0 ]; do
         case "$1" in
           -A|--forward-agent) forward_agent=1; shift ;;
@@ -1022,6 +1103,16 @@ in
               echo "develop: --template requires <hostpath>[:<name>]" >&2; exit 2
             fi
             template_specs+=("$2"); shift 2 ;;
+          --share)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --share requires <hostpath>[:<name>][:ro|:rw]" >&2; exit 2
+            fi
+            share_specs+=("$2"); shift 2 ;;
+          -D|--develop-arg)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --develop-arg requires a value" >&2; exit 2
+            fi
+            develop_args+=("$2"); shift 2 ;;
           --) shift; break ;;
           -*) echo "develop: unknown flag $1" >&2; exit 2 ;;
           *)  break ;;
@@ -1178,7 +1269,11 @@ in
           chown "$3:$4" "$home_dir/.bashrc"
           chmod 0644 "$home_dir/.bashrc"
           if ! mountpoint -q "$proj_dir"; then
-            bindfs --map=0/$3:@0/@$4 --perms="og=" \
+            # --multithreaded is NOT the bindfs default: without it one thread
+            # serves every request for this project, so parallel builds
+            # queue behind each other on a single FUSE daemon (46 requests
+            # waiting against 1 thread, in the case that prompted this).
+            bindfs --multithreaded --map=0/$3:@0/@$4 --perms="og=" \
               -o allow_other "$src" "$proj_dir"
           fi
         ' bash "$session_user" "$mount_id" "$uid" "$gid"
@@ -1284,6 +1379,64 @@ in
           ' bash "$session_user" "''${tpl_lowers[$t_name]}" "$uid" "$gid" "$t_name" "$mount_id"
       done
 
+      # `--share <hostpath>[:<name>][:ro|:rw]`: the real host directory in
+      # the session HOME at ~/<name>, same mechanism as ~/dev.
+      #
+      # This is the counterpart to --template, and the difference is the
+      # whole point: a template is frozen and its writes die with the
+      # session, a share is the live directory and writes go through to the
+      # host and outlive the session. That is what you want for things a
+      # session should accumulate across runs (a cargo registry, a build
+      # cache) and NOT what you want for anything you would mind a
+      # throwaway session corrupting. rw is the default because sharing a
+      # directory read-only is what --template already does better; `:ro`
+      # exists for a shared directory that must stay pristine.
+      for spec in "''${share_specs[@]+''${share_specs[@]}}"; do
+        s_mode=rw
+        case "$spec" in
+          *:rw) s_mode=rw; spec=''${spec%:rw} ;;
+          *:ro) s_mode=ro; spec=''${spec%:ro} ;;
+        esac
+        case "$spec" in
+          *:*) s_host=''${spec%:*}; s_name=''${spec##*:} ;;
+          *)   s_host=$spec;        s_name=$(basename -- "$spec") ;;
+        esac
+        case "$s_name" in
+          ""|.|..|dev|.bashrc|.bashrc.user|.gitconfig|.nixct|*/*|-*)
+            echo "develop: --share: refusing name $s_name" >&2
+            echo "  (must not be empty, contain a slash, start with a dash," >&2
+            echo "   or collide with a framework-managed entry)" >&2
+            exit 2 ;;
+        esac
+        for t_name in "''${tpl_names[@]+''${tpl_names[@]}}"; do
+          if [ "$t_name" = "$s_name" ]; then
+            echo "develop: $s_name is both a --template and a --share" >&2
+            exit 2
+          fi
+        done
+        if ! s_host=$(realpath -- "$s_host" 2>/dev/null) || [ ! -d "$s_host" ]; then
+          echo "develop: --share: not a directory: ''${spec%:*}" >&2; exit 2
+        fi
+        bind_workdir "$s_host" "$mount_id.$s_name"
+        # shellcheck disable=SC2016
+        pm exec -u root "$NAME" \
+          /run/current-system/sw/bin/bash -lc '
+            set -e
+            ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+            dst=/develop-home/$1/$5
+            src=/hostmnts/$2
+            ro_flag=""
+            [ "$6" = "ro" ] && ro_flag="-r"
+            mkdir -p "$dst"
+            if ! mountpoint -q "$dst"; then
+              # shellcheck disable=SC2086
+              bindfs --multithreaded --map=0/$3:@0/@$4 --perms="og=" $ro_flag \
+                -o allow_other "$src" "$dst"
+            fi
+          ' bash "$session_user" "$mount_id.$s_name" "$uid" "$gid" "$s_name" "$s_mode"
+        echo "share: $s_host -> $home_dir/$s_name ($s_mode; writes reach the host)"
+      done
+
       # Dev-shell command. In host-daemon mode, build the dev shell
       # through a discoverable profile under the session HOME so the
       # gcroot-keeper can register the resulting store paths as GC
@@ -1298,6 +1451,13 @@ in
         # shellcheck disable=SC2016
         develop_cmd='mkdir -p "$HOME/.nixct" && nix develop --profile "$HOME/.nixct/devshell"'
       fi
+
+      # Container-declared developArgs plus any --develop-arg from the
+      # command line, quoted so values with spaces survive the trip through
+      # the inner `bash -lc`.
+      for arg in "''${develop_args[@]+''${develop_args[@]}}"; do
+        develop_cmd="$develop_cmd $(printf '%q' "$arg")"
+      done
 
       # Hand the joiner registration over to the scope itself: by the time
       # this runs, the scope exists, so the watchdog can see a live shell.
@@ -1541,7 +1701,7 @@ in
     --security-opt systempaths=unconfined \
     --security-opt label=disable \
     --ulimit nproc=-1:-1 \
-    --ulimit nofile=262144:524288 \
+    --ulimit "nofile=$NOFILE_SOFT:$NOFILE_HARD" \
     --pids-limit=-1 \
     --shm-size=1g \
     --hostname "$NAME" \
@@ -1766,6 +1926,20 @@ in
                                 env is auto-set (do it in your shell).
 
   develop-only flags:
+    --share hostpath[:name][:ro|:rw]
+                                bind a host directory into the session
+                                HOME at ~/<name> (default: its basename),
+                                as the REAL directory: writes go through
+                                to the host and outlive the session.
+                                Default rw. Repeatable. For state a
+                                session should accumulate across runs
+                                (cargo registry, build caches). Use
+                                --template instead when the session must
+                                not be able to change it.
+    -D, --develop-arg ARG       extra argument for the session's
+                                \`nix develop\` (e.g. -D --impure).
+                                Repeatable; appended after any the
+                                container itself declares.
     --template hostpath[:name]  hand a host directory to the session at
                                 ~/<name> (default: its basename) as a
                                 frozen template: the host dir is the

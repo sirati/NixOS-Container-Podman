@@ -111,6 +111,46 @@ session. It can never land in one that is being dismantled.
 - `-S name=path` — generic socket forward; container side is
   `/run/sockets/<ns>/<name>` (no env auto-set).
 
+### `--share hostpath[:name][:ro|:rw]` (`develop` only) — a real shared dir
+
+Binds a host directory into the session HOME at `~/<name>` (default: its
+basename) as the **real** directory: writes go through to the host and
+outlive the session. Repeatable, `rw` by default.
+
+```sh
+nixct develop --share ~/.cache/cargo:.cargo ~/project
+```
+
+Use it for state a session should *accumulate* across runs — a cargo
+registry, a compiler cache, a shared artifact dir. Do not use it for anything
+you would mind a throwaway session corrupting; that is what `--template`
+below is for. `:ro` shares the live directory read-only.
+
+A container can declare shares every session gets, via `mkContainer`:
+
+```nix
+sessionShares = [{
+  host = "$HOME/.cache/cargo";   # expanded at run time, created if missing
+  name = ".cargo";
+  mode = "rw";                   # default
+}];
+```
+
+### `-D, --develop-arg ARG` (`develop` only) — arguments for `nix develop`
+
+Appends an argument to the `nix develop` the session starts with; repeatable.
+
+```sh
+nixct develop -D --impure ~/project
+```
+
+The container can set defaults that every session gets, with CLI arguments
+appended after them:
+
+```nix
+developArgs = [ "--impure" ];
+```
+
 ### `--template hostpath[:name]` (`develop` only) — inherited state, frozen
 
 A session HOME is wiped when the session ends, and with ephemeral storage the

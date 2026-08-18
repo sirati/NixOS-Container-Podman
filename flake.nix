@@ -135,6 +135,15 @@
           # `host` is expanded by the run script at run time and created if
           # missing. Same mechanism as the `--template` flag.
         , sessionTemplates ? [ ]
+          # Host dirs every develop session gets SHARED into its HOME - the
+          # real directory, writes reaching the host:
+          #   [ { host = "$HOME/.cache/cargo"; name = ".cargo"; mode = "rw"; } ]
+          # `host` is expanded by the run script at run time and created if
+          # missing; `mode` defaults to "rw". Same mechanism as `--share`.
+        , sessionShares ? [ ]
+          # Extra arguments for the `nix develop` a session starts with,
+          # e.g. [ "--impure" ]. Same as `--develop-arg`, applied first.
+        , developArgs ? [ ]
         }:
         let
           hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
@@ -238,6 +247,7 @@
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
               inherit tools rootfs shellUser name idleTimeout sessionTemplates
+                      sessionShares developArgs
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
                       hostNixDaemon;
               storage = storageMode;
@@ -409,9 +419,12 @@
         , modules ? [ ]              # extra NixOS modules for the container system
         , runName ? "nixct"          # basename of the run-script binary
         , sessionTemplates ? [ ]     # frozen host dirs every session inherits
+        , sessionShares ? [ ]        # host dirs shared into every session HOME
+        , developArgs ? [ ]          # default args for the session nix develop
         }:
         mkContainer {
-          inherit name idleTimeout runName sessionTemplates;
+          inherit name idleTimeout runName sessionTemplates
+                  sessionShares developArgs;
           modules = [ ./nix/nixct-system.nix ]
             ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; }
             ++ modules;

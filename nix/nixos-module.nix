@@ -7,6 +7,25 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.programs.nixct;
+
+  # Rootless podman shells out to the SETUID newuidmap/newgidmap to apply a
+  # multi-id mapping. Two things go wrong from a user service at boot:
+  # /run/wrappers/bin is not on a unit PATH, and the system unit that
+  # populates it may not have run yet when the user manager starts us. A
+  # user unit cannot order itself after a system unit, so wait for the
+  # wrapper instead of failing the container start outright - otherwise the
+  # container is simply absent after a reboot, with
+  #   Error: command required for rootless mode with multiple IDs:
+  #          exec: "newuidmap": executable file not found in $PATH
+  # buried in the user journal.
+  waitForWrappers = pkgs.writeShellScript "nixct-wait-for-wrappers" ''
+    for _ in $(seq 1 60); do
+      [ -x /run/wrappers/bin/newuidmap ] && exit 0
+      sleep 1
+    done
+    echo "nixct: /run/wrappers/bin/newuidmap never appeared" >&2
+    exit 1
+  '';
 in {
   options.programs.nixct = {
     enable = lib.mkEnableOption "the nixct dev container (host-daemon, develop-only)";
@@ -61,9 +80,14 @@ in {
       # Emits X-RestartIfChanged=false, which makes switch-to-configuration
       # skip this unit instead of stop/start-ing it. See the option.
       restartIfChanged = cfg.service.restartOnSwitch;
+      # Rootless podman needs the setuid newuidmap/newgidmap from
+      # /run/wrappers/bin, which is not on a systemd unit PATH by default;
+      # without it `up` fails with status 125 and the container never starts.
+      path = [ "/run/wrappers" "/run/current-system/sw" ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        ExecStartPre = "${waitForWrappers}";
         ExecStart = "${cfg.package}/bin/nixct up" + lib.optionalString cfg.gpu.enable " --gpu --opengl";
         # --force: stopping the unit is an explicit act, so it should not be
         # blocked by the live-session guard that protects against a stray
