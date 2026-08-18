@@ -302,6 +302,8 @@ in
   # can't collect the store paths the FUSE serves. Planted at up,
   # removed at down/purge.
   NIX_STORE_LOWER_GCROOT="$STATE_DIR/nix-store-lower.gcroot"
+  # pid files of the host-side `--host-port` bridges
+  HOST_PORT_DIR="$STATE_DIR/host-ports"
 
   # File-descriptor limits for the container, derived from the host's own
   # hard limit rather than hardcoded: podman cannot exceed the invoking
@@ -831,6 +833,72 @@ in
     printf '%s\n' "$mount_id"
   }
 
+  # ensure_host_port <port>: make the HOST's 127.0.0.1:<port> reachable at the
+  # same address inside the container.
+  #
+  # Not a network route on purpose. Services that only listen on loopback
+  # often authenticate by looking the caller up in the host /proc/net/tcp
+  # (claude-code-transparent-router does exactly this, and fails closed when
+  # the peer is not there). A connection made from the container netns is not
+  # in that table at all, so it would be refused however the packets got
+  # there. Bridging through a unix socket instead means the TCP connection to
+  # the service is opened by a HOST process owned by the invoking user, which
+  # is what such a check is asking about:
+  #
+  #   session -> 127.0.0.1:<port> in the container   (socat, container side)
+  #           -> unix socket in $SOCKET_MOUNTS       (shared via the bind)
+  #           -> 127.0.0.1:<port> on the host        (socat, host side, us)
+  #
+  # One pair per port, shared by every session: the container has a single
+  # netns, so the port can only be bound once anyway. Anything in the
+  # container can therefore use the port - it is as trusted as the service
+  # behind it.
+  ensure_host_port() {
+    local port=$1
+    local dir="$SOCKET_MOUNTS/hostports"
+    local sock="$dir/$port"
+    local pidfile="$HOST_PORT_DIR/$port.pid"
+    mkdir -p "$dir" "$HOST_PORT_DIR"
+    chmod 0711 "$dir"
+    if [ ! -s "$pidfile" ] || ! kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+      rm -f "$sock"
+      nohup ${tools.socat} UNIX-LISTEN:"$sock",fork,mode=0600 \
+        TCP:127.0.0.1:"$port" >/dev/null 2>&1 &
+      echo $! > "$pidfile"
+      # Give socat a moment to create the socket, so the container-side
+      # listener does not race it on first use.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -S "$sock" ] && break
+        sleep 0.2
+      done
+    fi
+    local unit="hostport-$port.service"
+    if ! pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/systemctl is-active --quiet "$unit" 2>/dev/null; then
+      # Runs as container root, which IS the invoking host user under
+      # rootless podman - so it can open the 0600 socket above without any
+      # ACL, while the session user only ever touches the TCP port.
+      pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/systemd-run \
+          --unit="$unit" --collect --quiet \
+          /run/current-system/sw/bin/socat \
+            TCP-LISTEN:"$port",bind=127.0.0.1,fork,reuseaddr \
+            UNIX-CONNECT:/var/socket-mounts/hostports/"$port" >/dev/null
+    fi
+  }
+
+  # stop_host_ports: kill the host-side bridges (the container-side ones die
+  # with the container).
+  stop_host_ports() {
+    [ -d "$HOST_PORT_DIR" ] || return 0
+    local f
+    for f in "$HOST_PORT_DIR"/*.pid; do
+      [ -e "$f" ] || continue
+      kill "$(cat "$f" 2>/dev/null)" 2>/dev/null || true
+      rm -f "$f"
+    done
+  }
+
   # require_no_live_sessions <subcommand> <force>: refuse to tear the
   # container down while someone is working in it.
   #
@@ -875,6 +943,7 @@ in
     if container_running; then pm stop -t 5 "$NAME" >/dev/null || true; fi
     if container_exists; then pm rm -f "$NAME" >/dev/null || true; fi
     stop_all_session_watchdogs
+    stop_host_ports
     # Container's mount-ns dying releases the overlays. Clean up
     # any per-session $WORK_SHARED binds and the rshared self-bind.
     _WS=$WORK_SHARED _MG=$MERGED _SM=$SOCKET_MOUNTS \
@@ -1128,6 +1197,7 @@ in
       # prepended to the command line so an explicit flag still parses after
       # them. Emitted double-quoted, so $HOME and friends expand here.
       ${sessionFlagLine}
+      host_ports=()
       forward_agent=0
       agent_sock=""
       x11_mode=""
@@ -1182,6 +1252,11 @@ in
               echo "develop: --share requires <hostpath>[:<name>][:ro|:rw]" >&2; exit 2
             fi
             share_specs+=("$2"); shift 2 ;;
+          --host-port)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --host-port requires a port" >&2; exit 2
+            fi
+            host_ports+=("$2"); shift 2 ;;
           -D|--develop-arg)
             if [ -z "''${2:-}" ]; then
               echo "develop: --develop-arg requires a value" >&2; exit 2
@@ -1619,6 +1694,14 @@ in
         echo "forward: wprs (proxied Wayland; '$(basename "$0") wayland-attach $hostpath' to view)"
       fi
 
+      for hp in "''${host_ports[@]+''${host_ports[@]}}"; do
+        case "$hp" in
+          ""|*[!0-9]*) echo "develop: --host-port: not a port: $hp" >&2; exit 2 ;;
+        esac
+        ensure_host_port "$hp"
+        echo "host port: 127.0.0.1:$hp in the session -> host 127.0.0.1:$hp"
+      done
+
       if [ "$dbus" -eq 1 ]; then
         dbus_out=$(start_session_dbus "$mount_id" "$uid" "$gid") || exit 2
         while IFS= read -r line; do
@@ -1849,7 +1932,7 @@ in
         [ -d "$state_dir" ] || exit 0
         allowed="
           upper work merged nix-store-upper nix-store-work
-          nix-store-lower.gcroot work-shared socket-mounts
+          nix-store-lower.gcroot work-shared socket-mounts host-ports
           podman-root podman-runroot host-watchdog session-gcroots
           wprs-viewers wayland-acl lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated
@@ -2024,6 +2107,17 @@ in
                                 env is auto-set (do it in your shell).
 
   develop-only flags:
+    --host-port PORT            make the HOST's 127.0.0.1:PORT reachable at
+                                the same address inside the session, bridged
+                                through a unix socket so the connection to
+                                the service is opened by a host process
+                                owned by you. Loopback services that
+                                authenticate the caller by uid (via
+                                /proc/net/tcp) therefore still accept it -
+                                a plain network route would be refused.
+                                Repeatable. Shared by all sessions of the
+                                container, so anything in it can use the
+                                port.
     --share hostpath[:name][:ro|:rw]
                                 bind a host directory into the session
                                 HOME at ~/<name> (default: its basename),

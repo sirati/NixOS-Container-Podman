@@ -308,6 +308,36 @@ not collide with a framework-managed entry (`dev`, `.bashrc`, `.bashrc.user`,
 `.gitconfig`, `.nixct`), and the same name cannot be both a share and a
 template.
 
+### `--host-port PORT` (`develop` only) — a host loopback service in the session
+
+Makes the host's `127.0.0.1:PORT` reachable at the same address inside the
+session. Repeatable.
+
+```sh
+nixct develop --host-port 8787 ~/project
+```
+
+Deliberately **not** a network route. Loopback-only services often
+authenticate the caller by looking it up in the host's `/proc/net/tcp` and
+reading the socket's owner uid — and fail closed when the peer is not there.
+A connection made from the container's netns is not in that table at all, so
+it would be refused however the packets arrived. So the bridge goes through a
+unix socket instead:
+
+```
+session → 127.0.0.1:PORT in the container   (socat, container side)
+        → unix socket under $SOCKET_MOUNTS  (crosses the namespace)
+        → 127.0.0.1:PORT on the host        (socat, host side, as you)
+```
+
+The TCP connection the service sees is opened by a host process owned by the
+invoking user, which is what such a check asks about.
+
+One bridge per port, shared by every session of the container — it has a
+single netns, so the port can only be bound once. Anything running in the
+container can therefore reach that port: it is exactly as trusted as the
+service behind it. The host side is torn down with the container.
+
 ### `-D, --develop-arg ARG` (`develop` only) — arguments for `nix develop`
 
 Appends an argument to the `nix develop` the session starts with; repeatable.
