@@ -39,6 +39,26 @@ in {
       hostHasToolkit = lib.mkEnableOption "use the host's nvidia-container-toolkit (CDI) for --gpu";
     };
     service.enable = lib.mkEnableOption "a per-user systemd service that starts nixct on login and keeps it running (disables idle shutdown)";
+    service.upgradeOnSwitch = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether `nixos-rebuild switch` should upgrade the running container
+        in place instead of leaving it on the old system.
+
+        `nixct` containers take their whole /nix from the host daemon, so a
+        container system built during the rebuild is already realised inside
+        the container and can simply be activated - the same thing
+        nixos-rebuild does on a real machine. The switch therefore reloads
+        this unit, which runs `nixct switch`: the container keeps running,
+        every develop session in it survives (they live in transient scopes,
+        which activation does not touch), and the new configuration takes
+        effect immediately.
+
+        Turn this off to leave a running container strictly untouched by
+        rebuilds; the new system then applies at its next start.
+      '';
+    };
     service.restartOnSwitch = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -77,8 +97,17 @@ in {
     systemd.user.services.nixct = lib.mkIf cfg.service.enable {
       description = "nixct dev container";
       wantedBy = [ "default.target" ];
-      # Emits X-RestartIfChanged=false, which makes switch-to-configuration
-      # skip this unit instead of stop/start-ing it. See the option.
+      # On `nixos-rebuild switch`, RELOAD instead of restarting: the reload
+      # activates the freshly built container system inside the RUNNING
+      # container (see `nixct switch`), so a rebuild upgrades it without
+      # dropping it or the develop sessions in it. Emits X-ReloadIfChanged,
+      # which switch-to-configuration honours ahead of the restart logic.
+      #
+      # Only host-nix-daemon containers can do this - anything else has its
+      # system baked into an immutable rootfs - so for those fall back to
+      # X-RestartIfChanged=false, i.e. leave the running container alone and
+      # let the new build apply at the next start.
+      reloadIfChanged = cfg.service.upgradeOnSwitch;
       restartIfChanged = cfg.service.restartOnSwitch;
       # Rootless podman needs the setuid newuidmap/newgidmap from
       # /run/wrappers/bin, which is not on a systemd unit PATH by default;
@@ -88,6 +117,9 @@ in {
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStartPre = "${waitForWrappers}";
+        # What the reload above runs. Activates the new system inside the
+        # live container; a no-op when it is not running.
+        ExecReload = "${cfg.package}/bin/nixct switch";
         ExecStart = "${cfg.package}/bin/nixct up" + lib.optionalString cfg.gpu.enable " --gpu --opengl";
         # --force: stopping the unit is an explicit act, so it should not be
         # blocked by the live-session guard that protects against a stray

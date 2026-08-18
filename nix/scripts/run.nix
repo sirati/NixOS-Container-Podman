@@ -25,6 +25,10 @@
 
 { tools
 , rootfs ? null
+  # The container's system toplevel. Only meaningful with hostNixDaemon,
+  # where the container sees the host store and can therefore activate a
+  # system that was just built outside it - see the `switch` subcommand.
+, toplevel ? null
 , shellUser
 , name
   # Host directories every develop session of this container gets as a
@@ -931,6 +935,49 @@ in
       [ "$ENABLE_OPENGL" = "1" ] && tags="$tags opengl"
       echo "$NAME: up''${tags:+ (''${tags# })} [storage: $STORAGE, nix: $(store_summary)]"
       maybe_start_idle_monitor
+      ;;
+    switch|upgrade)
+      # Upgrade a RUNNING container to this run script's system, in place.
+      #
+      # Only possible with hostNixDaemon: there the container sees the host
+      # /nix, so a system built on the host is already realised inside it and
+      # can simply be activated - the same thing nixos-rebuild does on a real
+      # machine. Everything else (self-contained store, host-store FUSE) has
+      # its system baked into an immutable rootfs layer built at image time,
+      # and there is nothing to swap under a live container.
+      #
+      # Activation is `test`, not `switch`: the container has no bootloader,
+      # and /nix/var here is the HOST profile directory, mounted read-only -
+      # so the system profile must not be touched. `test` activates and
+      # repoints /run/current-system, which is all a container needs.
+      #
+      # Develop sessions are unaffected: they live in transient scopes, which
+      # activation does not restart.
+      ${if toplevel == null then ''
+        echo "$cmd: this build has no system to activate" >&2
+        exit 1
+      '' else ""}
+      if [ "$HOST_NIX_DAEMON" != "1" ]; then
+        echo "$cmd: only host-nix-daemon containers can be upgraded in place;" >&2
+        echo "  this one has its system baked into its rootfs, so it needs a" >&2
+        echo "  restart (down + up) to pick up a new build." >&2
+        exit 1
+      fi
+      if ! container_running; then
+        echo "$NAME: not running - the next \`up\` starts the new system anyway"
+        exit 0
+      fi
+      current=$(pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/readlink -f /run/current-system 2>/dev/null \
+        | tr -d '[:space:]')
+      if [ "$current" = "${if toplevel == null then "" else toplevel}" ]; then
+        echo "$NAME: already running this system"
+        exit 0
+      fi
+      echo "$NAME: activating ${if toplevel == null then "" else toplevel}"
+      pm exec -u root "$NAME" \
+        ${if toplevel == null then "true" else "${toplevel}/bin/switch-to-configuration"} test
+      echo "$NAME: upgraded in place (develop sessions kept running)"
       ;;
     down|stop)
       force=0

@@ -246,7 +246,7 @@
             # drives both NixOS and portable tarball targets; the `tools`
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
-              inherit tools rootfs shellUser name idleTimeout sessionTemplates
+              inherit tools rootfs toplevel shellUser name idleTimeout sessionTemplates
                       sessionShares developArgs
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
                       hostNixDaemon;
