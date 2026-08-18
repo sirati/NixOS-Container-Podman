@@ -582,17 +582,24 @@ in
     test -n "$(pm ps --quiet --filter "name=^$NAME$" --filter status=running)"
   }
 
+  # FULL PATH, not a bare `systemctl`: podman exec runs the command directly
+  # with the image PATH, where it does not resolve. A bare probe therefore
+  # returned 127 every time, the loop never saw "running", and EVERY `up`
+  # paid the entire 60-second timeout (plus 120 podman execs) before warning
+  # and carrying on anyway.
   wait_for_systemd() {
     local _i state
     for _i in $(seq 1 120); do
-      state=$(pm exec "$NAME" systemctl is-system-running 2>/dev/null || true)
+      state=$(pm exec "$NAME" \
+        /run/current-system/sw/bin/systemctl is-system-running 2>/dev/null || true)
       case "$state" in
         running|degraded) return 0 ;;
       esac
       sleep 0.5
     done
     echo "warning: systemd did not reach running state" >&2
-    pm exec "$NAME" systemctl --failed --no-legend 2>/dev/null || true
+    pm exec "$NAME" \
+      /run/current-system/sw/bin/systemctl --failed --no-legend 2>/dev/null || true
     return 0
   }
 
