@@ -136,6 +136,28 @@ sessionShares = [{
 }];
 ```
 
+**If the host directory does not exist**, the two forms differ on purpose:
+
+- **declared** (`sessionShares`, `sessionTemplates`) — created for you. It is a
+  provisioning statement, so requiring you to pre-create it by hand would be
+  friction for nothing.
+- **CLI** (`--share`, `--template`) — hard error, exit 2, before any session
+  setup: nothing is created and no session starts. Silently creating a
+  mistyped path would hand you an empty directory that looks like your cache
+  and quietly loses what you expected to find in it.
+
+The source and target are independent — `name` is the target *inside* the
+session HOME, and defaults to the source's basename only when omitted:
+
+```sh
+nixct develop --share ~/.claudeB:.claude    # host ~/.claudeB is ~/.claude inside
+```
+
+`name` must be a single path component (`.claude`, not `.config/claude`), must
+not collide with a framework-managed entry (`dev`, `.bashrc`, `.bashrc.user`,
+`.gitconfig`, `.nixct`), and the same name cannot be both a share and a
+template.
+
 ### `-D, --develop-arg ARG` (`develop` only) — arguments for `nix develop`
 
 Appends an argument to the `nix develop` the session starts with; repeatable.
