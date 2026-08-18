@@ -1,13 +1,41 @@
 # nix-dev-container
 
-A framework for building **rootless podman containers that run a full NixOS
-system**. You describe the container as an ordinary NixOS configuration and the
-framework turns it into a podman-driven dev environment via
-`lib.mkContainer { modules; shellUser; name; ... }`. The container boots real
-systemd inside a rootless user namespace and gives you a persistent multi-user
-box you can enter, run commands in, or use as a per-project `nix develop`
-sandbox. Its `/nix/store` can be self-contained, served from the host, or
-delegated to the host nix-daemon (see the axes below).
+Rootless podman containers that run a **full NixOS system** — real systemd in a
+user namespace, described as an ordinary NixOS configuration.
+
+## What this repo provides
+
+Four independent primitives. `nixct` is only the last of them; the first three
+stand on their own.
+
+**1. `lib.mkContainer` — a NixOS system as a rootless podman container.**
+Takes NixOS modules, returns a rootfs plus a run script that drives podman
+(`up`, `enter`, `exec`, `boot`, `status`, `logs`, `down`, `purge`). Configured
+along [orthogonal axes](#configuration-axes): where the writable layer lives,
+how the base layer is packaged, and where `/nix/store` comes from. Nothing
+about it is dev-container specific.
+
+**2. Layer derivations, separately consumable.** `systemLower` (FHS skeleton +
+prebuilt nix database), `nixStoreLower` (the closure as a symlink farm),
+`rootfsFolder` / `rootfsSquashfs` (the assembled base), and a
+[portable tarball](#portable-tarball) that runs on a host with no nix at all.
+
+**3. `nix-store-shared-fuse` — a read-only FUSE for a host `/nix/store`.**
+Serves the host store into a container through a symlink-farm view, so the
+container gets the paths of its closure and nothing else. It is a standalone
+binary (`nix run .#<container>.fuse`) usable outside this framework; the
+`hostNixStore` axis is just the framework wiring it up. See
+[where `/nix/store` comes from](#hostnixstore--hostnixdaemon--where-nixstore-comes-from).
+
+**4. `nixct` — the develop-container preset built on top.** A host-nix-daemon,
+develop-only container whose entry point is
+[`nixct develop`](#nixct-develop-sessions): per-project throwaway users,
+forwarded sockets, shared or frozen host directories, and a
+[NixOS module](#nixct-installable-package--nixos-module) that keeps it running
+and upgrades it in place on `nixos-rebuild switch`.
+
+Also included: `check-host-compat`, a standalone probe that tells you whether a
+host can run any of this (binaries, kernel features, fuse, rootless setup).
 
 ## Quick start
 
@@ -28,19 +56,14 @@ outputs = { nixpkgs, nix-dev-container, ... }:
   };
 ```
 
-`lib.x86_64-linux` exports `mkContainer`, `mkNixct`, and the `overlay` helper
-(used for the `storage` axis below).
+`lib.x86_64-linux` exports `mkContainer`, `mkNixct` and the `overlay` helper.
+Example containers: `.#testcontainer` (persistent overlay), `.#testdaemon`
+(host nix-daemon), `.#testnvidia`, `.#nixct-nvidia`.
 
-This repo ships example containers: `.#testcontainer` (default persistent
-overlay), `.#testdaemon` (host nix-daemon), `.#testnvidia`, and
-`.#nixct-nvidia`.
-
-`mkNixct` additionally takes `modules` (extra NixOS modules for the container
-system), `runName` (name of the installed binary) and `sessionTemplates`
-(host state every session inherits, frozen — see `--template` below). Those
-are the extension points out-of-tree presets build on; `nixct-chrome` is one
-such preset, a separate flake whose containers ship Google Chrome with the
-Claude in Chrome extension preinstalled.
+`mkNixct` adds `modules`, `runName`, `sessionTemplates`, `sessionShares` and
+`developArgs` — the extension points out-of-tree presets build on.
+`nixct-chrome` is one: a separate flake shipping Google Chrome with the Claude
+in Chrome extension preinstalled.
 
 ## Subcommands
 
@@ -71,8 +94,135 @@ Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
 - `status` — show container state, store source, and disk usage.
 - `logs` — tail container logs.
 - `purge` — `down` plus wipe of `$STATE_DIR`.
+- `switch` / `upgrade` — activate this build's system inside the **running**
+  container, keeping it and its develop sessions up. Host-nix-daemon
+  containers only; see
+  [rebuilds upgrade in place](#nixos-rebuild-switch-upgrades-the-container-in-place).
 - `check-host-compat` — probe the host for required binaries, kernel features,
   fuse, and rootless setup. Touches no container.
+
+## Configuration axes
+
+`mkContainer` is configured along **orthogonal axes** — each controls one
+independent concern. All are optional; the defaults reproduce the historical
+persistent-overlay behavior of the example containers.
+
+### `storage` — writable strategy for the rootfs
+
+How the writable layer over the immutable base is provided:
+
+- `lib.overlay { lower ? "squashfs"; }` **(default)** — overlay with a
+  persistent **on-disk** upper under `$STATE_DIR`; in-container changes survive
+  across runs.
+- `"ephemeral"` — overlay with a **tmpfs** upper under `$XDG_RUNTIME_DIR`; state
+  is lost when the container is removed.
+- `"directory"` — a materialized writable rootfs with **no overlay** at all.
+
+### `lower` — packaging of the immutable base
+
+`"squashfs"` (default) | `"folder"`. squashfs is the smallest but needs
+squashfuse on the host; folder ships plain files. Only meaningful for the
+`ephemeral` / overlay storage strategies, and it also selects the portable
+tarball format.
+
+### `hostNixStore` / `hostNixDaemon` — where `/nix/store` comes from
+
+By default the container is **self-contained**: its closure is baked into the
+immutable lower. Two booleans change the source of `/nix/store`:
+
+- `hostNixStore = true` — `/nix/store` is served from the **host** at runtime by
+  a host-side Rust FUSE (`nix-store-shared-fuse`) over a GC-pinned, exact-closure
+  symlink farm, instead of being baked into the lower. A writable overlay upper
+  is stacked over it so in-container builds still work (in `directory` storage
+  the FUSE store is mounted read-only — no overlays). A per-instance host GC root
+  pins the closure for the container's lifetime and is released at teardown.
+  **Requires `user_allow_other` in the host's `/etc/fuse.conf`** (the FUSE is
+  mounted `--allow-other`); `check-host-compat` probes this.
+- `hostNixDaemon = true` — delegate every build and query to the **host
+  nix-daemon**: the whole host `/nix` is rbind-mounted read-only (store +
+  `/nix/var` db + daemon socket), the container runs **no in-container daemon**
+  and has **no nixbld users**. The closure must already be realised in the host
+  store (it is, since the container is built against it). When this is on,
+  `hostNixStore` is ignored. This is what `mkNixct` uses.
+
+The three store sources — self-contained (baked) / `hostNixStore` (FUSE) /
+`hostNixDaemon` (rbind) — compose with all three storage strategies. `status`
+reports the active source as `self-contained`, `host-store`, or `host-daemon`.
+
+`storage` (the `STORAGE` env) and `hostNixStore` (the `HOST_NIX_STORE` env) can
+be switched at runtime; `hostNixDaemon` (`HOST_NIX_DAEMON`) is **fixed at build
+time**, since it is coupled to the in-container NixOS host-daemon profile.
+
+### Other axes
+
+- `gpu.hostHasToolkit` — `up --gpu` uses the host nvidia-container-toolkit (CDI,
+  `--device nvidia.com/gpu=all`) instead of manual `/dev/nvidia*` binds.
+- `keepId.enable` / `keepId.uid` / `keepId.gid` — `--userns=keep-id` so
+  `shellUser` maps 1:1 to the invoking host user (uid/gid default `1000`/`100`).
+- `modules`, `shellUser`, `name`, `runName`, `idleTimeout` — as in the quick
+  start; `idleTimeout` (seconds, `0` disables) stops the container after no
+  active `develop` session.
+
+### Example: host nix-daemon container
+
+```nix
+ct = nix-dev-container.lib.x86_64-linux.mkContainer {
+  modules       = [ ./my-system-config.nix ];
+  shellUser     = "alice";
+  name          = "myct";
+  hostNixDaemon = true;          # /nix from the host daemon, no nixbld users
+};
+```
+
+The `.#testdaemon` flake attribute is a ready-made example:
+
+```sh
+nix run .#testdaemon.enter
+nix run .#testdaemon.develop -- ./my-project
+```
+
+### GC roots in host-daemon develop sessions
+
+With `hostNixDaemon = true` the store paths built during a `develop` session
+land in the **host** store. To keep a concurrent host `nix-collect-garbage` from
+deleting paths the live session still needs, the framework automatically
+registers GC roots — visible to the host daemon — for the symlinks a session
+produces:
+
+- `./result*` build outputs,
+- `.direnv/*-link` direnv result links,
+- the dev-shell profile under `.nixct/devshell`,
+- and `nix profile` generations.
+
+These roots are created by an in-container orchestrator running as **container
+root**, while the untrusted per-session user keeps building under its own uid.
+The roots live in a host-visible directory bind-mounted at an identical
+absolute path, so they are real GC roots from the host daemon's perspective.
+When the session ends they are **removed automatically** (by the per-session
+host watchdog at teardown); the corresponding `gcroots/auto/*` entries become
+dangling and nix prunes them on its next GC, so the paths become collectable
+again exactly when the session ends.
+
+A `.nixct/` directory is created in the project to hold the dev-shell profile.
+
+## Portable tarball
+
+`nix build .#<container>.portable` produces a **self-contained tarball** that
+runs on non-NixOS hosts with rootless podman + fuse-overlayfs (and squashfuse
+for the squashfs layout) — no Nix required on the host. The `lower` axis
+selects its layout (`"squashfs"`, default — needs squashfuse on the host — or
+`"folder"`, plain files). Run `check-host-compat` first to probe whether a
+target host meets the prerequisites before building or deploying the tarball.
+
+A portable tarball is **self-contained only**: `hostNixStore` and
+`hostNixDaemon` containers have no portable target (they rely on the host's
+`/nix`), so building `.portable` for one fails with a clear message.
+
+## `nixct develop` sessions
+
+How a develop session is put together, and every flag it takes. All of
+this works for any `mkContainer` container; `nixct` is just the preset
+whose only entry point is this.
 
 ### Sessions and shells
 
@@ -272,110 +422,6 @@ with `--wprs`:
 nixct develop --wprs --dbus ~/project
 ```
 
-## Configuration axes
-
-`mkContainer` is configured along **orthogonal axes** — each controls one
-independent concern. All are optional; the defaults reproduce the historical
-persistent-overlay behavior of the example containers.
-
-### `storage` — writable strategy for the rootfs
-
-How the writable layer over the immutable base is provided:
-
-- `lib.overlay { lower ? "squashfs"; }` **(default)** — overlay with a
-  persistent **on-disk** upper under `$STATE_DIR`; in-container changes survive
-  across runs.
-- `"ephemeral"` — overlay with a **tmpfs** upper under `$XDG_RUNTIME_DIR`; state
-  is lost when the container is removed.
-- `"directory"` — a materialized writable rootfs with **no overlay** at all.
-
-### `lower` — packaging of the immutable base
-
-`"squashfs"` (default) | `"folder"`. squashfs is the smallest but needs
-squashfuse on the host; folder ships plain files. Only meaningful for the
-`ephemeral` / overlay storage strategies, and it also selects the portable
-tarball format.
-
-### `hostNixStore` / `hostNixDaemon` — where `/nix/store` comes from
-
-By default the container is **self-contained**: its closure is baked into the
-immutable lower. Two booleans change the source of `/nix/store`:
-
-- `hostNixStore = true` — `/nix/store` is served from the **host** at runtime by
-  a host-side Rust FUSE (`nix-store-shared-fuse`) over a GC-pinned, exact-closure
-  symlink farm, instead of being baked into the lower. A writable overlay upper
-  is stacked over it so in-container builds still work (in `directory` storage
-  the FUSE store is mounted read-only — no overlays). A per-instance host GC root
-  pins the closure for the container's lifetime and is released at teardown.
-  **Requires `user_allow_other` in the host's `/etc/fuse.conf`** (the FUSE is
-  mounted `--allow-other`); `check-host-compat` probes this.
-- `hostNixDaemon = true` — delegate every build and query to the **host
-  nix-daemon**: the whole host `/nix` is rbind-mounted read-only (store +
-  `/nix/var` db + daemon socket), the container runs **no in-container daemon**
-  and has **no nixbld users**. The closure must already be realised in the host
-  store (it is, since the container is built against it). When this is on,
-  `hostNixStore` is ignored. This is what `mkNixct` uses.
-
-The three store sources — self-contained (baked) / `hostNixStore` (FUSE) /
-`hostNixDaemon` (rbind) — compose with all three storage strategies. `status`
-reports the active source as `self-contained`, `host-store`, or `host-daemon`.
-
-`storage` (the `STORAGE` env) and `hostNixStore` (the `HOST_NIX_STORE` env) can
-be switched at runtime; `hostNixDaemon` (`HOST_NIX_DAEMON`) is **fixed at build
-time**, since it is coupled to the in-container NixOS host-daemon profile.
-
-### Other axes
-
-- `gpu.hostHasToolkit` — `up --gpu` uses the host nvidia-container-toolkit (CDI,
-  `--device nvidia.com/gpu=all`) instead of manual `/dev/nvidia*` binds.
-- `keepId.enable` / `keepId.uid` / `keepId.gid` — `--userns=keep-id` so
-  `shellUser` maps 1:1 to the invoking host user (uid/gid default `1000`/`100`).
-- `modules`, `shellUser`, `name`, `runName`, `idleTimeout` — as in the quick
-  start; `idleTimeout` (seconds, `0` disables) stops the container after no
-  active `develop` session.
-
-### Example: host nix-daemon container
-
-```nix
-ct = nix-dev-container.lib.x86_64-linux.mkContainer {
-  modules       = [ ./my-system-config.nix ];
-  shellUser     = "alice";
-  name          = "myct";
-  hostNixDaemon = true;          # /nix from the host daemon, no nixbld users
-};
-```
-
-The `.#testdaemon` flake attribute is a ready-made example:
-
-```sh
-nix run .#testdaemon.enter
-nix run .#testdaemon.develop -- ./my-project
-```
-
-### GC roots in host-daemon develop sessions
-
-With `hostNixDaemon = true` the store paths built during a `develop` session
-land in the **host** store. To keep a concurrent host `nix-collect-garbage` from
-deleting paths the live session still needs, the framework automatically
-registers GC roots — visible to the host daemon — for the symlinks a session
-produces:
-
-- `./result*` build outputs,
-- `.direnv/*-link` direnv result links,
-- the dev-shell profile under `.nixct/devshell`,
-- and `nix profile` generations.
-
-These roots are created by an in-container orchestrator running as **container
-root**, while the untrusted per-session user keeps building under its own uid.
-The roots live in a host-visible directory bind-mounted at an identical
-absolute path, so they are real GC roots from the host daemon's perspective.
-When the session ends they are **removed automatically** (by the per-session
-host watchdog at teardown); the corresponding `gcroots/auto/*` entries become
-dangling and nix prunes them on its next GC, so the paths become collectable
-again exactly when the session ends.
-
-A `.nixct/` directory is created in the project to hold the dev-shell profile.
-
 ## `nixct` (installable package + NixOS module)
 
 `nixct` is a ready-to-install variant of this framework that ships the `nixct`
@@ -428,29 +474,42 @@ The `programs.nixct` options:
   `--gpu`.
 - `service.enable` — run a per-user systemd service that starts nixct on login
   and keeps it up (disables idle shutdown).
-- `service.restartOnSwitch` — whether `nixos-rebuild switch` may restart that
-  service when the built container changes (default `false`, see below).
+- `service.upgradeOnSwitch` — `nixos-rebuild switch` activates the new system
+  inside the running container (default `true`, see below).
+- `service.restartOnSwitch` — let a switch stop and start it instead, killing
+  live sessions (default `false`).
 - `package` — the built nixct package; defaults to one built from the options
   above.
 
-### Rebuilds don't disturb a running container
+### `nixos-rebuild switch` upgrades the container in place
 
-A restart is not an upgrade-in-place: the rootfs is baked at build time, so
-there is nothing to swap under a live container — a restart tears it down and
-takes every `nixct develop` session with it, along with whatever they were
-running. So the service is marked `X-RestartIfChanged=false` and
-`nixos-rebuild switch` **skips** it: the rebuild writes the new unit, the old
-container keeps serving.
+By default a rebuild **upgrades the running container without stopping it**.
+Nothing restarts, and every live `nixct develop` session keeps running.
 
-The new version applies the next time the service actually starts — a fresh
-login, or deliberately when nothing is running:
+This works because `nixct` takes its whole `/nix` from the host daemon: a
+container system built during the rebuild is already realised inside the
+container, so it can simply be activated — the same thing `nixos-rebuild` does
+on a real machine. The unit is marked `X-ReloadIfChanged`, so the switch
+reloads it, which runs:
 
 ```sh
-systemctl --user restart nixct     # picks up the newly built container
+nixct switch      # activate this build inside the running container
 ```
 
-Set `service.restartOnSwitch = true` to get the old behaviour (switch restarts
-it, killing live sessions).
+Activation is `switch-to-configuration test`: the container has no bootloader,
+and its `/nix/var` is the host's profile directory mounted read-only, so no
+system profile is touched. Develop sessions live in transient scopes, which
+activation does not restart. A no-op if the container is not running, or is
+already on that system.
+
+Only host-nix-daemon containers can do this; anything with a baked rootfs has
+nothing to swap under a live container and must be restarted to pick up a new
+build (`nixct switch` says so and exits non-zero).
+
+- `service.upgradeOnSwitch = false` — leave a running container strictly alone;
+  the new system then applies at its next start.
+- `service.restartOnSwitch = true` — the old behaviour: switch stops and starts
+  it, killing live sessions.
 
 ### Lifecycle
 
@@ -477,16 +536,3 @@ Both skip silently if the host file is absent.
 ```sh
 nixct develop ~/some/project
 ```
-
-## Portable tarball
-
-`nix build .#<container>.portable` produces a **self-contained tarball** that
-runs on non-NixOS hosts with rootless podman + fuse-overlayfs (and squashfuse
-for the squashfs layout) — no Nix required on the host. The `lower` axis
-selects its layout (`"squashfs"`, default — needs squashfuse on the host — or
-`"folder"`, plain files). Run `check-host-compat` first to probe whether a
-target host meets the prerequisites before building or deploying the tarball.
-
-A portable tarball is **self-contained only**: `hostNixStore` and
-`hostNixDaemon` containers have no portable target (they rely on the host's
-`/nix`), so building `.portable` for one fails with a clear message.
