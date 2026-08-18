@@ -308,6 +308,19 @@ not collide with a framework-managed entry (`dev`, `.bashrc`, `.bashrc.user`,
 `.gitconfig`, `.nixct`), and the same name cannot be both a share and a
 template.
 
+### Terminal capabilities
+
+`TERM`, `COLORTERM` and `TERM_PROGRAM*` are forwarded from the invoking
+terminal into `enter` and `develop` sessions, the way ssh does it. Without
+that, `podman exec -t` hands the session a bare `TERM=xterm` whatever the
+real terminal is, and full-screen TUIs drop to 16 colours and no truecolor.
+The container carries a full terminfo database, so the forwarded value
+resolves.
+
+`LANG`/`LC_*` are deliberately **not** forwarded: the container has its own
+locale archive, and a host locale it does not carry would make every program
+warn. Its default is UTF-8 already, which is what TUI drawing needs.
+
 ### `--host-port PORT` (`develop` only) — a host loopback service in the session
 
 Makes the host's `127.0.0.1:PORT` reachable at the same address inside the

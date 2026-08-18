@@ -587,6 +587,27 @@ in
   # returned 127 every time, the loop never saw "running", and EVERY `up`
   # paid the entire 60-second timeout (plus 120 podman execs) before warning
   # and carrying on anyway.
+  # Terminal capabilities of the invoking terminal, as VAR=value lines.
+  #
+  # `podman exec -t` gives the session a bare TERM=xterm regardless of what
+  # the real terminal is, so full-screen TUIs (Claude Code among them) drop
+  # to their reduced mode - 16 colours, no truecolor - even on a capable
+  # terminal. Forward what the host advertises, the way ssh does.
+  #
+  # Terminal only, deliberately not LANG/LC_*: the container carries its own
+  # locale archive, and a host locale it lacks (en_GB.UTF-8 against a
+  # container built with en_US.UTF-8) would just make every program warn.
+  # The container default is UTF-8 already, which is what TUI drawing needs.
+  term_env() {
+    if [ -n "''${TERM:-}" ]; then printf 'TERM=%s\n' "$TERM"; fi
+    if [ -n "''${COLORTERM:-}" ]; then printf 'COLORTERM=%s\n' "$COLORTERM"; fi
+    if [ -n "''${TERM_PROGRAM:-}" ]; then printf 'TERM_PROGRAM=%s\n' "$TERM_PROGRAM"; fi
+    if [ -n "''${TERM_PROGRAM_VERSION:-}" ]; then
+      printf 'TERM_PROGRAM_VERSION=%s\n' "$TERM_PROGRAM_VERSION"
+    fi
+    return 0
+  }
+
   wait_for_systemd() {
     local _i state
     for _i in $(seq 1 120); do
@@ -1189,6 +1210,11 @@ in
         echo "forward: Wayland"
       fi
 
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        exec_env+=(--env "$line")
+      done <<<"$(term_env)"
+
       pm exec -it -u "$SHELL_USER" \
         "''${exec_env[@]+''${exec_env[@]}}" \
         "$NAME" \
@@ -1717,6 +1743,13 @@ in
         done <<<"$dbus_out"
         echo "forward: session D-Bus"
       fi
+
+      # Terminal capabilities, so a TUI in the session sees the real
+      # terminal rather than podman's bare TERM=xterm.
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        extra_setenv+=(--setenv="$line")
+      done <<<"$(term_env)"
 
       # Spawn the per-session HOST watchdog (waits on a socket
       # uniquely named for this mount_id; tears down host-side
