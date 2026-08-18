@@ -81,11 +81,54 @@ in {
       default = [ ];
       description = "Extra packages available inside the nixct develop-session environment.";
     };
+    modules = lib.mkOption {
+      type = lib.types.listOf lib.types.anything;
+      default = [ ];
+      description = "Extra NixOS modules for the container system.";
+    };
+    sessionFlags = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "--agent" "$HOME/.1password/agent.sock" "--mount-bashrc" "--mount-gitconfig" ];
+      description = ''
+        Default flags for every `nixct develop`, prepended to the command
+        line so an explicit flag still parses after them. Shell-expanded, so
+        paths may be written relative to `$HOME`.
+      '';
+    };
+    sessionShares = lib.mkOption {
+      type = lib.types.listOf lib.types.attrs;
+      default = [ ];
+      example = [{ host = "$HOME/.claudeB"; name = ".claude"; }];
+      description = ''
+        Host directories shared into every develop session HOME as
+        `~/<name>` - the real directory, so writes reach the host and outlive
+        the session. `host` is shell-expanded and created if missing; `mode`
+        is "rw" (default) or "ro".
+      '';
+    };
+    sessionTemplates = lib.mkOption {
+      type = lib.types.listOf lib.types.attrs;
+      default = [ ];
+      example = [{ host = "$HOME/.local/state/foo"; name = ".foo"; }];
+      description = ''
+        Host directories handed to every develop session as a frozen template
+        at `~/<name>`: read-only lower plus a session-lifetime overlay, so the
+        session can write but nothing reaches the host and nothing survives.
+      '';
+    };
+    developArgs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "--impure" ];
+      description = "Extra arguments for the `nix develop` a session starts with.";
+    };
     package = lib.mkOption {
       type = lib.types.package;
       description = "The built nixct package (binary `nixct`). Defaults to one built from the options above.";
       default = (mkNixct {
-        inherit (cfg) name packages;
+        inherit (cfg) name packages modules
+                      sessionFlags sessionShares sessionTemplates developArgs;
         idleTimeout = if cfg.service.enable then 0 else cfg.idleTimeoutSeconds;
         gpuHasToolkit = cfg.gpu.hostHasToolkit;
       }).run;

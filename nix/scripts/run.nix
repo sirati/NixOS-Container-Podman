@@ -46,6 +46,12 @@
   # Extra arguments appended to the `nix develop` the session starts with,
   # e.g. [ "--impure" ]. See `--develop-arg` for the runtime version.
 , developArgs ? [ ]
+  # Default flags for the `develop` subcommand itself, e.g.
+  # [ "--agent" "$HOME/.1password/agent.sock" "--mount-gitconfig" ]. They are
+  # prepended to the command line (and shell-expanded), so every session gets
+  # them without typing them. NOT the same as developArgs, which go to the
+  # `nix develop` inside the session.
+, sessionFlags ? [ ]
 , hostHasNvidiaContainerToolkit ? false
 , useKeepId ? false
 , keepIdUid ? 1000
@@ -135,6 +141,14 @@ let
       mkdir -p -- "$_s" 2>/dev/null || true
       share_specs+=("$_s:${s.name}:${s.mode or "rw"}")
     '') sessionShares);
+
+  # Container-declared default flags for `develop`, prepended to the command
+  # line. Double-quoted so paths can be written relative to $HOME.
+  sessionFlagLine =
+    if sessionFlags == [ ] then ""
+    else "set -- "
+         + builtins.concatStringsSep " " (map (f: "\"" + f + "\"") sessionFlags)
+         + " \"$@\"";
 
   # Single-quote a string for the shell (run.nix takes no `lib`).
   shellQuote = a:
@@ -1110,7 +1124,12 @@ in
       pm exec -it -u "$SHELL_USER" "$NAME" "$@"
       ;;
     develop)
+      # Container-declared default flags (mkContainer `sessionFlags`),
+      # prepended to the command line so an explicit flag still parses after
+      # them. Emitted double-quoted, so $HOME and friends expand here.
+      ${sessionFlagLine}
       forward_agent=0
+      agent_sock=""
       x11_mode=""
       wayland=0
       wprs=0
@@ -1133,6 +1152,14 @@ in
       while [ $# -gt 0 ]; do
         case "$1" in
           -A|--forward-agent) forward_agent=1; shift ;;
+          --agent)
+            # Like -A but naming the socket, for when the agent you want is
+            # not the one $SSH_AUTH_SOCK happens to point at - e.g. the
+            # 1Password agent while the login session carries a forwarded one.
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --agent requires a socket path" >&2; exit 2
+            fi
+            agent_sock=$2; forward_agent=1; shift 2 ;;
           --x11)             x11_mode=trusted; shift ;;
           --x11-untrusted)   x11_mode=untrusted; shift ;;
           --wayland)         wayland=1; shift ;;
@@ -1336,11 +1363,30 @@ in
           set -e; dest="/develop-home/$1/$2"; cat > "$dest"; chown "$3:$4" "$dest"; chmod 0444 "$dest"
         ' bash "$session_user" ".bashrc.user" "$uid" "$gid" < "$HOME/.bashrc"
       fi
-      if [ "$mount_gitconfig" -eq 1 ] && [ -f "$HOME/.gitconfig" ]; then
-        # shellcheck disable=SC2016
-        pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
-          set -e; dest="/develop-home/$1/$2"; cat > "$dest"; chown "$3:$4" "$dest"; chmod 0444 "$dest"
-        ' bash "$session_user" ".gitconfig" "$uid" "$gid" < "$HOME/.gitconfig"
+      # git reads ~/.gitconfig OR $XDG_CONFIG_HOME/git/config, and a
+      # home-manager setup typically only has the latter - so look in both
+      # and reproduce whichever exists at the same place in the session.
+      if [ "$mount_gitconfig" -eq 1 ]; then
+        git_src="" git_dst=""
+        if [ -f "$HOME/.gitconfig" ]; then
+          git_src="$HOME/.gitconfig"; git_dst=".gitconfig"
+        elif [ -f "''${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
+          git_src="''${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
+          git_dst=".config/git/config"
+        fi
+        if [ -n "$git_src" ]; then
+          # shellcheck disable=SC2016
+          pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
+            set -e
+            dest="/develop-home/$1/$2"
+            parent=$(dirname -- "$dest")
+            mkdir -p "$parent"
+            chown "$3:$4" "$parent" 2>/dev/null || true
+            cat > "$dest"
+            chown "$3:$4" "$dest"
+            chmod 0444 "$dest"
+          ' bash "$session_user" "$git_dst" "$uid" "$gid" < "$git_src"
+        fi
       fi
 
       home_dir="/develop-home/$session_user"
@@ -1517,11 +1563,16 @@ in
 
 
       if [ "$forward_agent" -eq 1 ]; then
-        if [ -z "''${SSH_AUTH_SOCK:-}" ] || [ ! -S "$SSH_AUTH_SOCK" ]; then
-          echo "develop: -A given but SSH_AUTH_SOCK is unset/invalid" >&2
+        agent_src=''${agent_sock:-''${SSH_AUTH_SOCK:-}}
+        if [ -z "$agent_src" ] || [ ! -S "$agent_src" ]; then
+          if [ -n "$agent_sock" ]; then
+            echo "develop: --agent: not a socket: $agent_sock" >&2
+          else
+            echo "develop: -A given but SSH_AUTH_SOCK is unset/invalid" >&2
+          fi
           exit 2
         fi
-        bind_socket "$mount_id" "ssh-agent" "$SSH_AUTH_SOCK"
+        bind_socket "$mount_id" "ssh-agent" "$agent_src"
         spawn_socket_proxy "$mount_id" "ssh-agent" "$uid" "$gid"
         extra_setenv+=(--setenv="SSH_AUTH_SOCK=/run/sockets/$mount_id/ssh-agent")
       fi

@@ -144,6 +144,10 @@
           # Extra arguments for the `nix develop` a session starts with,
           # e.g. [ "--impure" ]. Same as `--develop-arg`, applied first.
         , developArgs ? [ ]
+          # Default flags for the `develop` subcommand itself, e.g.
+          #   [ "--agent" "$HOME/.1password/agent.sock" "--mount-gitconfig" ]
+          # Shell-expanded and prepended to every `develop` command line.
+        , sessionFlags ? [ ]
         }:
         let
           hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
@@ -247,7 +251,7 @@
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
               inherit tools rootfs toplevel shellUser name idleTimeout sessionTemplates
-                      sessionShares developArgs
+                      sessionShares developArgs sessionFlags
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
                       hostNixDaemon;
               storage = storageMode;
@@ -421,10 +425,11 @@
         , sessionTemplates ? [ ]     # frozen host dirs every session inherits
         , sessionShares ? [ ]        # host dirs shared into every session HOME
         , developArgs ? [ ]          # default args for the session nix develop
+        , sessionFlags ? [ ]         # default flags for `develop` itself
         }:
         mkContainer {
           inherit name idleTimeout runName sessionTemplates
-                  sessionShares developArgs;
+                  sessionShares developArgs sessionFlags;
           modules = [ ./nix/nixct-system.nix ]
             ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; }
             ++ modules;
