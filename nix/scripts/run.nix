@@ -967,6 +967,10 @@ in
     if getfacl -pn -- "$dir" 2>/dev/null | grep -q "^user:$huid:rwx"; then
       return 0
     fi
+    # Said out loud because it is the one slow step here: on a tree with a
+    # large build cache in it this walks a lot of inodes, and silence would
+    # read as a hang. Only ever happens once per directory.
+    echo "native: granting $dir to the session (first time; walks the tree)" >&2
     # rwX, not rwx: X adds execute only where it belongs - on directories
     # and on files that already carry the bit - so a recursive grant does
     # not turn every source file into an executable.
