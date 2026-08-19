@@ -985,6 +985,12 @@ in
     return 0
   }
 
+  # already_mounted <container-path>: is something already mounted there?
+  already_mounted() {
+    pm exec -u root "$NAME" \
+      /run/current-system/sw/bin/mountpoint -q -- "$1" 2>/dev/null
+  }
+
   # bind_native <container-src> <container-dst> <ro|rw>: hand a directory
   # already visible under /hostmnts to a session as a plain bind mount,
   # with no FUSE in the path. Made private so it cannot propagate back
@@ -1601,8 +1607,14 @@ in
       # reflinks and native mmap, at the cost of the --perms="og=" screen:
       # a plain bind shows the real host permissions, so a project other
       # session users could read on the host stays readable to them here.
+      # Only when this shell is the one that will actually mount. A second
+      # `develop` on the same path JOINS the live session and reuses its
+      # mount, so deciding again there would re-probe and re-walk the tree
+      # to no effect - and print a native line for a session that is on
+      # bindfs. Whichever way the first shell went is what the session is.
       project_native=0
       if [ "$native_project" -eq 1 ] \
+         && ! already_mounted "/develop-home/$session_user/dev" \
          && use_native "$hostpath" "$uid" "$gid" "native"; then
         project_native=1
       fi
@@ -1831,6 +1843,7 @@ in
         fi
         bind_workdir "$s_host" "$mount_id.$s_name"
         if [ "$s_native" -eq 1 ] \
+           && ! already_mounted "/develop-home/$session_user/$s_name" \
            && use_native "$s_host" "$uid" "$gid" "share $s_name"; then
           bind_native "/hostmnts/$mount_id.$s_name" \
                       "/develop-home/$session_user/$s_name" "$s_mode"
