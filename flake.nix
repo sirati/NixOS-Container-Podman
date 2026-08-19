@@ -139,7 +139,7 @@
           # real directory, writes reaching the host:
           #   [ { host = "$HOME/.cache/cargo"; name = ".cargo"; mode = "rw"; } ]
           # `host` is expanded by the run script at run time and created if
-          # missing; `mode` defaults to "rw". Same mechanism as `--share`.
+          # missing; `mode` is "rw" (default), "ro" or "native". Same as `--share`.
         , sessionShares ? [ ]
           # Extra arguments for the `nix develop` a session starts with,
           # e.g. [ "--impure" ]. Same as `--develop-arg`, applied first.

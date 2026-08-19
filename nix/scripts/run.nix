@@ -877,6 +877,152 @@ in
     printf '%s\n' "$mount_id"
   }
 
+  # ---------------------------------------------------------------------
+  # Native mounts.
+  #
+  # A develop session normally sees its project through bindfs, because
+  # ownership names exactly one uid: the host directory belongs to the
+  # invoking user, which inside the container is uid 0, so the session user
+  # cannot write it. bindfs rewrites that on the fly.
+  #
+  # The rewriting costs the filesystem itself. A FUSE ioctl cannot carry
+  # the source fd that FICLONE needs, so reflinks are impossible through
+  # bindfs whatever backs it, and a copy-on-write filesystem silently
+  # degrades to whole-file copies. The FUSE daemon also caps how many
+  # files the whole session can hold open at once.
+  #
+  # An ACL can name a second uid, which is the piece ownership was
+  # missing. The container id map already pairs each container id with a
+  # host id, so granting that host id rwx lets the session in without
+  # touching ownership - and then the mount can be a plain bind, with the
+  # filesystem keeping every native capability.
+  #
+  # The alternative, an idmapped mount, is not available here: the kernel
+  # requires CAP_SYS_ADMIN in the user namespace that owns the superblock,
+  # and for a host filesystem that is the initial namespace, which a
+  # rootless container is not in.
+  # ---------------------------------------------------------------------
+
+  # host_id_for <map-file> <container-id>: translate an id inside the
+  # container user namespace to the host id backing it, reading the kernel
+  # map rather than assuming an offset - `--userns=keep-id` maps container
+  # 0 to the invoking user and container 1.. to the subuid range, so there
+  # is no single offset to assume. Columns: id-inside, id-outside, length.
+  host_id_for() {
+    awk -v id="$2" \
+      '{ if (id >= $1 && id < $1 + $3) { print $2 + (id - $1); exit } }' "$1"
+  }
+
+  # native_supported <hostdir>: can this directory carry a native mount,
+  # and is it worth taking one?
+  #
+  # Probed, not looked up in a table of filesystem names. Reflink support
+  # is a property of the mount, the kernel build and sometimes the mkfs
+  # options - xfs without reflink=1, btrfs on a kernel without it - and a
+  # name-based table gets every one of those wrong. Ask the ioctl instead;
+  # it costs one 4 KiB file. ACLs are probed the same way, since without
+  # them there is no way to let the session in.
+  #
+  # A directory that fails either probe falls back to bindfs, which works
+  # everywhere. That is the whole point of making this a probe: turning
+  # the option on must never be what breaks a session.
+  native_supported() {
+    local dir=$1 probe rc=1
+    probe=$(mktemp -d "$dir/.nixct-native-probe.XXXXXX" 2>/dev/null) || return 1
+    if dd if=/dev/zero of="$probe/a" bs=4096 count=1 status=none 2>/dev/null \
+       && cp --reflink=always -- "$probe/a" "$probe/b" 2>/dev/null \
+       && setfacl -m "u:$(id -u):rwx" -- "$probe" 2>/dev/null; then
+      rc=0
+    fi
+    rm -rf -- "$probe"
+    return "$rc"
+  }
+
+  # grant_native_acl <hostdir> <container-uid> <container-gid>: let the
+  # session user reach a host directory without rewriting its ownership.
+  #
+  # The default entries carry it both ways. Files the session creates are
+  # owned by the mapped subuid, which the invoking user could not
+  # otherwise write, so every directory also gets a default entry for the
+  # invoking user - the host keeps full access to whatever a session
+  # leaves behind.
+  #
+  # The recursive pass runs only on the first grant: anything already in
+  # the tree predates the default entries and would be unreachable
+  # otherwise. After that, re-asserting the top-level entry is enough.
+  grant_native_acl() {
+    local dir=$1 cuid=$2 cgid=$3 pid huid hgid self
+    pid=$(pm inspect "$NAME" --format '{{.State.Pid}}' 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$pid" ] || [ ! -r "/proc/$pid/uid_map" ]; then
+      echo "native: cannot read the container id maps" >&2
+      return 1
+    fi
+    huid=$(host_id_for "/proc/$pid/uid_map" "$cuid")
+    hgid=$(host_id_for "/proc/$pid/gid_map" "$cgid")
+    if [ -z "$huid" ] || [ -z "$hgid" ]; then
+      echo "native: container id $cuid/$cgid is outside the container id map" >&2
+      return 1
+    fi
+    self=$(id -u)
+    if getfacl -pn -- "$dir" 2>/dev/null | grep -q "^user:$huid:rwx"; then
+      return 0
+    fi
+    # rwX, not rwx: X adds execute only where it belongs - on directories
+    # and on files that already carry the bit - so a recursive grant does
+    # not turn every source file into an executable.
+    if ! setfacl -R -m "u:$huid:rwX" -m "u:$self:rwX" -- "$dir" 2>/dev/null; then
+      echo "native: cannot set an ACL on $dir" >&2
+      return 1
+    fi
+    if ! find "$dir" -type d -print0 \
+         | xargs -0 -r setfacl -m "d:u:$huid:rwx" -m "d:u:$self:rwx" -- \
+         2>/dev/null; then
+      echo "native: cannot set default ACLs under $dir" >&2
+      return 1
+    fi
+    mkdir -p "$STATE_DIR/native-acl"
+    printf '%s\n' "$dir" > "$STATE_DIR/native-acl/$(printf '%s' "$dir" | sha256sum | cut -c1-16)"
+    return 0
+  }
+
+  # bind_native <container-src> <container-dst> <ro|rw>: hand a directory
+  # already visible under /hostmnts to a session as a plain bind mount,
+  # with no FUSE in the path. Made private so it cannot propagate back
+  # through the rshared /hostmnts peer group into the host mount table.
+  bind_native() {
+    # shellcheck disable=SC2016
+    pm exec -u root "$NAME" \
+      /run/current-system/sw/bin/bash -c '
+        export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+        set -e
+        src=$1; dst=$2; mode=$3
+        mkdir -p -- "$dst"
+        if ! mountpoint -q -- "$dst"; then
+          mount --bind -- "$src" "$dst"
+          mount --make-private -- "$dst"
+          if [ "$mode" = "ro" ]; then
+            mount -o remount,bind,ro -- "$dst"
+          fi
+        fi
+      ' bash "$1" "$2" "$3"
+  }
+
+  # use_native <hostdir> <container-uid> <container-gid> <label>: decide
+  # and prepare. Echoes nothing; returns 0 for a native mount, 1 to fall
+  # back to bindfs, after saying which and why.
+  use_native() {
+    local dir=$1 cuid=$2 cgid=$3 label=$4
+    if ! native_supported "$dir"; then
+      echo "$label: no reflink or ACL support here - using bindfs" >&2
+      return 1
+    fi
+    if ! grant_native_acl "$dir" "$cuid" "$cgid"; then
+      echo "$label: could not grant access - using bindfs" >&2
+      return 1
+    fi
+    return 0
+  }
+
   # ensure_host_port <port>: make the HOST's 127.0.0.1:<port> reachable at the
   # same address inside the container.
   #
@@ -1261,6 +1407,7 @@ in
       dbus=0
       mount_bashrc=0
       mount_gitconfig=0
+      native_project=0
       sock_specs=()
       # Container-declared templates (mkContainer `sessionTemplates`).
       # Emitted by the flake, so the host paths may reference $HOME /
@@ -1292,6 +1439,8 @@ in
           --dbus)            dbus=1; shift ;;
           --mount-bashrc)    mount_bashrc=1; shift ;;
           --mount-gitconfig) mount_gitconfig=1; shift ;;
+          --native)          native_project=1; shift ;;
+          --no-native)       native_project=0; shift ;;
           -S|--socket)
             if [ -z "''${2:-}" ]; then
               echo "develop: -S requires name=path" >&2; exit 2
@@ -1446,6 +1595,17 @@ in
       #   <home>/dev  - bindfs view of /hostmnts/<id>. --perms="og="
       #                 strips group/other perms so other session users
       #                 can't peek in even if they guess the username.
+      #
+      # With --native the project is a plain bind instead, once the host
+      # directory has been probed and granted (see use_native). That keeps
+      # reflinks and native mmap, at the cost of the --perms="og=" screen:
+      # a plain bind shows the real host permissions, so a project other
+      # session users could read on the host stays readable to them here.
+      project_native=0
+      if [ "$native_project" -eq 1 ] \
+         && use_native "$hostpath" "$uid" "$gid" "native"; then
+        project_native=1
+      fi
       # shellcheck disable=SC2016
       pm exec -u root "$NAME" \
         /run/current-system/sw/bin/bash -lc '
@@ -1478,7 +1638,7 @@ in
           cp /etc/nix-dev-container/bashrc "$home_dir/.bashrc"
           chown "$3:$4" "$home_dir/.bashrc"
           chmod 0644 "$home_dir/.bashrc"
-          if ! mountpoint -q "$proj_dir"; then
+          if ! mountpoint -q "$proj_dir" && [ "$5" != "1" ]; then
             # --multithreaded is NOT the bindfs default: without it one thread
             # serves every request for this project, so parallel builds
             # queue behind each other on a single FUSE daemon (46 requests
@@ -1486,7 +1646,11 @@ in
             bindfs --multithreaded --map=0/$3:@0/@$4 --perms="og=" \
               -o allow_other "$src" "$proj_dir"
           fi
-        ' bash "$session_user" "$mount_id" "$uid" "$gid"
+        ' bash "$session_user" "$mount_id" "$uid" "$gid" "$project_native"
+      if [ "$project_native" -eq 1 ]; then
+        bind_native "/hostmnts/$mount_id" "/develop-home/$session_user/dev" rw
+        echo "native: $hostpath -> /develop-home/$session_user/dev (plain bind; reflinks work)"
+      fi
 
       # Opt-in: copy the invoking host user's dotfiles read-only into
       # the session HOME. Each is piped in as container root, chowned
@@ -1637,9 +1801,13 @@ in
       # exists for a shared directory that must stay pristine.
       for spec in "''${share_specs[@]+''${share_specs[@]}}"; do
         s_mode=rw
+        s_native=0
         case "$spec" in
-          *:rw) s_mode=rw; spec=''${spec%:rw} ;;
-          *:ro) s_mode=ro; spec=''${spec%:ro} ;;
+          *:rw)     s_mode=rw; spec=''${spec%:rw} ;;
+          *:ro)     s_mode=ro; spec=''${spec%:ro} ;;
+          # `:native` is rw plus the native mount (a read-only native
+          # mount would be `:ro`, which bindfs already serves at no cost).
+          *:native) s_mode=rw; s_native=1; spec=''${spec%:native} ;;
         esac
         case "$spec" in
           *:*) s_host=''${spec%:*}; s_name=''${spec##*:} ;;
@@ -1662,6 +1830,13 @@ in
           echo "develop: --share: not a directory: ''${spec%:*}" >&2; exit 2
         fi
         bind_workdir "$s_host" "$mount_id.$s_name"
+        if [ "$s_native" -eq 1 ] \
+           && use_native "$s_host" "$uid" "$gid" "share $s_name"; then
+          bind_native "/hostmnts/$mount_id.$s_name" \
+                      "/develop-home/$session_user/$s_name" "$s_mode"
+          echo "share: $s_host -> $home_dir/$s_name (native; reflinks work)"
+          continue
+        fi
         # shellcheck disable=SC2016
         pm exec -u root "$NAME" \
           /run/current-system/sw/bin/bash -lc '
@@ -2020,7 +2195,7 @@ in
           upper work merged nix-store-upper nix-store-work
           nix-store-lower.gcroot work-shared socket-mounts host-ports
           podman-root podman-runroot host-watchdog session-gcroots
-          wprs-viewers wayland-acl lower-mount fuse-store fuse-store.log
+          wprs-viewers wayland-acl native-acl lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated
         "
         # Collapse the list to single-space-separated words: the literal
@@ -2204,14 +2379,17 @@ in
                                 Repeatable. Shared by all sessions of the
                                 container, so anything in it can use the
                                 port.
-    --share hostpath[:name][:ro|:rw]
+    --share hostpath[:name][:ro|:rw|:native]
                                 bind a host directory into the session
                                 HOME at ~/<name> (default: its basename),
                                 as the REAL directory: writes go through
                                 to the host and outlive the session.
                                 Default rw. Repeatable. For state a
                                 session should accumulate across runs
-                                (cargo registry, build caches). Use
+                                (cargo registry, build caches). \`:native\`
+                                is rw on the real filesystem rather than
+                                through bindfs - see --native for what
+                                that buys and what it costs. Use
                                 --template instead when the session must
                                 not be able to change it.
     -D, --develop-arg ARG       extra argument for the session's
@@ -2231,6 +2409,24 @@ in
                                 names give separate templates, the same
                                 name twice stacks the host dirs as overlay
                                 lowers (earlier wins).
+    --native                    mount the project directly instead of
+                                through bindfs, so the session gets the
+                                real filesystem: reflinks (FICLONE), native
+                                mmap, and no FUSE handle ceiling. A FUSE
+                                ioctl cannot carry the fd that FICLONE
+                                needs, so a copy-on-write filesystem
+                                silently degrades to whole-file copies
+                                without this. Access comes from an ACL
+                                granting the host uid the session user maps
+                                to, so ownership is untouched and the host
+                                keeps rwx on what a session leaves behind.
+                                Probed per directory: without reflink and
+                                ACL support it falls back to bindfs on its
+                                own, so it is safe to leave on. Costs the
+                                bindfs --perms=\"og=\" screen - a plain bind
+                                shows the real host permissions - and files
+                                a session creates are owned on the host by
+                                the mapped subuid. --no-native overrides it.
     --mount-bashrc              copy the host \$HOME/.bashrc into the
                                 session HOME as ~/.bashrc.user (0444),
                                 sourced by the framework ~/.bashrc.

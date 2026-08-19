@@ -104,7 +104,7 @@ in {
         Host directories shared into every develop session HOME as
         `~/<name>` - the real directory, so writes reach the host and outlive
         the session. `host` is shell-expanded and created if missing; `mode`
-        is "rw" (default) or "ro".
+        is "rw" (default), "ro", or "native" (see `--native`).
       '';
     };
     sessionTemplates = lib.mkOption {
