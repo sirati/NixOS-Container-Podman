@@ -414,6 +414,13 @@
         name = "testdaemon";
         keepId.enable = false;
         hostNixDaemon = true;
+        # Also the only build-time coverage of the declared-session options:
+        # they emit shell into the run script, and the script is shellchecked
+        # at build time, so a container that declares none would let a broken
+        # emitter through to whoever does declare one.
+        sessionEnv = { NIXCT_EXAMPLE_ENV = "$HOME/.example"; };
+        sessionShares = [ { host = "$HOME/.cache/nixct-example"; name = ".example-share"; } ];
+        developArgs = [ "--impure" ];
       };
 
       # Thin wrapper producing a host-daemon, develop-only, tmpfs-state,

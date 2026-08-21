@@ -150,9 +150,13 @@ let
   # $HOME in a value is expanded to the session HOME at run time, which
   # is the only way to name it: the session user is derived from the
   # project path, so its home is not known when this is written.
+  # SC2016 is disabled per line on purpose: a `$HOME` in a value must reach
+  # the runtime unexpanded, because it names the SESSION home, which does
+  # not exist yet and is nothing like the one this script would expand to.
   sessionEnvLines =
     builtins.concatStringsSep "" (map (e:
-      "env_specs+=(" + shellQuote e + ")\n      ") sessionEnv);
+      "# shellcheck disable=SC2016\n      env_specs+=("
+      + shellQuote e + ")\n      ") sessionEnv);
 
   # Container-declared default flags for `develop`, prepended to the command
   # line. Double-quoted so paths can be written relative to $HOME.
