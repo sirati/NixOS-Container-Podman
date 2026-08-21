@@ -127,6 +127,17 @@ in {
         is derived from the project path, so its home is not known here.
       '';
     };
+    isolateLan = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Refuse connections from the container to private address space
+        (RFC1918, CGNAT/tailnet, link-local, IPv6 ULA); loopback and the
+        public internet stay reachable. pasta gives the container a copy of
+        the host interface, so without this a session can reach every
+        machine on the LAN - and a forwarded ssh-agent reaches them as you.
+      '';
+    };
     developArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -139,7 +150,7 @@ in {
       default = (mkNixct {
         inherit (cfg) name packages modules
                       sessionFlags sessionShares sessionTemplates developArgs
-                      sessionEnv;
+                      sessionEnv isolateLan;
         idleTimeout = if cfg.service.enable then 0 else cfg.idleTimeoutSeconds;
         gpuHasToolkit = cfg.gpu.hostHasToolkit;
       }).run;

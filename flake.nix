@@ -128,6 +128,11 @@
         , keepId ? { }
         , runName ? "nix-dev-container"
         , idleTimeout ? 0
+          # Refuse container connections to private address space (RFC1918,
+          # CGNAT/tailnet, link-local, IPv6 ULA). pasta hands the namespace a
+          # copy of the host interface, so without this a session reaches the
+          # whole LAN - and a forwarded ssh-agent reaches every machine on it.
+        , isolateLan ? false
           # Host dirs every develop session gets as a frozen template
           # (read-only lower + session-lifetime overlay upper):
           #   [ { host = "\${XDG_STATE_HOME:-$HOME/.local/state}/foo";
@@ -194,6 +199,7 @@
               # daemon / nixbld users, store = daemon) to match the
               # hostNixDaemon axis.
               { nixDevContainer.hostDaemon.enable = hostDaemon; }
+              { nixDevContainer.isolateLan.enable = isolateLan; }
             ] ++ modules;
           };
 
@@ -439,10 +445,11 @@
         , developArgs ? [ ]          # default args for the session nix develop
         , sessionFlags ? [ ]         # default flags for `develop` itself
         , sessionEnv ? { }           # environment for every develop session
+        , isolateLan ? false         # refuse connections to private address space
         }:
         mkContainer {
           inherit name idleTimeout runName sessionTemplates
-                  sessionShares developArgs sessionFlags sessionEnv;
+                  sessionShares developArgs sessionFlags sessionEnv isolateLan;
           modules = [ ./nix/nixct-system.nix ]
             ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; }
             ++ modules;

@@ -26,7 +26,105 @@ in
     nix-daemon over its bind-mounted socket, with /nix/store mounted
     read-only from the host'';
 
+
+  # LAN isolation. A rootless container gets its network through pasta,
+  # which hands the namespace a COPY of the host interface - same address,
+  # same on-link route - so by default a session can open a connection to
+  # anything the host can reach on the local network. That turns a
+  # forwarded ssh-agent into a way out: the agent cannot be used against
+  # the host itself (loopback is not mapped), but it can be used against
+  # every other machine on the LAN that trusts those keys.
+  #
+  # Enforced inside the namespace, which is where a session user cannot
+  # reach: sessions run as ordinary users, are not in wheel and have no
+  # sudo, so they cannot load or flush a ruleset. It does NOT contain a
+  # process that has become root INSIDE the container - for that the rule
+  # has to sit on the host, outside the namespace, and the host is also
+  # where a container escape lands anyway.
+  options.nixDevContainer.isolateLan = {
+    enable = lib.mkEnableOption ''
+      refusing connections from the container to private-use address
+      space (RFC1918, CGNAT/tailnet, link-local and IPv6 ULA), leaving
+      loopback and the public internet reachable'';
+
+    allow = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "192.168.176.5" "10.0.0.0/24" ];
+      description = ''
+        Destinations to permit despite the isolation, as nftables address
+        or prefix literals. Matched before the refusals.
+      '';
+    };
+
+    allow6 = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "IPv6 counterpart of `allow`.";
+    };
+
+    resolver = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "169.254.1.1" ];
+      description = ''
+        Addresses always reachable, ahead of the link-local refusal. The
+        default is pasta's own DNS forwarder: it is a link-local address
+        that pasta answers itself, so refusing it would take DNS down with
+        the LAN. Set to [ ] if the container gets DNS another way.
+      '';
+    };
+  };
+
   config = lib.mkMerge [
+    (lib.mkIf config.nixDevContainer.isolateLan.enable (
+      let
+        iso = config.nixDevContainer.isolateLan;
+        set = xs: "{ " + lib.concatStringsSep ", " xs + " }";
+        # Refused, not dropped: a refused connect fails immediately with
+        # ECONNREFUSED instead of hanging until the TCP timeout, which is
+        # the difference between a build that errors and a build that
+        # looks wedged.
+        ruleset = pkgs.writeText "nixct-isolate-lan.nft" ''
+          table inet nixct-isolate-lan {
+            chain output {
+              type filter hook output priority filter; policy accept;
+              oifname "lo" accept
+              ${lib.optionalString (iso.resolver != [ ])
+                  "ip daddr ${set iso.resolver} accept"}
+              ${lib.optionalString (iso.allow != [ ])
+                  "ip daddr ${set iso.allow} accept"}
+              ${lib.optionalString (iso.allow6 != [ ])
+                  "ip6 daddr ${set iso.allow6} accept"}
+              ip daddr ${set [
+                "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16"
+                "169.254.0.0/16" "100.64.0.0/10"
+              ]} reject with icmp type admin-prohibited
+              ip6 daddr ${set [ "fc00::/7" "fe80::/10" ]} \
+                reject with icmpv6 type admin-prohibited
+            }
+          }
+        '';
+      in
+      {
+        # A plain oneshot rather than networking.nftables: the ruleset is
+        # self-contained and must not drag the whole firewall module (and
+        # its input policy) into a container that has no inbound path.
+        systemd.services.nixct-isolate-lan = {
+          description = "Refuse container connections to private address space";
+          wantedBy = [ "sysinit.target" ];
+          before = [ "network.target" ];
+          after = [ "systemd-sysctl.service" ];
+          unitConfig.DefaultDependencies = false;
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${pkgs.nftables}/bin/nft -f ${ruleset}";
+            ExecStop = "${pkgs.nftables}/bin/nft delete table inet nixct-isolate-lan";
+          };
+        };
+        # So the rules can be read back from inside for debugging.
+        environment.systemPackages = [ pkgs.nftables ];
+      }))
     {
       boot = {
         isContainer = true;

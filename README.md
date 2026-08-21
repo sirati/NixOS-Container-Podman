@@ -366,6 +366,32 @@ resolves.
 locale archive, and a host locale it does not carry would make every program
 warn. Its default is UTF-8 already, which is what TUI drawing needs.
 
+### `isolateLan` (build-time) — no route to the local network
+
+A rootless container gets its network from **pasta**, which hands the
+namespace a *copy* of the host interface — same address, same on-link route.
+So by default a session can open a connection to anything the host can reach
+locally. With a forwarded ssh-agent that is a way out: the agent cannot be
+aimed at the host itself (loopback is not mapped), but it can be aimed at
+every other machine on the LAN that trusts those keys.
+
+```nix
+mkNixct { isolateLan = true; }        # or programs.nixct.isolateLan = true;
+```
+
+Refuses RFC1918, CGNAT/tailnet (`100.64.0.0/10`), link-local and IPv6 ULA;
+loopback and the public internet stay reachable. `reject`, not `drop`, so a
+blocked connect fails at once instead of hanging until the TCP timeout.
+`isolateLan.allow` / `.allow6` punch holes; `.resolver` (default
+`169.254.1.1`, pasta's own DNS forwarder) is permitted ahead of the
+link-local refusal, since refusing it would take DNS down with the LAN.
+
+Enforced inside the namespace, where a session user cannot reach it — sessions
+are ordinary users, not in wheel, with no sudo, so they cannot flush the
+ruleset. It does **not** contain a process that has become root inside the
+container; that needs a rule on the host, which is also where a container
+escape lands anyway.
+
 ### `--host-port PORT` (`develop` only) — a host loopback service in the session
 
 Makes the host's `127.0.0.1:PORT` reachable at the same address inside the
