@@ -861,19 +861,41 @@ in
   # ----- optional per-session D-Bus session bus -------------------
   ${dbusFns}
 
-  # compute_mount_id <hostpath>: sanitised basename + short hash,
-  # shared by `develop` and the wayland-attach/wayland-detach
-  # subcommands so they agree on which session a hostpath maps to.
-  # The sanitiser strips anything outside [A-Za-z0-9._-] and forbids
-  # leading `-` or `.`, so the id cannot smuggle shell metacharacters
-  # or option prefixes into useradd, mount, bindfs, or similar calls.
+  # compute_mount_id <hostpath>: the path itself, encoded. Shared by
+  # `develop` and the wayland-attach/wayland-detach subcommands so they
+  # agree on which session a hostpath maps to.
+  #
+  # The id is what you read on the session user, its HOME and its scope
+  # name, so it spells the project out rather than hashing it. `/` becomes
+  # `-` and a real `-` doubles, which is reversible: a dash that came from
+  # the path can never be mistaken for a separator, so two different paths
+  # cannot land on one id.
+  #
+  # A hash comes back only where the encoding cannot carry the path by
+  # itself:
+  #   - a character outside [A-Za-z0-9._-], which has to be folded to `_`
+  #     (that fold is lossy, so `/a b` and `/a_b` would otherwise collide);
+  #   - a path too long to survive as a user name, which useradd caps at
+  #     255 - minus `dev-` and the `.<share>` suffix the share mounts add.
+  # Both are rare enough that ordinary paths keep a clean id.
+  #
+  # Anything outside [A-Za-z0-9._-] is folded and a leading `-` or `.` is
+  # prefixed away, so the id cannot smuggle shell metacharacters or option
+  # prefixes into useradd, mount, bindfs, or similar calls.
   compute_mount_id() {
-    local hostpath=$1 base hash mount_id
-    base=$(basename -- "$hostpath" | sed 's/[^A-Za-z0-9._-]/_/g; s/^[-.]/_/')
-    if [ -z "$base" ]; then base=project; fi
-    hash=$(printf '%s' "$hostpath" | sha256sum | cut -c1-8)
-    mount_id="''${base}-''${hash}"
-    case "$mount_id" in -*) mount_id="_$mount_id" ;; esac
+    local hostpath=$1 enc safe mount_id
+    # Drop the leading slash; it would only make every id start with a dash.
+    enc=''${hostpath#/}
+    # Order matters: double the real dashes BEFORE separators become dashes.
+    enc=''${enc//-/--}
+    enc=''${enc//\//-}
+    safe=$(printf '%s' "$enc" | sed 's/[^A-Za-z0-9._-]/_/g')
+    mount_id=$safe
+    if [ "$safe" != "$enc" ] || [ ''${#safe} -gt 180 ]; then
+      mount_id="''${safe:0:180}-$(printf '%s' "$hostpath" | sha256sum | cut -c1-8)"
+    fi
+    if [ -z "$mount_id" ]; then mount_id=project; fi
+    case "$mount_id" in [-.]*) mount_id="_$mount_id" ;; esac
     printf '%s\n' "$mount_id"
   }
 

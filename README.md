@@ -229,7 +229,12 @@ whose only entry point is this.
 ### Sessions and shells
 
 A **session** is per project path — the session user, its HOME, the project
-bind, any templates, the forwards and the watchdogs all belong to it. Each
+bind, any templates, the forwards and the watchdogs all belong to it. It is
+named after the path, encoded so it stays reversible: `/` becomes `-` and a
+real `-` doubles, so `/a/b-c` (`a-b--c`) and `/a-b/c` (`a--b-c`) cannot land on
+the same session. A short hash is appended only for a path that will not
+survive the encoding — one holding a character outside `[A-Za-z0-9._-]`, or
+too long for a 255-character user name. Each
 `develop` on that path adds a **shell** to that session, in its own scope. So
 running `develop` again while one is live opens a second shell rather than
 failing, and the new shell may carry different flags:
