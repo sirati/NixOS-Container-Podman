@@ -113,6 +113,15 @@ in
   # to connect() at all). This modifies the actual host socket - not
   # cleaning it up would leave a permanent ACL entry on the user's live
   # compositor socket after the session ends.
+  # The host-side ssh-agent filter for this session (--agent-allow /
+  # --agent-deny). It holds a socket that grants the use of the user's
+  # keys, so it must not outlive the session it was granted to.
+  AGENT_FILTER_PID="$STATE_DIR/agent-filter/$MOUNT_ID.pid"
+  if [ -f "$AGENT_FILTER_PID" ]; then
+    kill "$(${bin "cat"} "$AGENT_FILTER_PID" 2>/dev/null)" 2>/dev/null || true
+    ${bin "rm"} -f -- "$AGENT_FILTER_PID" "$STATE_DIR/agent-filter/$MOUNT_ID.sock"
+  fi
+
   WAYLAND_ACL_FILE="$STATE_DIR/wayland-acl/$MOUNT_ID"
   if [ -f "$WAYLAND_ACL_FILE" ]; then
     WAYLAND_HOST_SOCK=$(${bin "cat"} "$WAYLAND_ACL_FILE" 2>/dev/null)

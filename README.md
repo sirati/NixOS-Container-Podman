@@ -5,7 +5,7 @@ user namespace, described as an ordinary NixOS configuration.
 
 ## What this repo provides
 
-Four independent primitives. `nixct` is only the last of them; the first three
+Five independent primitives. `nixct` is only the last of them; the first four
 stand on their own.
 
 **1. `lib.mkContainer` — a NixOS system as a rootless podman container.**
@@ -27,7 +27,13 @@ binary (`nix run .#<container>.fuse`) usable outside this framework; the
 `hostNixStore` axis is just the framework wiring it up. See
 [where `/nix/store` comes from](#hostnixstore--hostnixdaemon--where-nixstore-comes-from).
 
-**4. `nixct` — the develop-container preset built on top.** A host-nix-daemon,
+**4. `ssh-agent-filter` — a filtering proxy for the SSH agent protocol.**
+Forwards a restricted view of an agent: keys chosen by fingerprint or comment,
+with adding, removing and locking always refused. A standalone binary, used by
+[`--agent-allow`](#--agent-allow----agent-deny-develop-only--a-filtered-agent)
+but not tied to containers.
+
+**5. `nixct` — the develop-container preset built on top.** A host-nix-daemon,
 develop-only container whose entry point is
 [`nixct develop`](#nixct-develop-sessions): per-project throwaway users,
 forwarded sockets, shared or frozen host directories, an
@@ -365,6 +371,39 @@ resolves.
 `LANG`/`LC_*` are deliberately **not** forwarded: the container has its own
 locale archive, and a host locale it does not carry would make every program
 warn. Its default is UTF-8 already, which is what TUI drawing needs.
+
+### `--agent-allow` / `--agent-deny` (`develop` only) — a filtered agent
+
+`-A` forwards the whole agent, which hands a session every key you hold. A
+policy forwards a *view* of it instead:
+
+```sh
+nixct develop -A --agent-allow 'Github*' ~/project
+nixct develop -A --agent-deny 'Sudo*'   ~/project
+```
+
+A spec is a SHA256 fingerprint (as `ssh-add -l` prints it, with or without
+the `SHA256:` prefix) or a key comment, where `*` globs. Repeatable; the two
+are mutually exclusive — with both lists it would be unreadable which way an
+unlisted key falls, and that is not a good thing to guess about an ssh key.
+
+Filtered keys are removed from identity listings **and** refused for signing,
+so a client that already knows a key blob cannot use it by asking directly.
+Refusals never reach the upstream agent, so a key behind a confirmation
+prompt does not even flash one up.
+
+Independently of any policy, everything that would *change* the agent is
+refused: adding and removing identities, smartcard keys, and locking. A
+sandbox with borrowed keys has no business adding one, and locking would be a
+denial of service against the agent's real owner. Extensions are refused too
+(their semantics cannot be policed); `--allow-extensions` on the binary opts
+in.
+
+The filter — [`ssh-agent-filter`](ssh-agent-filter/), a small Rust proxy —
+runs **on the host**, one per session, and the container is handed only the
+socket it serves. A filter inside the container would sit on the wrong side
+of the boundary it enforces. It is torn down with the session by the host
+watchdog, so the grant does not outlive what it was granted to.
 
 ### `isolateLan` (build-time) — no route to the local network
 

@@ -1,0 +1,11 @@
+[package]
+name = "ssh-agent-filter"
+version = "0.1.0"
+edition = "2021"
+description = "Filtering ssh-agent proxy: exposes a restricted view of an upstream agent to an untrusted client"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true

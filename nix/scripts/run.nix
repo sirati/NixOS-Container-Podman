@@ -1027,6 +1027,47 @@ in
     return 0
   }
 
+  # start_agent_filter <mount-id> <upstream-sock>: run a filtering proxy in
+  # front of the agent and echo the socket it serves.
+  #
+  # Idempotent per session: a second shell joining reuses the running filter
+  # rather than starting a rival on the same path. The pid is recorded where
+  # the host watchdog looks, so the filter dies with the session - the socket
+  # must not outlive the session that was granted it.
+  start_agent_filter() {
+    local mount_id=$1 upstream=$2
+    local dir="$STATE_DIR/agent-filter"
+    local sock="$dir/$mount_id.sock" pid_file="$dir/$mount_id.pid"
+    mkdir -p "$dir"
+    chmod 0700 "$dir"
+    if [ -f "$pid_file" ] \
+       && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null \
+       && [ -S "$sock" ]; then
+      printf '%s\n' "$sock"
+      return 0
+    fi
+    local args=(--upstream "$upstream" --listen "$sock")
+    local spec
+    for spec in "''${agent_allow[@]+''${agent_allow[@]}}"; do
+      args+=(--allow "$spec")
+    done
+    for spec in "''${agent_deny[@]+''${agent_deny[@]}}"; do
+      args+=(--deny "$spec")
+    done
+    rm -f "$sock"
+    nohup ${tools.sshAgentFilter} "''${args[@]}" \
+      </dev/null >"$dir/$mount_id.log" 2>&1 &
+    disown
+    echo $! > "$pid_file"
+    local _i
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$sock" ] && { printf '%s\n' "$sock"; return 0; }
+      sleep 0.1
+    done
+    echo "develop: ssh-agent filter did not come up; see $dir/$mount_id.log" >&2
+    return 1
+  }
+
   # allow_git_dir <session-user> <uid> <gid> <container-path>: mark a path
   # trusted in the session global git config.
   #
@@ -1482,6 +1523,8 @@ in
       host_ports=()
       forward_agent=0
       agent_sock=""
+      agent_allow=()
+      agent_deny=()
       x11_mode=""
       wayland=0
       wprs=0
@@ -1517,6 +1560,12 @@ in
               echo "develop: --agent requires a socket path" >&2; exit 2
             fi
             agent_sock=$2; forward_agent=1; shift 2 ;;
+          --agent-allow|--agent-deny)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: $1 requires a key fingerprint or comment" >&2; exit 2
+            fi
+            if [ "$1" = "--agent-allow" ]; then agent_allow+=("$2"); else agent_deny+=("$2"); fi
+            shift 2 ;;
           --x11)             x11_mode=trusted; shift ;;
           --x11-untrusted)   x11_mode=untrusted; shift ;;
           --wayland)         wayland=1; shift ;;
@@ -2065,6 +2114,16 @@ in
       if [ "$forward_agent" -eq 1 ]; then
         # $agent_src was resolved and validated up front, before the git
         # config copy that --translate-gitconfig hooks into.
+        #
+        # With a policy, what gets forwarded is not the agent but a filtered
+        # view of it - and the filter runs HERE, on the host. That placement
+        # is the whole point: a filter inside the container would sit on the
+        # wrong side of the boundary it enforces, reachable by whatever it
+        # is meant to restrain. The container only ever sees the socket the
+        # filter serves, and never the real one.
+        if [ "''${#agent_allow[@]}" -gt 0 ] || [ "''${#agent_deny[@]}" -gt 0 ]; then
+          agent_src=$(start_agent_filter "$mount_id" "$agent_src") || exit 1
+        fi
         bind_socket "$mount_id" "ssh-agent" "$agent_src"
         spawn_socket_proxy "$mount_id" "ssh-agent" "$uid" "$gid"
         extra_setenv+=(--setenv="SSH_AUTH_SOCK=/run/sockets/$mount_id/ssh-agent")
@@ -2362,7 +2421,7 @@ in
           upper work merged nix-store-upper nix-store-work
           nix-store-lower.gcroot work-shared socket-mounts host-ports
           podman-root podman-runroot host-watchdog session-gcroots
-          wprs-viewers wayland-acl native-acl lower-mount fuse-store fuse-store.log
+          wprs-viewers wayland-acl native-acl agent-filter lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated
         "
         # Collapse the list to single-space-separated words: the literal

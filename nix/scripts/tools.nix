@@ -39,6 +39,9 @@
     socat         = "${pkgs.socat}/bin/socat";
     xauth         = "${pkgs.xauth}/bin/xauth";
     setfacl       = "${pkgs.acl}/bin/setfacl";
+    # Filtering ssh-agent proxy for --agent-allow / --agent-deny. Runs on
+    # the HOST: the container only ever sees the socket it serves.
+    sshAgentFilter = "${import ../ssh-agent-filter.nix { inherit pkgs; }}/bin/ssh-agent-filter";
 
     # Standard textproc
     sed           = "${pkgs.gnused}/bin/sed";
@@ -66,6 +69,7 @@
     socat         = "socat";
     xauth         = "xauth";
     setfacl       = "setfacl";
+    sshAgentFilter = "ssh-agent-filter";
 
     sed           = "sed";
     awk           = "awk";
