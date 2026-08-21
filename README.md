@@ -396,6 +396,24 @@ single netns, so the port can only be bound once. Anything running in the
 container can therefore reach that port: it is exactly as trusted as the
 service behind it. The host side is torn down with the container.
 
+### `--env KEY=VALUE` (`develop` only) — session environment
+
+Sets `KEY` in the session shell. Repeatable. `$HOME` in the value expands to
+the session HOME — the only way to name it, since the session user is derived
+from the project path. Nothing else is expanded.
+
+```sh
+nixct develop --env 'CLAUDE_CONFIG_DIR=$HOME/.claude' ~/project
+```
+
+A container can declare it: `sessionEnv = { CLAUDE_CONFIG_DIR = "$HOME/.claude"; }`.
+
+That example is the useful one for a tool that splits its state between a
+directory and a dotfile beside it: a `--share` carries directories, and a file
+cannot be shared in its place if the tool rewrites it by rename (which replaces
+the inode, so a bind mount or symlink of the file stops tracking it). Pointing
+the tool at one directory puts both inside the share.
+
 ### `-D, --develop-arg ARG` (`develop` only) — arguments for `nix develop`
 
 Appends an argument to the `nix develop` the session starts with; repeatable.

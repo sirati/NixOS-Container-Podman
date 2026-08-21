@@ -148,6 +148,9 @@
           #   [ "--agent" "$HOME/.1password/agent.sock" "--mount-gitconfig" ]
           # Shell-expanded and prepended to every `develop` command line.
         , sessionFlags ? [ ]
+          # Environment for every develop session, as { KEY = "VALUE"; }.
+          # $HOME in a value expands to the session HOME. Same as `--env`.
+        , sessionEnv ? { }
         }:
         let
           hostHasNvidiaContainerToolkit = gpu.hostHasToolkit or false;
@@ -250,6 +253,8 @@
             # drives both NixOS and portable tarball targets; the `tools`
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
+              sessionEnv = map (k: "${k}=${builtins.getAttr k sessionEnv}")
+                               (builtins.attrNames sessionEnv);
               inherit tools rootfs toplevel shellUser name idleTimeout sessionTemplates
                       sessionShares developArgs sessionFlags
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
@@ -426,10 +431,11 @@
         , sessionShares ? [ ]        # host dirs shared into every session HOME
         , developArgs ? [ ]          # default args for the session nix develop
         , sessionFlags ? [ ]         # default flags for `develop` itself
+        , sessionEnv ? { }           # environment for every develop session
         }:
         mkContainer {
           inherit name idleTimeout runName sessionTemplates
-                  sessionShares developArgs sessionFlags;
+                  sessionShares developArgs sessionFlags sessionEnv;
           modules = [ ./nix/nixct-system.nix ]
             ++ nixpkgs.lib.optional (packages != [ ]) { environment.systemPackages = packages; }
             ++ modules;

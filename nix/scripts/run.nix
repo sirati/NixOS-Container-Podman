@@ -52,6 +52,10 @@
   # them without typing them. NOT the same as developArgs, which go to the
   # `nix develop` inside the session.
 , sessionFlags ? [ ]
+  # Environment for every develop session, as a list of "KEY=VALUE". $HOME
+  # in a value expands to the session HOME. See `--env` for the runtime
+  # version.
+, sessionEnv ? [ ]
 , hostHasNvidiaContainerToolkit ? false
 , useKeepId ? false
 , keepIdUid ? 1000
@@ -141,6 +145,14 @@ let
       mkdir -p -- "$_s" 2>/dev/null || true
       share_specs+=("$_s:${s.name}:${s.mode or "rw"}")
     '') sessionShares);
+
+  # Container-declared session environment, one KEY=VALUE per entry.
+  # $HOME in a value is expanded to the session HOME at run time, which
+  # is the only way to name it: the session user is derived from the
+  # project path, so its home is not known when this is written.
+  sessionEnvLines =
+    builtins.concatStringsSep "" (map (e:
+      "env_specs+=(" + shellQuote e + ")\n      ") sessionEnv);
 
   # Container-declared default flags for `develop`, prepended to the command
   # line. Double-quoted so paths can be written relative to $HOME.
@@ -1485,6 +1497,9 @@ in
       # both, so a session can add to what the container already provides.
       share_specs=()
       ${sessionShareLines}
+      # Session environment (mkContainer `sessionEnv`), plus any --env.
+      env_specs=()
+      ${sessionEnvLines}
       develop_args=()
       ${developArgLines}
       while [ $# -gt 0 ]; do
@@ -1520,6 +1535,11 @@ in
               echo "develop: --template requires <hostpath>[:<name>]" >&2; exit 2
             fi
             template_specs+=("$2"); shift 2 ;;
+          --env)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --env requires KEY=VALUE" >&2; exit 2
+            fi
+            env_specs+=("$2"); shift 2 ;;
           --share)
             if [ -z "''${2:-}" ]; then
               echo "develop: --share requires <hostpath>[:<name>][:ro|:rw]" >&2; exit 2
@@ -1833,6 +1853,27 @@ in
       home_dir="/develop-home/$session_user"
       proj_dir="$home_dir/dev"
       extra_setenv=()
+
+      # `--env KEY=VALUE`: environment for the session shell.
+      #
+      # $HOME is expanded here, to the session HOME, because that is the
+      # only place it can be: the session user is derived from the project
+      # path, so whoever writes the value cannot know the path it will
+      # have. Nothing else is expanded - the value is otherwise literal.
+      for spec in "''${env_specs[@]+''${env_specs[@]}}"; do
+        case "$spec" in
+          *=*) ;;
+          *) echo "develop: --env: not KEY=VALUE: $spec" >&2; exit 2 ;;
+        esac
+        e_key=''${spec%%=*}
+        case "$e_key" in
+          ""|*[!A-Za-z0-9_]*)
+            echo "develop: --env: not a variable name: $e_key" >&2; exit 2 ;;
+        esac
+        e_val=''${spec#*=}
+        e_val=''${e_val//\$HOME/$home_dir}
+        extra_setenv+=(--setenv="$e_key=$e_val")
+      done
 
       # `--template <hostpath>[:<name>]`: a host directory handed to the
       # session as a TEMPLATE at ~/<name>, next to ~/dev.
@@ -2531,6 +2572,10 @@ in
                                 names give separate templates, the same
                                 name twice stacks the host dirs as overlay
                                 lowers (earlier wins).
+    --env KEY=VALUE             set KEY in the session shell. Repeatable.
+                                \$HOME in the value expands to the session
+                                HOME - the only way to name it, since the
+                                session user comes from the project path.
     --native                    mount the project directly instead of
                                 through bindfs, so the session gets the
                                 real filesystem: reflinks (FICLONE), native

@@ -117,6 +117,16 @@ in {
         session can write but nothing reaches the host and nothing survives.
       '';
     };
+    sessionEnv = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = { CLAUDE_CONFIG_DIR = "$HOME/.claude"; };
+      description = ''
+        Environment for every develop session. `$HOME` in a value expands to
+        the session HOME, which is the only way to name it - the session user
+        is derived from the project path, so its home is not known here.
+      '';
+    };
     developArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -128,7 +138,8 @@ in {
       description = "The built nixct package (binary `nixct`). Defaults to one built from the options above.";
       default = (mkNixct {
         inherit (cfg) name packages modules
-                      sessionFlags sessionShares sessionTemplates developArgs;
+                      sessionFlags sessionShares sessionTemplates developArgs
+                      sessionEnv;
         idleTimeout = if cfg.service.enable then 0 else cfg.idleTimeoutSeconds;
         gpuHasToolkit = cfg.gpu.hostHasToolkit;
       }).run;
