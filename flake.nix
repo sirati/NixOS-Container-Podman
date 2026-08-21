@@ -274,6 +274,7 @@
               nixStoreLower = if effectiveHostNixStore && !hostNixDaemon
                               then "${nixStoreLower}" else null;
               hostWatchdogPath = "${hostWatchdogScript}";
+              gitServeHooks = "${import ./nix/git-serve-hooks.nix { inherit pkgs; }}";
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
               # Bridge the storage axis to run.nix's stateDirLine: ephemeral
               # storage puts STATE_DIR (overlay upper/work) on tmpfs; all

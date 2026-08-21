@@ -116,6 +116,14 @@ in
   # The host-side ssh-agent filter for this session (--agent-allow /
   # --agent-deny). It holds a socket that grants the use of the user's
   # keys, so it must not outlive the session it was granted to.
+  # The host-side git daemon for this session (--git-serve). It serves the
+  # real repository, so it must not outlive the session it was serving.
+  GIT_SERVE_PID="$STATE_DIR/git-serve/$MOUNT_ID.pid"
+  if [ -f "$GIT_SERVE_PID" ]; then
+    kill "$(${bin "cat"} "$GIT_SERVE_PID" 2>/dev/null)" 2>/dev/null || true
+    ${bin "rm"} -f -- "$GIT_SERVE_PID" "$STATE_DIR/git-serve/$MOUNT_ID.sock"
+  fi
+
   AGENT_FILTER_PID="$STATE_DIR/agent-filter/$MOUNT_ID.pid"
   if [ -f "$AGENT_FILTER_PID" ]; then
     kill "$(${bin "cat"} "$AGENT_FILTER_PID" 2>/dev/null)" 2>/dev/null || true

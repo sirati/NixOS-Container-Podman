@@ -372,6 +372,43 @@ resolves.
 locale archive, and a host locale it does not carry would make every program
 warn. Its default is UTF-8 already, which is what TUI drawing needs.
 
+### `--git-serve BRANCH[:PUSH-GLOB]` (`develop` only) — a remote, not a mount
+
+Instead of mounting the project, serve it to the session as a git remote:
+
+```sh
+nixct develop --git-serve 'main:main-*' ~/project
+```
+
+`~/dev` becomes a **clone**, not the real tree. The session reads only
+`BRANCH` — every other ref is hidden, so the rest of the history is not
+merely unwritable but invisible — and can push only branches matching
+`PUSH-GLOB` (default: `BRANCH` itself). Nothing it does can touch a ref
+outside that, and a mistake lands in its own clone rather than in your
+working tree.
+
+Both halves are git's own, and neither writes to the served repository:
+
+| | mechanism |
+|---|---|
+| read | `uploadpack.hideRefs` — hides every ref but `BRANCH` |
+| write | a `pre-receive` hook matching the branch against `PUSH-GLOB` |
+
+The split is forced: git refuses to update a *hidden* ref at all, so
+`hideRefs` cannot express a push policy wider than one exact branch, and the
+hook does that job instead. Both arrive through `GIT_CONFIG_SYSTEM` on the
+daemon, so the repository keeps its own config and hooks untouched.
+
+The daemon runs on the **host** and is reached through a unix socket bound
+into the container, with a TCP proxy on the far side because `git://` has no
+unix-socket form. The container has its own netns, so `127.0.0.1:9418` there
+is reachable by nothing else. It is torn down with the session.
+
+Needs `git` in the container package set. Pushing to the branch that is
+checked out on the host is refused by git itself (`receive.denyCurrentBranch`),
+which is why a postfix glob is the useful shape: the session works on
+`main-something` and you merge it yourself.
+
 ### `--agent-allow` / `--agent-deny` (`develop` only) — a filtered agent
 
 `-A` forwards the whole agent, which hands a session every key you hold. A

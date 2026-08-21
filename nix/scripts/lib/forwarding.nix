@@ -156,6 +156,36 @@
         ' >/dev/null
   }
 
+
+  # spawn_tcp_proxy <namespace> <name> <port>: expose a forwarded unix
+  # socket as a TCP port on the container's loopback.
+  #
+  # For protocols that only speak TCP. git is the case in point: `git://`
+  # has no unix-socket form, so a session cannot reach a host-side git
+  # daemon without one end being a port. It is safe because the container
+  # has its OWN netns - 127.0.0.1 there is reachable by nothing else - and
+  # the far end is still the single unix socket the host chose to bind.
+  spawn_tcp_proxy() {
+    local ns=$1 name=$2 port=$3
+    local unit="tcp-proxy-''${ns}-''${name}.service"
+    if pm exec -u root "$NAME" \
+        /run/current-system/sw/bin/systemctl is-active --quiet \
+        "$unit" 2>/dev/null; then
+      return 0
+    fi
+    # shellcheck disable=SC2016
+    pm exec -u root "$NAME" \
+      /run/current-system/sw/bin/systemd-run \
+        --unit="$unit" --collect --quiet \
+        --setenv=NS="$ns" --setenv=NAME="$name" --setenv=PORT="$port" \
+        --setenv=PATH=/run/current-system/sw/bin:/run/wrappers/bin \
+        /run/current-system/sw/bin/bash -c '
+          exec socat \
+            TCP-LISTEN:"$PORT",bind=127.0.0.1,fork,reuseaddr \
+            UNIX-CONNECT:"/hostmnts/.sockets/$NS/$NAME"
+        ' >/dev/null
+  }
+
   # ensure_xdg_runtime <uid> <gid>: create /run/user/<uid> owned
   # by the session user, mode 0700. Many GUI apps (Firefox,
   # Wayland clients, dbus libs) hard-require XDG_RUNTIME_DIR.

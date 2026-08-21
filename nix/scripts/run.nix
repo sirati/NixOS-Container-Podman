@@ -62,6 +62,8 @@
 , keepIdGid ? 100
 , hostWatchdogPath
 , checkHostCompatPath  # absolute path to check-host-compat executable
+  # gitServeHooks: store path of the hook dir for `develop --git-serve`.
+, gitServeHooks ? null
   # OCI-runtime flag passed to podman (in pm() + direct podman runs).
   # NixOS: full /nix/store path to crun, pinned at build time. Portable:
   # empty so podman uses whatever it's configured for (typically runc
@@ -1027,6 +1029,62 @@ in
     return 0
   }
 
+  # start_git_server <mount-id> <hostpath> <branch> <push-glob>: serve a
+  # host repository to a session over git://, instead of mounting it.
+  #
+  # A mount gives a session the whole working tree and its whole history,
+  # and any damage it does lands directly in the real repository. A git
+  # remote gives it a transport instead: it clones what it is allowed to
+  # read, works in its own copy, and pushes back only where policy allows.
+  # Nothing it does can touch a ref outside that.
+  #
+  # Both halves are git's own, and neither writes to the served repo:
+  #   read  - uploadpack.hideRefs hides every ref but the one branch, so a
+  #           clone cannot even see the rest of the history.
+  #   write - a pre-receive hook, because git refuses to update a HIDDEN
+  #           ref at all, which makes hideRefs unusable for a push policy
+  #           that is wider than one exact branch.
+  # Both arrive through GIT_CONFIG_SYSTEM on the daemon, so the repository
+  # keeps its own config and hooks untouched.
+  start_git_server() {
+    local mount_id=$1 hostpath=$2 branch=$3 glob=$4
+    local dir="$STATE_DIR/git-serve"
+    local sock="$dir/$mount_id.sock" pid_file="$dir/$mount_id.pid"
+    local cfg="$dir/$mount_id.gitconfig"
+    mkdir -p "$dir"
+    chmod 0700 "$dir"
+    if [ -f "$pid_file" ] \
+       && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null \
+       && [ -S "$sock" ]; then
+      return 0
+    fi
+    {
+      printf '[uploadpack]\n'
+      printf '\thideRefs = refs\n'
+      printf '\thideRefs = !refs/heads/%s\n' "$branch"
+      printf '[core]\n'
+      printf '\thooksPath = %s\n' "${gitServeHooks}"
+    } > "$cfg"
+    rm -f "$sock"
+    # --export-all rather than a git-daemon-export-ok marker: writing that
+    # marker would mean writing into the served repository, which is the
+    # one thing this mode exists to avoid. The socket is 0600 and is only
+    # ever bound into this one session.
+    GIT_CONFIG_SYSTEM="$cfg" NIXCT_GIT_PUSH_GLOB="$glob" \
+      nohup ${tools.socat} "UNIX-LISTEN:$sock,fork,mode=0600" \
+        "EXEC:${tools.git} daemon --inetd --export-all --enable=receive-pack --base-path=$hostpath" \
+        </dev/null >"$dir/$mount_id.log" 2>&1 &
+    disown
+    echo $! > "$pid_file"
+    local _i
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      [ -S "$sock" ] && return 0
+      sleep 0.1
+    done
+    echo "develop: git server did not come up; see $dir/$mount_id.log" >&2
+    return 1
+  }
+
   # start_agent_filter <mount-id> <upstream-sock>: run a filtering proxy in
   # front of the agent and echo the socket it serves.
   #
@@ -1456,7 +1514,6 @@ in
       dev_gid=100
 
       exec_env=()
-
       if [ "$forward_agent" -eq 1 ]; then
         if [ -z "''${SSH_AUTH_SOCK:-}" ] || [ ! -S "$SSH_AUTH_SOCK" ]; then
           echo "enter: -A given but SSH_AUTH_SOCK is unset/invalid" >&2
@@ -1525,6 +1582,8 @@ in
       agent_sock=""
       agent_allow=()
       agent_deny=()
+      git_serve_branch=""
+      git_serve_glob=""
       x11_mode=""
       wayland=0
       wprs=0
@@ -1565,6 +1624,18 @@ in
               echo "develop: $1 requires a key fingerprint or comment" >&2; exit 2
             fi
             if [ "$1" = "--agent-allow" ]; then agent_allow+=("$2"); else agent_deny+=("$2"); fi
+            shift 2 ;;
+          --git-serve)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --git-serve requires <branch>[:<push-glob>]" >&2; exit 2
+            fi
+            case "$2" in
+              *:*) git_serve_branch=''${2%%:*}; git_serve_glob=''${2#*:} ;;
+              *)   git_serve_branch=$2;        git_serve_glob=$2 ;;
+            esac
+            if [ -z "$git_serve_branch" ]; then
+              echo "develop: --git-serve: empty branch" >&2; exit 2
+            fi
             shift 2 ;;
           --x11)             x11_mode=trusted; shift ;;
           --x11-untrusted)   x11_mode=untrusted; shift ;;
@@ -1671,7 +1742,11 @@ in
 
       mount_id=$(compute_mount_id "$hostpath")
 
-      bind_workdir "$hostpath" "$mount_id"
+      # With --git-serve the project is never mounted, so there is nothing
+      # to bind: the daemon reads the repository on the host directly.
+      if [ -z "$git_serve_branch" ]; then
+        bind_workdir "$hostpath" "$mount_id"
+      fi
 
       # One SESSION per project path (user, home, binds, forwards,
       # watchdogs - all keyed on $mount_id), but any number of SHELLS in it.
@@ -1790,6 +1865,7 @@ in
       # to no effect - and print a native line for a session that is on
       # bindfs. Whichever way the first shell went is what the session is.
       project_native=0
+      if [ -n "$git_serve_branch" ]; then native_project=0; fi
       if [ "$native_project" -eq 1 ] \
          && ! already_mounted "/develop-home/$session_user/dev" \
          && use_native "$hostpath" "$uid" "$gid" "native"; then
@@ -1827,7 +1903,12 @@ in
           cp /etc/nix-dev-container/bashrc "$home_dir/.bashrc"
           chown "$3:$4" "$home_dir/.bashrc"
           chmod 0644 "$home_dir/.bashrc"
-          if ! mountpoint -q "$proj_dir" && [ "$5" != "1" ]; then
+          if [ "$7" = "1" ]; then
+            # --git-serve: ~/dev is an empty directory owned by the session,
+            # to clone into. Nothing of the host repository is mounted.
+            chown "$3:$4" "$proj_dir"
+            chmod 0700 "$proj_dir"
+          elif ! mountpoint -q "$proj_dir" && [ "$5" != "1" ]; then
             # --multithreaded is NOT the bindfs default: without it one thread
             # serves every request for this project, so parallel builds
             # queue behind each other on a single FUSE daemon (46 requests
@@ -1835,7 +1916,8 @@ in
             bindfs --multithreaded --map=0/$3:@0/@$4 --perms="og=" \
               -o allow_other "$src" "$proj_dir"
           fi
-        ' bash "$session_user" "$mount_id" "$uid" "$gid" "$project_native"
+        ' bash "$session_user" "$mount_id" "$uid" "$gid" "$project_native" \
+          "" "$( [ -n "$git_serve_branch" ] && echo 1 || echo 0 )"
       if [ "$project_native" -eq 1 ]; then
         bind_native "/hostmnts/$mount_id" "/develop-home/$session_user/dev" rw
         allow_git_dir "$session_user" "$uid" "$gid" "/develop-home/$session_user/dev" "$fw_git_cfg"
@@ -2110,6 +2192,46 @@ in
       # rest.
       develop_cmd="rm -f $joiner_marker 2>/dev/null; $develop_cmd"
 
+
+      # --git-serve: the project reaches the session as a git remote rather
+      # than a mount. Bridged the same way the ssh-agent is - a host unix
+      # socket bound into the container - with a TCP proxy on the far side
+      # because git:// has no unix-socket form. The container has its own
+      # netns, so that port is reachable by nothing else.
+      if [ -n "$git_serve_branch" ]; then
+        start_git_server "$mount_id" "$hostpath" \
+                         "$git_serve_branch" "$git_serve_glob" || exit 1
+        bind_socket "$mount_id" "git" "$STATE_DIR/git-serve/$mount_id.sock"
+        spawn_tcp_proxy "$mount_id" "git" 9418
+        extra_setenv+=(--setenv="NIXCT_GIT_REMOTE=git://127.0.0.1/")
+        # Cloned for the session, not left to it: ~/dev is where `nix
+        # develop` runs, so an empty one would just fail to find a flake.
+        # Done as the session user so the working tree is its own.
+        # shellcheck disable=SC2016
+        if ! pm exec -u root "$NAME" \
+             /run/current-system/sw/bin/setpriv \
+               --reuid="$uid" --regid="$gid" --clear-groups \
+               /run/current-system/sw/bin/bash -c '
+                 set -e
+                 export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+                 # setpriv changes credentials, not the environment, so
+                 # HOME is still the one root had; git would go looking in
+                 # /root for its config and warn about every file there.
+                 export HOME=$3
+                 command -v git >/dev/null 2>&1 || {
+                   echo "develop: --git-serve needs git in the container package set" >&2
+                   exit 1
+                 }
+                 git clone --quiet --branch "$2" "$1" "$3/dev"
+               ' bash "git://127.0.0.1/" "$git_serve_branch" "$home_dir"; then
+          echo "develop: --git-serve: clone into the session failed" >&2
+          exit 1
+        fi
+        echo "git-serve: $hostpath -> git://127.0.0.1/ in the session"
+        echo "  readable: branch $git_serve_branch (every other ref hidden)"
+        echo "  pushable: $git_serve_glob"
+        echo "  ~/dev is a clone, not a mount; push to reach the host repo"
+      fi
 
       if [ "$forward_agent" -eq 1 ]; then
         # $agent_src was resolved and validated up front, before the git
@@ -2421,7 +2543,7 @@ in
           upper work merged nix-store-upper nix-store-work
           nix-store-lower.gcroot work-shared socket-mounts host-ports
           podman-root podman-runroot host-watchdog session-gcroots
-          wprs-viewers wayland-acl native-acl agent-filter lower-mount fuse-store fuse-store.log
+          wprs-viewers wayland-acl native-acl agent-filter git-serve lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated
         "
         # Collapse the list to single-space-separated words: the literal
