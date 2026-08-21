@@ -317,6 +317,21 @@ native: no reflink or ACL support here - using bindfs
 
 so turning it on is never what breaks a session. `--no-native` forces bindfs.
 
+**git needs telling.** Ownership is deliberately untouched, so the project
+keeps its host owner - uid 0 inside the container, not the session user - and
+both git and libgit2 refuse a repository owned by somebody else
+(CVE-2022-24765). Since nix fetches a flake through libgit2, a native session
+could not evaluate the flake it is standing in. `nixct` therefore writes
+`safe.directory` for each native mount into the session `~/.gitconfig`, which
+is the only scope git honours it from. `--mount-gitconfig` puts your copied
+config at `~/.config/git/config` so the two never contend for one file; git
+reads both.
+
+Chowning the mount instead is not an option, and not an oversight: a bind
+mount shares the inode, so `chown` inside the container changes the *host*
+directory. The project would stop being yours, and host-side git would then
+reject it for the same reason - the problem moves rather than goes away.
+
 What it costs, and why it is opt-in:
 
 | | bindfs (default) | `--native` |
@@ -651,7 +666,9 @@ for the login session, disabling idle shutdown.
 - `--mount-bashrc` copies the host `~/.bashrc` into the session as read-only
   `~/.bashrc.user`, which the framework `~/.bashrc` sources (it always sets up
   direnv regardless).
-- `--mount-gitconfig` copies the host `~/.gitconfig` in read-only.
+- `--mount-gitconfig` copies the host git config in read-only, as
+  `~/.config/git/config` (git reads it there too, which leaves `~/.gitconfig`
+  for the framework — see [`--native`](#--native-develop-only--the-real-filesystem-not-fuse)).
 
 Both skip silently if the host file is absent.
 

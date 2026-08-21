@@ -989,6 +989,36 @@ in
     return 0
   }
 
+  # allow_git_dir <session-user> <uid> <gid> <container-path>: mark a path
+  # trusted in the session global git config.
+  #
+  # A native mount is a plain bind, so the directory keeps its HOST owner,
+  # which inside the container is uid 0 - not the session user. Both git
+  # and libgit2 refuse to open a repository owned by somebody else
+  # (CVE-2022-24765), and nix fetches a flake through libgit2, so without
+  # this a native session cannot evaluate the flake it is standing in.
+  # The ACL grants access but deliberately does not change ownership, so
+  # this is the piece that has to say the ownership is expected.
+  #
+  # safe.directory only counts from a PROTECTED config - system or global,
+  # never the repository - which is why this goes in ~/.gitconfig. The
+  # host copy from --mount-gitconfig lives at ~/.config/git/config so the
+  # two never contend for one file; git reads both.
+  allow_git_dir() {
+    # shellcheck disable=SC2016
+    pm exec -u root "$NAME" \
+      /run/current-system/sw/bin/bash -c '
+        export PATH=/run/current-system/sw/bin
+        set -e
+        cfg=/develop-home/$1/.gitconfig
+        [ -f "$cfg" ] || printf "[safe]\n" > "$cfg"
+        grep -qxF "  directory = $4" "$cfg" \
+          || printf "  directory = %s\n" "$4" >> "$cfg"
+        chown "$2:$3" "$cfg"
+        chmod 0644 "$cfg"
+      ' bash "$1" "$2" "$3" "$4"
+  }
+
   # already_mounted <container-path>: is something already mounted there?
   already_mounted() {
     pm exec -u root "$NAME" \
@@ -1665,6 +1695,7 @@ in
         ' bash "$session_user" "$mount_id" "$uid" "$gid" "$project_native"
       if [ "$project_native" -eq 1 ]; then
         bind_native "/hostmnts/$mount_id" "/develop-home/$session_user/dev" rw
+        allow_git_dir "$session_user" "$uid" "$gid" "/develop-home/$session_user/dev"
         echo "native: $hostpath -> /develop-home/$session_user/dev (plain bind; reflinks work)"
       fi
 
@@ -1680,15 +1711,20 @@ in
         ' bash "$session_user" ".bashrc.user" "$uid" "$gid" < "$HOME/.bashrc"
       fi
       # git reads ~/.gitconfig OR $XDG_CONFIG_HOME/git/config, and a
-      # home-manager setup typically only has the latter - so look in both
-      # and reproduce whichever exists at the same place in the session.
+      # home-manager setup typically only has the latter - so look in both.
+      #
+      # The copy always lands at the XDG path, wherever it came from. git
+      # reads both files (the XDG one is not shadowed by ~/.gitconfig -
+      # only *writes* pick one), which leaves ~/.gitconfig free for the
+      # framework to own. That matters for safe.directory, which a native
+      # mount needs and which only counts from a protected config: two
+      # writers on one file would mean merging into a copy of yours.
       if [ "$mount_gitconfig" -eq 1 ]; then
-        git_src="" git_dst=""
+        git_src="" git_dst=".config/git/config"
         if [ -f "$HOME/.gitconfig" ]; then
-          git_src="$HOME/.gitconfig"; git_dst=".gitconfig"
+          git_src="$HOME/.gitconfig"
         elif [ -f "''${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
           git_src="''${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
-          git_dst=".config/git/config"
         fi
         if [ -n "$git_src" ]; then
           # shellcheck disable=SC2016
@@ -1851,6 +1887,8 @@ in
            && use_native "$s_host" "$uid" "$gid" "share $s_name"; then
           bind_native "/hostmnts/$mount_id.$s_name" \
                       "/develop-home/$session_user/$s_name" "$s_mode"
+          allow_git_dir "$session_user" "$uid" "$gid" \
+                        "/develop-home/$session_user/$s_name"
           echo "share: $s_host -> $home_dir/$s_name (native; reflinks work)"
           continue
         fi
@@ -2447,9 +2485,12 @@ in
     --mount-bashrc              copy the host \$HOME/.bashrc into the
                                 session HOME as ~/.bashrc.user (0444),
                                 sourced by the framework ~/.bashrc.
-    --mount-gitconfig           copy the host \$HOME/.gitconfig into the
-                                session HOME (0444). Both skip silently
-                                if the host file is absent.
+    --mount-gitconfig           copy the host git config into the session
+                                HOME as ~/.config/git/config (0444). git
+                                reads it there too, which leaves
+                                ~/.gitconfig for the framework - see
+                                --native. Both skip silently if the host
+                                file is absent.
     --wprs                      run wprsd INSIDE the session instead of
                                 sharing the real Wayland socket (what
                                 --wayland does): the untrusted session
