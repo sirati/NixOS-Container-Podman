@@ -265,102 +265,40 @@ session. It can never land in one that is being dismantled.
 
 ### `--native` (`develop` only) — the real filesystem, not FUSE
 
-By default a session sees its project through **bindfs**, because ownership
-names exactly one uid: the host directory belongs to you, which inside the
-container is uid 0, so the session user could not write it. bindfs rewrites
-ownership on the fly.
-
-That rewrite costs the filesystem itself. A FUSE `ioctl` cannot carry the
-source fd that `FICLONE` needs, so **reflinks are impossible through bindfs**
-no matter what backs it — a copy-on-write filesystem silently degrades to
-whole-file copies. The FUSE daemon is also a shared ceiling on how many files
-the whole session can hold open at once.
-
-`--native` mounts the project as a plain bind instead:
+bindfs rewrites ownership so a session user can write the project. A FUSE
+`ioctl` cannot carry the fd `FICLONE` needs, so reflinks are impossible through
+it and a copy-on-write filesystem degrades to whole-file copies.
 
 ```sh
 nixct develop --native ~/project
 ```
 
-Access comes from an **ACL** rather than from rewritten ownership. A POSIX ACL
-can name a second uid, which is the piece plain ownership was missing. The
-container's id map already pairs each container id with a host id — with
-`--userns=keep-id`, container 0 is you and container 1.. is your subuid range
-— so the session user has a real host uid, and granting *that* uid `rwx` lets
-it in without touching ownership:
+Mounts the project as a plain bind instead. Access comes from an ACL rather
+than rewritten ownership: the container id map already gives the session user a
+real host uid, so granting *that* uid `rwx` — plus default entries, so you keep
+access to what the session creates — lets it in with ownership untouched. An
+idmapped mount would be the obvious alternative; the kernel refuses it rootless
+(`CAP_SYS_ADMIN` in the superblock's user namespace).
 
-```
-setfacl    -m u:<mapped-uid>:rwX   <hostdir>   # the session user gets in
-setfacl -d -m u:<mapped-uid>:rwx   <hostdir>   # ...and so does what it creates
-setfacl -d -m u:<you>:rwx          <hostdir>   # you keep access to what it leaves
-```
-
-The third line is not decoration: files a session creates are owned on the
-host by the mapped subuid, and without an inherited entry for you they would
-land in your tree unwritable.
-
-An **idmapped mount** would be the obvious alternative and is not available
-here — the kernel requires `CAP_SYS_ADMIN` in the user namespace owning the
-superblock, which for a host filesystem is the initial namespace, and a
-rootless container is not in it. (`mount_setattr` returns `EPERM`.)
-
-**It is probed, not assumed.** Reflink support is a property of the mount, the
-kernel build and sometimes the mkfs options — xfs without `reflink=1`, btrfs
-on a kernel without it — so a table of filesystem names would get every one of
-those wrong. `nixct` writes one 4 KiB file, tries the ioctl, tries an ACL, and
-removes them. A directory that fails either probe **falls back to bindfs**,
-which works everywhere, and says so:
-
-```
-native: no reflink or ACL support here - using bindfs
-```
-
-so turning it on is never what breaks a session. `--no-native` forces bindfs.
-
-**git needs telling.** Ownership is deliberately untouched, so the project
-keeps its host owner - uid 0 inside the container, not the session user - and
-both git and libgit2 refuse a repository owned by somebody else
-(CVE-2022-24765). Since nix fetches a flake through libgit2, a native session
-could not evaluate the flake it is standing in. `nixct` therefore records each
-native mount as a `safe.directory`, which git only honours from a *protected*
-config — system or global, never the repository itself.
-
-git defines **two** global-scope files, `~/.gitconfig` and
-`$XDG_CONFIG_HOME/git/config`, reads both, and merges them; the second is not
-shadowed by the first (only *writes* pick one). So `--mount-gitconfig` puts
-your copy wherever it sat on the host, and the framework stanza goes in
-whichever of the two is left. Nothing ever contends for one file, and a tool
-that parses `~/.gitconfig` by hand still finds your config there if that is
-where you keep it.
-
-Chowning the mount instead is not an option, and not an oversight: a bind
-mount shares the inode, so `chown` inside the container changes the *host*
-directory. The project would stop being yours, and host-side git would then
-reject it for the same reason - the problem moves rather than goes away.
-
-What it costs, and why it is opt-in:
+Probed, not assumed: one 4 KiB file, an ioctl, an ACL. A directory failing
+either falls back to bindfs and says so, so turning it on cannot break a
+session. `--no-native` forces bindfs.
 
 | | bindfs (default) | `--native` |
 |---|---|---|
 | reflink / `FICLONE` | ✗ | ✓ |
-| SQLite WAL, `mmap`, `O_DIRECT` | through FUSE | native |
 | open-file ceiling | shared FUSE daemon pool | none |
-| files a session creates | owned by you | owned by the mapped subuid (you keep `rwx`) |
-| hidden from other session users | ✓ (`--perms="og="`) | ✗ — real host permissions apply |
+| files a session creates | owned by you | mapped subuid (you keep `rwx`) |
+| hidden from other sessions | ✓ (`--perms="og="`) | ✗ — host permissions apply |
 
-The last two rows are the trade. A plain bind cannot hide the tree the way
-bindfs does, so on a multi-session container a native project is as visible to
-other sessions as its host permissions make it. And the ACL stays on the
-directory after the session — it names a uid in your own subuid range, so it
-grants nothing to anyone else, but it is a persistent change to your tree.
+Ownership stays with the host, so git and libgit2 reject the repository
+(CVE-2022-24765) and nix fetches flakes through libgit2. Each native mount is
+therefore recorded as a `safe.directory` in whichever global config
+`--mount-gitconfig` did not take. Chowning instead is not an option: a bind
+shares the inode, so it would chown your host directory.
 
-Shares take the same mode, `--share hostpath[:name]:native`, and a container
-can declare it:
-
-```nix
-sessionShares = [{ host = "$HOME/.cache/build"; name = ".build"; mode = "native"; }];
-sessionFlags  = [ "--native" ];   # every session, project included
-```
+Shares take the same mode — `--share hostpath[:name]:native`, or
+`mode = "native"` in `sessionShares`.
 
 ### `--share hostpath[:name][:ro|:rw|:native]` (`develop` only) — a real shared dir
 
@@ -672,22 +610,14 @@ for the login session, disabling idle shutdown.
 - `--mount-bashrc` copies the host `~/.bashrc` into the session as read-only
   `~/.bashrc.user`, which the framework `~/.bashrc` sources (it always sets up
   direnv regardless).
-- `--mount-gitconfig` copies the host git config in read-only, to the same
-  place it sits on the host (`~/.gitconfig` or `~/.config/git/config`). git
-  reads both as global scope and merges them, so the framework takes whichever
-  one is left for its own stanza — see
-  [`--native`](#--native-develop-only--the-real-filesystem-not-fuse).
-- `--translate-gitconfig` does the same, but rewrites the forwarded agent
-  socket on the way in. A host config that names the agent *by path* — an
-  `IdentityAgent` inside a `core.sshCommand`, a signing helper pointed at it —
-  carries a path the session does not have, while the same agent is reachable
-  there at `/run/sockets/<id>/ssh-agent`. Needs `-A` or `--agent`; a config
-  that says `$SSH_AUTH_SOCK` is already correct and is left alone.
-
-  ```
-  host    core.sshCommand = ssh -o IdentityAgent=/home/you/.1password/agent.sock
-  session core.sshCommand = ssh -o IdentityAgent=/run/sockets/proj-1a2b3c4d/ssh-agent
-  ```
+- `--mount-gitconfig` copies the host git config in read-only, to the same place
+  it sits on the host. git reads `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`
+  both as global scope, so the framework takes whichever is left for its
+  `safe.directory` stanza (see
+  [`--native`](#--native-develop-only--the-real-filesystem-not-fuse)).
+- `--translate-gitconfig` does the same and rewrites the `-A` agent socket path
+  to the one the session has (`/run/sockets/<id>/ssh-agent`) — for a config that
+  names the agent by path rather than by `$SSH_AUTH_SOCK`.
 
 Both skip silently if the host file is absent.
 
