@@ -321,11 +321,17 @@ so turning it on is never what breaks a session. `--no-native` forces bindfs.
 keeps its host owner - uid 0 inside the container, not the session user - and
 both git and libgit2 refuse a repository owned by somebody else
 (CVE-2022-24765). Since nix fetches a flake through libgit2, a native session
-could not evaluate the flake it is standing in. `nixct` therefore writes
-`safe.directory` for each native mount into the session `~/.gitconfig`, which
-is the only scope git honours it from. `--mount-gitconfig` puts your copied
-config at `~/.config/git/config` so the two never contend for one file; git
-reads both.
+could not evaluate the flake it is standing in. `nixct` therefore records each
+native mount as a `safe.directory`, which git only honours from a *protected*
+config — system or global, never the repository itself.
+
+git defines **two** global-scope files, `~/.gitconfig` and
+`$XDG_CONFIG_HOME/git/config`, reads both, and merges them; the second is not
+shadowed by the first (only *writes* pick one). So `--mount-gitconfig` puts
+your copy wherever it sat on the host, and the framework stanza goes in
+whichever of the two is left. Nothing ever contends for one file, and a tool
+that parses `~/.gitconfig` by hand still finds your config there if that is
+where you keep it.
 
 Chowning the mount instead is not an option, and not an oversight: a bind
 mount shares the inode, so `chown` inside the container changes the *host*
@@ -666,9 +672,22 @@ for the login session, disabling idle shutdown.
 - `--mount-bashrc` copies the host `~/.bashrc` into the session as read-only
   `~/.bashrc.user`, which the framework `~/.bashrc` sources (it always sets up
   direnv regardless).
-- `--mount-gitconfig` copies the host git config in read-only, as
-  `~/.config/git/config` (git reads it there too, which leaves `~/.gitconfig`
-  for the framework — see [`--native`](#--native-develop-only--the-real-filesystem-not-fuse)).
+- `--mount-gitconfig` copies the host git config in read-only, to the same
+  place it sits on the host (`~/.gitconfig` or `~/.config/git/config`). git
+  reads both as global scope and merges them, so the framework takes whichever
+  one is left for its own stanza — see
+  [`--native`](#--native-develop-only--the-real-filesystem-not-fuse).
+- `--translate-gitconfig` does the same, but rewrites the forwarded agent
+  socket on the way in. A host config that names the agent *by path* — an
+  `IdentityAgent` inside a `core.sshCommand`, a signing helper pointed at it —
+  carries a path the session does not have, while the same agent is reachable
+  there at `/run/sockets/<id>/ssh-agent`. Needs `-A` or `--agent`; a config
+  that says `$SSH_AUTH_SOCK` is already correct and is left alone.
+
+  ```
+  host    core.sshCommand = ssh -o IdentityAgent=/home/you/.1password/agent.sock
+  session core.sshCommand = ssh -o IdentityAgent=/run/sockets/proj-1a2b3c4d/ssh-agent
+  ```
 
 Both skip silently if the host file is absent.
 

@@ -1010,13 +1010,16 @@ in
       /run/current-system/sw/bin/bash -c '
         export PATH=/run/current-system/sw/bin
         set -e
-        cfg=/develop-home/$1/.gitconfig
+        cfg=/develop-home/$1/$5
+        dir=$(dirname -- "$cfg")
+        mkdir -p -- "$dir"
+        chown "$2:$3" "$dir"
         [ -f "$cfg" ] || printf "[safe]\n" > "$cfg"
         grep -qxF "  directory = $4" "$cfg" \
           || printf "  directory = %s\n" "$4" >> "$cfg"
         chown "$2:$3" "$cfg"
         chmod 0644 "$cfg"
-      ' bash "$1" "$2" "$3" "$4"
+      ' bash "$1" "$2" "$3" "$4" "$5"
   }
 
   # already_mounted <container-path>: is something already mounted there?
@@ -1447,6 +1450,7 @@ in
       dbus=0
       mount_bashrc=0
       mount_gitconfig=0
+      translate_gitconfig=0
       native_project=0
       sock_specs=()
       # Container-declared templates (mkContainer `sessionTemplates`).
@@ -1479,6 +1483,9 @@ in
           --dbus)            dbus=1; shift ;;
           --mount-bashrc)    mount_bashrc=1; shift ;;
           --mount-gitconfig) mount_gitconfig=1; shift ;;
+          # Implies --mount-gitconfig: it is a modifier on that copy.
+          --translate-gitconfig)
+            mount_gitconfig=1; translate_gitconfig=1; shift ;;
           --native)          native_project=1; shift ;;
           --no-native)       native_project=0; shift ;;
           -S|--socket)
@@ -1515,6 +1522,47 @@ in
         echo "develop: --wayland and --wprs are mutually exclusive (--wayland shares the raw compositor socket; --wprs proxies it through wprsd)" >&2
         exit 2
       fi
+      # Resolve the agent socket up front. The forward itself happens much
+      # further down, but --translate-gitconfig needs the host path while
+      # copying the config, which is earlier.
+      agent_src=""
+      if [ "$forward_agent" -eq 1 ]; then
+        agent_src=''${agent_sock:-''${SSH_AUTH_SOCK:-}}
+        if [ -z "$agent_src" ] || [ ! -S "$agent_src" ]; then
+          if [ -n "$agent_sock" ]; then
+            echo "develop: --agent: not a socket: $agent_sock" >&2
+          else
+            echo "develop: -A given but SSH_AUTH_SOCK is unset/invalid" >&2
+          fi
+          exit 2
+        fi
+      fi
+
+      # Where the copied host git config goes, and where the framework puts
+      # its own stanza (safe.directory, for --native).
+      #
+      # git defines TWO global-scope files - ~/.gitconfig and
+      # $XDG_CONFIG_HOME/git/config - reads both, and merges them; the XDG
+      # one is not shadowed by the other (only *writes* pick one). So the
+      # copy keeps the layout it had on the host, and the framework takes
+      # whichever of the two is left. Nothing contends for one file, and a
+      # tool that reads ~/.gitconfig by hand still finds your config there
+      # if that is where you keep it.
+      git_src="" git_dst=""
+      if [ "$mount_gitconfig" -eq 1 ]; then
+        if [ -f "$HOME/.gitconfig" ]; then
+          git_src="$HOME/.gitconfig"; git_dst=".gitconfig"
+        elif [ -f "''${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
+          git_src="''${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
+          git_dst=".config/git/config"
+        fi
+      fi
+      if [ "$git_dst" = ".gitconfig" ]; then
+        fw_git_cfg=".config/git/config"
+      else
+        fw_git_cfg=".gitconfig"
+      fi
+
       # No path given: develop the current working directory.
       target=''${1:-.}
       if ! hostpath=$(realpath -- "$target" 2>/dev/null); then
@@ -1695,7 +1743,7 @@ in
         ' bash "$session_user" "$mount_id" "$uid" "$gid" "$project_native"
       if [ "$project_native" -eq 1 ]; then
         bind_native "/hostmnts/$mount_id" "/develop-home/$session_user/dev" rw
-        allow_git_dir "$session_user" "$uid" "$gid" "/develop-home/$session_user/dev"
+        allow_git_dir "$session_user" "$uid" "$gid" "/develop-home/$session_user/dev" "$fw_git_cfg"
         echo "native: $hostpath -> /develop-home/$session_user/dev (plain bind; reflinks work)"
       fi
 
@@ -1710,23 +1758,26 @@ in
           set -e; dest="/develop-home/$1/$2"; cat > "$dest"; chown "$3:$4" "$dest"; chmod 0444 "$dest"
         ' bash "$session_user" ".bashrc.user" "$uid" "$gid" < "$HOME/.bashrc"
       fi
-      # git reads ~/.gitconfig OR $XDG_CONFIG_HOME/git/config, and a
-      # home-manager setup typically only has the latter - so look in both.
+      # Copy the host git config in (source and destination decided above).
       #
-      # The copy always lands at the XDG path, wherever it came from. git
-      # reads both files (the XDG one is not shadowed by ~/.gitconfig -
-      # only *writes* pick one), which leaves ~/.gitconfig free for the
-      # framework to own. That matters for safe.directory, which a native
-      # mount needs and which only counts from a protected config: two
-      # writers on one file would mean merging into a copy of yours.
+      # --translate-gitconfig rewrites the forwarded agent socket on the
+      # way through. A host config that names the socket by path - an
+      # `IdentityAgent` in a core.sshCommand, a signing helper pointed at
+      # it - carries a path that does not exist in the session, where the
+      # same agent is reachable at /run/sockets/<id>/ssh-agent instead. The
+      # rewrite is a plain substitution of the one path -A resolved to, so
+      # a config that says $SSH_AUTH_SOCK (already correct in the session)
+      # is left alone.
       if [ "$mount_gitconfig" -eq 1 ]; then
-        git_src="" git_dst=".config/git/config"
-        if [ -f "$HOME/.gitconfig" ]; then
-          git_src="$HOME/.gitconfig"
-        elif [ -f "''${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
-          git_src="''${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
-        fi
         if [ -n "$git_src" ]; then
+          git_filter=(cat)
+          if [ "$translate_gitconfig" -eq 1 ]; then
+            if [ -z "$agent_src" ]; then
+              echo "develop: --translate-gitconfig without a forwarded agent - nothing to translate" >&2
+            else
+              git_filter=(sed -e "s|$agent_src|/run/sockets/$mount_id/ssh-agent|g")
+            fi
+          fi
           # shellcheck disable=SC2016
           pm exec -i -u root "$NAME" /run/current-system/sw/bin/bash -lc '
             set -e
@@ -1752,7 +1803,8 @@ in
             cat > "$dest"
             chown "$3:$4" "$dest"
             chmod 0444 "$dest"
-          ' bash "$session_user" "$git_dst" "$uid" "$gid" < "$git_src"
+          ' bash "$session_user" "$git_dst" "$uid" "$gid" \
+            < <("''${git_filter[@]}" -- "$git_src")
         fi
       fi
 
@@ -1888,7 +1940,7 @@ in
           bind_native "/hostmnts/$mount_id.$s_name" \
                       "/develop-home/$session_user/$s_name" "$s_mode"
           allow_git_dir "$session_user" "$uid" "$gid" \
-                        "/develop-home/$session_user/$s_name"
+                        "/develop-home/$session_user/$s_name" "$fw_git_cfg"
           echo "share: $s_host -> $home_dir/$s_name (native; reflinks work)"
           continue
         fi
@@ -1944,15 +1996,8 @@ in
 
 
       if [ "$forward_agent" -eq 1 ]; then
-        agent_src=''${agent_sock:-''${SSH_AUTH_SOCK:-}}
-        if [ -z "$agent_src" ] || [ ! -S "$agent_src" ]; then
-          if [ -n "$agent_sock" ]; then
-            echo "develop: --agent: not a socket: $agent_sock" >&2
-          else
-            echo "develop: -A given but SSH_AUTH_SOCK is unset/invalid" >&2
-          fi
-          exit 2
-        fi
+        # $agent_src was resolved and validated up front, before the git
+        # config copy that --translate-gitconfig hooks into.
         bind_socket "$mount_id" "ssh-agent" "$agent_src"
         spawn_socket_proxy "$mount_id" "ssh-agent" "$uid" "$gid"
         extra_setenv+=(--setenv="SSH_AUTH_SOCK=/run/sockets/$mount_id/ssh-agent")
@@ -2486,11 +2531,22 @@ in
                                 session HOME as ~/.bashrc.user (0444),
                                 sourced by the framework ~/.bashrc.
     --mount-gitconfig           copy the host git config into the session
-                                HOME as ~/.config/git/config (0444). git
-                                reads it there too, which leaves
-                                ~/.gitconfig for the framework - see
-                                --native. Both skip silently if the host
-                                file is absent.
+                                HOME at the same place it sits on the host
+                                - ~/.gitconfig or ~/.config/git/config
+                                (0444). git reads both as global scope, so
+                                the framework takes whichever is left for
+                                its own stanza (see --native). Both skip
+                                silently if the host file is absent.
+    --translate-gitconfig       like --mount-gitconfig, but rewrite the
+                                forwarded agent socket path on the way in:
+                                a host config naming the socket by path
+                                (an IdentityAgent in a core.sshCommand, a
+                                signing helper pointed at it) carries a
+                                path the session does not have, where the
+                                same agent lives at
+                                /run/sockets/<id>/ssh-agent. Needs -A or
+                                --agent; a config using \$SSH_AUTH_SOCK is
+                                already correct and is left alone.
     --wprs                      run wprsd INSIDE the session instead of
                                 sharing the real Wayland socket (what
                                 --wayland does): the untrusted session
