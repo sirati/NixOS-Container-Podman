@@ -40,6 +40,7 @@
     xauth         = "${pkgs.xauth}/bin/xauth";
     setfacl       = "${pkgs.acl}/bin/setfacl";
     git           = "${pkgs.git}/bin/git";
+    nft           = "${pkgs.nftables}/bin/nft";
     # Filtering ssh-agent proxy for --agent-allow / --agent-deny. Runs on
     # the HOST: the container only ever sees the socket it serves.
     sshAgentFilter = "${import ../ssh-agent-filter.nix { inherit pkgs; }}/bin/ssh-agent-filter";
@@ -71,6 +72,7 @@
     xauth         = "xauth";
     setfacl       = "setfacl";
     git           = "git";
+    nft           = "nft";
     sshAgentFilter = "ssh-agent-filter";
 
     sed           = "sed";

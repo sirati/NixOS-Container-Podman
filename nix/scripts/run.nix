@@ -64,6 +64,12 @@
 , checkHostCompatPath  # absolute path to check-host-compat executable
   # gitServeHooks: store path of the hook dir for `develop --git-serve`.
 , gitServeHooks ? null
+  # lanRuleset/netGatewayRootfs: set together when isolateLan is on. The
+  # ruleset is loaded by the HOST into the gateway container namespace; the
+  # dev container joins that namespace and has NET_ADMIN dropped, so it can
+  # use the network but cannot reconfigure it.
+, lanRuleset ? null
+, netGatewayRootfs ? null
   # OCI-runtime flag passed to podman (in pm() + direct podman runs).
   # NixOS: full /nix/store path to crun, pinned at build time. Portable:
   # empty so podman uses whatever it's configured for (typically runc
@@ -123,6 +129,83 @@
 
 let
   # Cohesive bash fragments. See the header of each file for its contract.
+  # Empty unless isolateLan is on; used as the build-time switch for the
+  # gateway-container networking below.
+  lanRulesetLine = if lanRuleset == null then "" else toString lanRuleset;
+  gatewayRootfsLine = if netGatewayRootfs == null then "" else toString netGatewayRootfs;
+  isolateLan = lanRuleset != null;
+  # Chosen HERE rather than tested in the script: with isolateLan the
+  # operand would be a literal store path, which is always non-empty, and
+  # shellcheck is right to call that a mistake.
+  netFlagsLine =
+    if isolateLan
+    then "FLAGS+=(--network=\"container:\${NAME}-net\")"
+    else "FLAGS+=(--cap-add=NET_ADMIN)";
+  # Same reason: a runtime test on a build-time constant.
+  netGatewayStart =
+    if isolateLan
+    then "# Before the container, because the container joins ITS namespace.\n    ensure_net_gateway || exit 1"
+    else "";
+  netGatewayStop =
+    if isolateLan
+    then "# After the container: its network namespace lives in the gateway.\n    stop_net_gateway"
+    else "";
+  # The gateway container owns the network namespace the dev container
+  # joins. Defined only when isolateLan is on: with it off there is no
+  # gateway, and a body that begins by returning would just be a pile of
+  # unreachable code.
+  netGatewayFns = if !isolateLan then (
+    ""
+  ) else ''
+    # ensure_net_gateway: bring up the container that owns the network
+    # namespace, and load the filter into it.
+    #
+    # The filtering does not happen inside the dev container, and it does not
+    # happen inside this one either: the ruleset is a store file, and the HOST
+    # loads it through nsenter into the namespace before anything joins. The
+    # gateway itself runs one `sleep` and holds no capability to change what
+    # was loaded. Both containers are on the wrong side of the boundary to
+    # alter it, which is the whole point of a separate namespace owner.
+    ensure_net_gateway() {
+      local gw="''${NAME}-net"
+      if ! pm container exists "$gw" 2>/dev/null; then
+        pm run -d --name "$gw" \
+          --network=pasta \
+          -v /nix/store:/nix/store:ro \
+          --rootfs "${gatewayRootfsLine}:O" \
+          ${tools.coreutils}/sleep infinity >/dev/null
+      elif [ "$(pm inspect "$gw" --format '{{.State.Status}}' 2>/dev/null)" != running ]; then
+        pm start "$gw" >/dev/null
+      fi
+      local gpid
+      gpid=$(pm inspect "$gw" --format '{{.State.Pid}}' 2>/dev/null | tr -d '[:space:]')
+      if [ -z "$gpid" ] || [ "$gpid" = 0 ]; then
+        echo "$NAME: network gateway did not start" >&2
+        return 1
+      fi
+      # Loaded from the host: podman unshare puts us in the rootless user
+      # namespace that OWNS this network namespace, which is where the
+      # capability to write a ruleset into it lives.
+      _G="$gpid" _R="${lanRulesetLine}" podman unshare "${tools.bash}" -c '
+        set -eu
+        ${tools.utilLinux}/nsenter --net=/proc/$_G/ns/net ${tools.nft} -f "$_R"
+      ' || {
+        echo "$NAME: could not load the LAN filter into the gateway" >&2
+        return 1
+      }
+      return 0
+    }
+  
+    # stop_net_gateway: after the dev container, never before - its network
+    # namespace lives in here.
+    stop_net_gateway() {
+      local gw="''${NAME}-net"
+      if pm container exists "$gw" 2>/dev/null; then
+        pm rm -f "$gw" >/dev/null 2>&1 || true
+      fi
+    }
+  
+  '';
   storeLib      = import ./lib/store.nix { };
   gpuFns        = import ./lib/gpu.nix { };
   watchdogFns   = import ./lib/watchdog.nix { inherit hostWatchdogPath; };
@@ -671,11 +754,14 @@ in
            "/sys/devices/system/cpu/online"
   }
 
+  ${netGatewayFns}
+
   # start_persistent: mount overlays + WORK_SHARED, create+start
   # detached container. Container holds the mount-ns; the
   # `podman unshare bash` exits but the mounts survive.
   start_persistent() {
     ensure_state
+    ${netGatewayStart}
     # Mount the squashfs rootfs lower (portable target only) before
     # the `podman unshare` so the resulting fuse mount propagates
     # into the unshare's mount-ns and stays there for the container.
@@ -746,7 +832,16 @@ in
     --cgroupns=host
     --cap-add=SYS_ADMIN
     --cap-add=NET_RAW
-    --cap-add=NET_ADMIN
+  )
+  # Networking. Without isolateLan the container owns its namespace and
+  # gets NET_ADMIN to configure it. With isolateLan it joins the gateway
+  # container namespace instead and NET_ADMIN is withheld: the capability
+  # set is decided out here, by the host, and nothing inside can widen it -
+  # a process that unshares a fresh user namespace becomes root only over
+  # what THAT namespace owns, which is not this network namespace. So the
+  # session can use the network and cannot touch the rules filtering it.
+  ${netFlagsLine}
+  FLAGS+=(
     --device=/dev/fuse
     --security-opt unmask=/sys/fs/cgroup
     # systempaths=unconfined removes the default RO/mask of
@@ -1312,6 +1407,7 @@ in
   tear_down() {
     if container_running; then pm stop -t 5 "$NAME" >/dev/null || true; fi
     if container_exists; then pm rm -f "$NAME" >/dev/null || true; fi
+    ${netGatewayStop}
     stop_all_session_watchdogs
     stop_host_ports
     # Container's mount-ns dying releases the overlays. Clean up

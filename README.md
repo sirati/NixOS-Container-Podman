@@ -455,18 +455,39 @@ every other machine on the LAN that trusts those keys.
 mkNixct { isolateLan = true; }        # or programs.nixct.isolateLan = true;
 ```
 
-Refuses RFC1918, CGNAT/tailnet (`100.64.0.0/10`), link-local and IPv6 ULA;
-loopback and the public internet stay reachable. `reject`, not `drop`, so a
-blocked connect fails at once instead of hanging until the TCP timeout.
-`isolateLan.allow` / `.allow6` punch holes; `.resolver` (default
-`169.254.1.1`, pasta's own DNS forwarder) is permitted ahead of the
-link-local refusal, since refusing it would take DNS down with the LAN.
+**The filter is not in the container.** A second, near-empty container — the
+gateway — owns the network namespace and runs nothing but `sleep`. The dev
+container joins that namespace with `--network=container:<name>-net`, so it
+has no namespace of its own to reconfigure, and the host loads the ruleset
+into the namespace with `nsenter` before anything joins it. Neither container
+polices itself.
 
-Enforced inside the namespace, where a session user cannot reach it — sessions
-are ordinary users, not in wheel, with no sudo, so they cannot flush the
-ruleset. It does **not** contain a process that has become root inside the
-container; that needs a rule on the host, which is also where a container
-escape lands anyway.
+What makes it hold is the capability set, which is decided by the host and
+cannot be widened from inside: with `isolateLan` the dev container is started
+**without `CAP_NET_ADMIN`**. A process that unshares a fresh user namespace
+becomes root only over what *that* namespace owns, which is not this network
+namespace. Measured inside a running container:
+
+```
+CapEff = 00000000802425fb     → NET_ADMIN absent
+# ip link add dummy0 type dummy
+RTNETLINK answers: Operation not permitted
+```
+
+The ruleset refuses RFC1918, CGNAT/tailnet (`100.64.0.0/10`), link-local and
+IPv6 ULA; loopback and the public internet stay reachable. `reject`, not
+`drop`, so a blocked connect fails at once instead of hanging until the TCP
+timeout. `isolateLan.allow` / `.allow6` punch holes; `.resolver` (default
+`169.254.1.1`, pasta's own DNS forwarder) is permitted ahead of the
+link-local refusal, since refusing it would take DNS down with the LAN:
+
+```
+LAN gateway 192.168.176.1:80   -> blocked
+LAN host    192.168.176.38:22  -> blocked
+tailnet   100.100.100.100:53   -> blocked
+public          1.1.1.1:443    -> REACHABLE
+DNS                            -> OK
+```
 
 ### `--host-port PORT` (`develop` only) — a host loopback service in the session
 

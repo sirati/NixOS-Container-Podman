@@ -136,6 +136,10 @@ in {
         public internet stay reachable. pasta gives the container a copy of
         the host interface, so without this a session can reach every
         machine on the LAN - and a forwarded ssh-agent reaches them as you.
+
+        Enforced outside the container: a second container owns the network
+        namespace, the host loads the ruleset into it, and the dev container
+        joins that namespace without CAP_NET_ADMIN.
       '';
     };
     developArgs = lib.mkOption {

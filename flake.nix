@@ -132,6 +132,11 @@
           # CGNAT/tailnet, link-local, IPv6 ULA). pasta hands the namespace a
           # copy of the host interface, so without this a session reaches the
           # whole LAN - and a forwarded ssh-agent reaches every machine on it.
+          #
+          # Enforced OUTSIDE the container: a second, near-empty container
+          # owns the network namespace, the host loads the ruleset into it,
+          # and this container joins that namespace WITHOUT CAP_NET_ADMIN,
+          # so it can use the network but cannot reconfigure or unfilter it.
         , isolateLan ? false
           # Host dirs every develop session gets as a frozen template
           # (read-only lower + session-lifetime overlay upper):
@@ -199,7 +204,6 @@
               # daemon / nixbld users, store = daemon) to match the
               # hostNixDaemon axis.
               { nixDevContainer.hostDaemon.enable = hostDaemon; }
-              { nixDevContainer.isolateLan.enable = isolateLan; }
             ] ++ modules;
           };
 
@@ -275,6 +279,10 @@
                               then "${nixStoreLower}" else null;
               hostWatchdogPath = "${hostWatchdogScript}";
               gitServeHooks = "${import ./nix/git-serve-hooks.nix { inherit pkgs; }}";
+              lanRuleset = if isolateLan
+                           then "${import ./nix/lan-ruleset.nix { inherit pkgs; }}" else null;
+              netGatewayRootfs = if isolateLan
+                           then "${import ./nix/net-gateway.nix { inherit pkgs; }}" else null;
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
               # Bridge the storage axis to run.nix's stateDirLine: ephemeral
               # storage puts STATE_DIR (overlay upper/work) on tmpfs; all
