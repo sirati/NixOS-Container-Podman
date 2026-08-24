@@ -26,6 +26,22 @@
 let
   inherit (lib) mkOption types concatMapStringsSep optionals optionalString;
 
+  # A value only known when the script runs -- a computed overlay path, a
+  # resolved uid, a detected GPU flag. run.nix assembles most of its argv from
+  # these, so a model that only accepts literals cannot describe it.
+  #
+  # `rt "MERGED"` renders as "": double-quoted so the shell expands it,
+  # where a literal is single-quoted so the shell does not. Validation that
+  # cannot apply to an unknown value is skipped for these, which is the honest
+  # thing -- pretending to check a runtime string would be worse than not
+  # checking it.
+  rt = name: { __rt = name; };
+  isRt = v: builtins.isAttrs v && v ? __rt;
+  rtType = types.addCheck types.attrs isRt // {
+    description = "a runtime value, from rt \"VARNAME\"";
+  };
+  orRt = t: types.either t rtType;
+
   absPath = description:
     lib.types.addCheck types.str (s: lib.hasPrefix "/" s) // {
       inherit description;
@@ -55,7 +71,7 @@ let
         description = "Mount kind.";
       };
       source = mkOption {
-        type = types.nullOr (absPath "absolute host path");
+        type = types.nullOr (orRt (absPath "absolute host path"));
         default = null;
         description = "Host path. Required for bind, meaningless for tmpfs.";
       };
@@ -136,7 +152,7 @@ let
     name = mkOption { type = types.str; description = "Container name."; };
 
     rootfs = mkOption {
-      type = absPath "absolute path to an exploded rootfs";
+      type = orRt (absPath "absolute path to an exploded rootfs");
       description = ''
         Rootfs directory. Rendered last, as the positional image argument,
         because `--rootfs` is a boolean flag -- the caller cannot influence
