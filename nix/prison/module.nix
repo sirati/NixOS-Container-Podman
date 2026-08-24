@@ -56,11 +56,11 @@ let
       capAdds = map (c: "--cap-add=${c}") s.capabilities;
       envArgs = lib.concatLists (lib.mapAttrsToList (k: v: [ "--env" "${k}=${v}" ]) s.environment);
     in
-    nameValuePair "prison-${p.name}-${s.name}" {
+    nameValuePair "${p.name}-${s.name}" {
       description = "prison ${p.name}: service ${s.name}";
-      after = [ "prison-${p.name}.service" ];
-      bindsTo = [ "prison-${p.name}.service" ];
-      partOf = [ "prison-${p.name}.service" ];
+      after = [ "${p.name}.service" ];
+      bindsTo = [ "${p.name}.service" ];
+      partOf = [ "${p.name}.service" ];
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
@@ -74,18 +74,23 @@ let
           podmanBin
           "run"
           "--rm"
-          "--name" "prison-${p.name}-${s.name}"
-          "--pod" "prison-${p.name}"
-          "--rootfs" "${s.rootfs}:O"
+          "--name" "${p.name}-${s.name}"
+          "--pod" "${p.name}"
           "--user" "${toString s.uid}:${toString s.gid}"
           "--mount" "type=bind,source=${mnt},destination=/nix/store,ro"
           "--mount" "type=tmpfs,destination=/tmp,tmpfs-size=${s.tmpfsSize},tmpfs-mode=1777,noexec,nosuid,nodev"
         ]
         ++ lib.optionals s.readOnlyRoot [ "--read-only" ]
+        ++ lib.optionals s.init [ "--init" "--init-path" "${pkgs.catatonit}/bin/catatonit" ]
         ++ baseFlags ++ capAdds ++ envArgs ++ stateMounts ++ persistMounts
         ++ s.extraPodmanArgs
+        # --rootfs is a BOOLEAN flag: the path is the positional image
+        # argument, so it must come last, immediately before argv. Emitting it
+        # earlier makes podman parse the next flag as the command --
+        # "executable file `--user` not found in $PATH".
+        ++ [ "--rootfs" "${s.rootfs}:O" ]
         ++ s.argv);
-        ExecStop = escapeShellArgs [ podmanBin "stop" "-t" "10" "prison-${p.name}-${s.name}" ];
+        ExecStop = escapeShellArgs [ podmanBin "stop" "-t" "10" "${p.name}-${s.name}" ];
       };
     };
 
@@ -95,7 +100,7 @@ let
       netFlag = if p.wantsNetwork then [ "--network" "pasta" ] else [ "--network" "none" ];
 
       setup = pkgs.writeShellApplication {
-        name = "prison-${p.name}-up";
+        name = "${p.name}-up";
         runtimeInputs = [ pkgs.coreutils pkgs.podman pkgs.util-linux pkgs.fuse3 pkgs.nftables ];
         text = ''
           set -euo pipefail
@@ -111,22 +116,23 @@ let
               ${fuseBin} \
                 --bind-target ${s.storeFarm}/nix/store \
                 --resolution-root /nix/store \
+                --allow-other \
                 "$STATE/store/${s.name}"
             fi
           '') p.svcList}
 
-          if ! ${podmanBin} pod exists prison-${p.name} 2>/dev/null; then
-            ${podmanBin} pod create --name prison-${p.name} \
-              --infra-name prison-${p.name}-infra \
+          if ! ${podmanBin} pod exists ${p.name} 2>/dev/null; then
+            ${podmanBin} pod create --name ${p.name} \
+              --infra-name ${p.name}-infra \
               ${escapeShellArgs netFlag} ${escapeShellArgs p.publishArgs} >/dev/null
           fi
-          ${podmanBin} pod start prison-${p.name} >/dev/null
+          ${podmanBin} pod start ${p.name} >/dev/null
 
           ${lib.optionalString p.wantsNetwork ''
             # Load the ruleset from the host, into the namespace the infra
             # container owns. podman unshare enters the rootless user
             # namespace that owns it; nothing inside the pod is there.
-            gpid=$(${podmanBin} inspect prison-${p.name}-infra --format '{{.State.Pid}}' | tr -d '[:space:]')
+            gpid=$(${podmanBin} inspect ${p.name}-infra --format '{{.State.Pid}}' | tr -d '[:space:]')
             if [ -z "$gpid" ] || [ "$gpid" = 0 ]; then
               echo "prison ${p.name}: infra container did not start" >&2
               exit 1
@@ -138,12 +144,12 @@ let
       };
 
       teardown = pkgs.writeShellApplication {
-        name = "prison-${p.name}-down";
+        name = "${p.name}-down";
         runtimeInputs = [ pkgs.coreutils pkgs.podman pkgs.fuse3 ];
         text = ''
           set -uo pipefail
           STATE=${lib.escapeShellArg p.stateDir}
-          ${podmanBin} pod rm -f prison-${p.name} >/dev/null 2>&1 || true
+          ${podmanBin} pod rm -f ${p.name} >/dev/null 2>&1 || true
           ${concatMapStringsSep "\n" (s: ''
             ${fusermountBin} -u "$STATE/store/${s.name}" 2>/dev/null || true
           '') p.svcList}
@@ -151,7 +157,7 @@ let
         '';
       };
     in
-    nameValuePair "prison-${p.name}" {
+    nameValuePair "${p.name}" {
       description = "prison ${p.name}: pod, store views and network policy";
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
@@ -159,8 +165,8 @@ let
         Type = "oneshot";
         RemainAfterExit = true;
         User = p.user;
-        ExecStart = "${setup}/bin/prison-${p.name}-up";
-        ExecStop = "${teardown}/bin/prison-${p.name}-down";
+        ExecStart = "${setup}/bin/${p.name}-up";
+        ExecStop = "${teardown}/bin/${p.name}-down";
       };
     };
 in
@@ -199,6 +205,14 @@ in
     users.groups = lib.mapAttrs' (n: p: nameValuePair p.user { }) cfg;
 
     virtualisation.containers.enable = lib.mkDefault true;
+
+    # The store view is a FUSE mount owned by the prison's host user, but the
+    # container process runs as a mapped subuid -- a different uid entirely.
+    # Without allow_other the kernel denies it access and crun fails with
+    # "failed to exec pid1: Permission denied", which reads like a missing
+    # binary rather than a mount permission. --allow-other is refused unless
+    # this is set.
+    programs.fuse.userAllowOther = lib.mkDefault true;
 
     systemd.services =
       (lib.mapAttrs' (_: p: podUnit p) cfg)

@@ -57,7 +57,11 @@ pkgs.runCommand "prison-rootfs-${name}"
     passthru = { inherit users allGroups; };
   } ''
   set -euo pipefail
-  mkdir -p $out/{proc,sys,dev,tmp,run,etc,nix/store,var/empty}
+  # /var/tmp is here because podman's --read-only-tmpfs defaults on and
+  # mounts a tmpfs at /run, /tmp AND /var/tmp; a read-only rootfs cannot
+  # create the mount point itself, and crun fails with "mkdir `/var/tmp`:
+  # Permission denied" before the service ever starts.
+  mkdir -p $out/{proc,sys,dev,tmp,run,etc,nix/store,var/empty,var/tmp}
   ${concatMapStringsSep "\n" (d: "mkdir -p $out${d}") extraDirs}
 
   # podman bind-mounts over each of these, so they have to exist first; a

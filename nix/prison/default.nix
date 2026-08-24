@@ -7,9 +7,11 @@
 # runit) needs a writable scan directory, and the rootfs here is a read-only
 # store path with no shell and no coreutils to populate one at startup. A pod
 # gets the same property -- services sharing one loopback interface and
-# nothing else -- with crun as the only thing that ever forks, no init inside
-# any container, and each service confined to its own mount namespace and its
-# own store view.
+# nothing else -- with each service confined to its own mount namespace and
+# its own store view, and no supervisor anywhere: systemd on the host restarts
+# a container, and catatonit inside it does nothing but forward signals and
+# reap, because PID 1 in a namespace ignores every signal it has no handler
+# for (pid_namespaces(7)).
 #
 # What each service can see of /nix/store is its own closure and nothing more,
 # served by nix-store-shared-fuse over the symlink farm from nix-store-lower.
@@ -68,6 +70,20 @@ let
     , persist ? [ ]            # [ { path; host; } ] writable host directories
     , capabilities ? [ ]       # capability names to ADD back; default none
     , readOnlyRoot ? true
+    # PID 1 in a namespace only receives signals it has installed a handler
+    # for -- pid_namespaces(7): "a process in an ancestor namespace can send
+    # signals to the init process of a child PID namespace only if the init
+    # process has established a handler for that signal". So `podman stop`
+    # sends SIGTERM, the kernel drops it, and every stop degrades to the
+    # SIGKILL that follows the timeout. PID 1 also inherits orphans and must
+    # reap them.
+    #
+    # catatonit is podman's own answer to both: a few KB of C that forwards
+    # signals to the real process and reaps whatever it is handed. It is
+    # bind-mounted by podman from the host, so it does not enter the store
+    # view and the closure does not grow. Turn this off only for a service
+    # that is genuinely its own init.
+    , init ? true
     , tmpfsSize ? "16M"
     , extraPodmanArgs ? [ ]
     }:
@@ -95,7 +111,7 @@ let
     in
     {
       inherit name uid gid user argv environment state persist capabilities
-        readOnlyRoot tmpfsSize extraPodmanArgs rootfs storeFarm closure;
+        readOnlyRoot init tmpfsSize extraPodmanArgs rootfs storeFarm closure;
       __prisonService = true;
     };
 
@@ -107,8 +123,8 @@ let
     , services                 # attrset or list of mkPrisonService results
     , listen ? { tcp = [ ]; udp = [ ]; }
     , egress ? { mode = "none"; targets = [ ]; lan = [ ]; }
-    , user ? "prison-${name}"  # unprivileged host account podman runs as
-    , stateDir ? "/var/lib/prison/${name}"
+    , user ? name  # unprivileged host account podman runs as
+    , stateDir ? "/var/lib/${name}"
     }:
     let
       svcList =

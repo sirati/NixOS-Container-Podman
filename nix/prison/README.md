@@ -92,7 +92,39 @@ prison rootfs                       0 executables
 view is exactly the closure, so it contains whatever the package references.
 Building the service against a systemd-less variant removes it.
 
-## Not yet done
+## Runtime findings
 
-No runtime test. The derivations build, the ruleset passes `nft -c`, and the
-module evaluates; nothing here has yet started a pod.
+Tested with rootless podman 5.8.6 + crun 1.27.1 (`nix shell nixpkgs#podman ...`).
+
+**PID 1 needs an init.** `pid_namespaces(7)`: an ancestor namespace can signal
+a child namespace's init "only if the init process has established a handler
+for that signal". Same container, one flag apart:
+
+| | PID 1 | `podman stop -t5` |
+|---|---|---|
+| no `--init` | the service | 5063 ms -- SIGTERM dropped, SIGKILL at timeout |
+| `--init` | catatonit, service as PID 2 | 54 ms |
+
+So `init = true` is the default. catatonit is bind-mounted at
+`/run/podman-init`, so it never enters the store view.
+
+**`--rootfs` is a boolean flag.** The path is the positional image argument and
+must come last, immediately before argv. Emitting it earlier makes podman parse
+the next flag as the command: ``executable file `--user` not found in ``.
+
+**`/var/tmp` must exist in the rootfs.** podman's `--read-only-tmpfs` defaults
+on and mounts tmpfs at `/run`, `/tmp` and `/var/tmp`; a read-only rootfs cannot
+create the mount point, and crun fails before the service starts.
+
+**The store view needs `--allow-other`.** The FUSE mount is owned by the
+prison's host user; the container runs as a mapped subuid. Without it the
+kernel denies access and crun reports ``failed to exec pid1: Permission
+denied``, which reads like a missing binary. The module sets
+`programs.fuse.userAllowOther`, without which `--allow-other` is refused.
+
+## Not yet verified
+
+A container booting against the narrowed FUSE view end to end. The view itself
+is confirmed (10 paths, no shell, binaries resolve) and the container is
+confirmed against the full host store, but joining the two needs
+`user_allow_other`, which was off on the test host.
