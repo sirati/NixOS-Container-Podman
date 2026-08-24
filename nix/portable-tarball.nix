@@ -51,13 +51,34 @@
   # so the assertion below can reject a misconfiguration explicitly.
 , hostNixStore ? false
 , hostNixDaemon ? false
+  # isolateLan needs a namespace-owner rootfs and a catatonit binary, and
+  # this tarball ships neither -- so accepting it would produce a container
+  # with no isolation and no indication that the setting did nothing. It is
+  # taken only so it can be refused.
+, isolateLan ? false
+  # These are plumbed through rather than refused: they become lines in the
+  # generated script and need nothing from the host. They were simply never
+  # passed, so a caller asking for session templates got a tarball without
+  # them and no error.
+, sessionTemplates ? [ ]
+, sessionShares ? [ ]
+, developArgs ? [ ]
+, sessionFlags ? [ ]
+, sessionEnv ? [ ]
+, idleTimeout ? 0
 , version ? "0.0.0"
 , format ? "squashfs"
 }:
 
-assert pkgs.lib.elem format [ "squashfs" "folder" "both" ];
+# Fail loudly on anything this target cannot honour. Silently dropping a
+# setting is worse than refusing it: the caller asked for something, got a
+# tarball, and has no way to know the setting did nothing.
+assert pkgs.lib.elem format [ "squashfs" "folder" "both" ]
+  || throw "portable tarball: format must be \"squashfs\", \"folder\" or \"both\", not \"${toString format}\"";
 assert (!hostNixStore && !hostNixDaemon)
   || throw "portable tarball must be self-contained: hostNixStore/hostNixDaemon are not supported on a portable target (the target host has no shared /nix/store or nix-daemon)";
+assert (!isolateLan)
+  || throw "portable tarball: isolateLan is not supported. It needs a namespace-owner rootfs and a catatonit binary (see nix/net-owner.nix), and this tarball ships neither -- the result would have no network isolation and nothing would say so.";
 
 let
   toolsLib = import ./scripts/tools.nix;
@@ -135,7 +156,9 @@ let
   runText = import ./scripts/run.nix {
     inherit (pkgs) lib;
     inherit tools shellUser name
-            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+            hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
+            sessionTemplates sessionShares developArgs sessionFlags sessionEnv
+            idleTimeout;
     # Portable is always self-contained: persistent on-disk overlay
     # (data/upper), store baked into the rootfs lower, no host store or
     # daemon. nixStoreLower stays null so store.nix derives the lower

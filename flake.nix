@@ -225,6 +225,12 @@
             "nix-dev-container-session-watchdog"
             (import ./nix/scripts/host-watchdog.nix { inherit tools; });
 
+          # run.nix and the portable tarball both want the environment as
+          # KEY=VALUE strings, not the attrset the caller writes. Converted
+          # once so the two cannot disagree.
+          sessionEnvList = map (k: "${k}=${builtins.getAttr k sessionEnv}")
+                               (builtins.attrNames sessionEnv);
+
           # Standalone host-compat probe. Built once per mkContainer
           # call so the dispatcher's `check-host-compat` subcommand
           # has a stable path to exec into.
@@ -264,8 +270,7 @@
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
               inherit (nixpkgs) lib;
-              sessionEnv = map (k: "${k}=${builtins.getAttr k sessionEnv}")
-                               (builtins.attrNames sessionEnv);
+              sessionEnv = sessionEnvList;
               inherit tools rootfs toplevel shellUser name idleTimeout sessionTemplates
                       sessionShares developArgs sessionFlags
                       hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
@@ -375,7 +380,10 @@
           # only when includeStore holds (hostNixStore/hostNixDaemon both off).
           portableTarball = import ./nix/portable-tarball.nix {
             inherit pkgs name shellUser rootfsFolder rootfsSquashfs
-                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
+                    hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid
+                    isolateLan sessionTemplates sessionShares developArgs
+                    sessionFlags idleTimeout;
+            sessionEnv = sessionEnvList;
             hostNixStore = effectiveHostNixStore;
             hostNixDaemon = hostNixDaemon;
             version = if self ? rev then self.rev else "dirty";
