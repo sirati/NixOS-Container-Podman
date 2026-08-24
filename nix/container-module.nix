@@ -80,6 +80,26 @@ in
         preStart = "mkdir -p /run/wrappers";
       };
 
+      # nix-daemon.service asks systemd for CPU and IO scheduling policies,
+      # which systemd applies with sched_setscheduler/ioprio_set before exec.
+      # Neither is permitted in a rootless container, so the unit dies at
+      # 214/SETSCHEDULER before nix-daemon ever starts -- and every nix
+      # command then fails with "cannot open connection to remote store
+      # 'daemon'", which reads like a socket problem and not a scheduling one.
+      #
+      # An empty assignment makes systemd skip the call entirely. The
+      # alternative, granting CAP_SYS_NICE to the whole container, would widen
+      # its privileges to satisfy a niceness setting that means nothing here:
+      # the container is already inside whatever scheduling class the host
+      # gave it.
+      #
+      # Harmless in host-daemon mode, where the unit is disabled anyway.
+      systemd.services.nix-daemon.serviceConfig = {
+        CPUSchedulingPolicy = lib.mkForce "";
+        IOSchedulingClass = lib.mkForce "";
+        IOSchedulingPriority = lib.mkForce "";
+      };
+
       # Container runtime handles networking; don't run dhcpcd by default.
       networking.useDHCP = lib.mkDefault false;
 

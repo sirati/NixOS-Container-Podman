@@ -229,7 +229,12 @@
       trap restore_term EXIT
       trap 'restore_term; exit 130' INT
       trap 'restore_term; exit 143' TERM
-      pm exec -it -u "$SHELL_USER" "$NAME" "$@"
+      # -t only when there is a terminal to allocate one for. Asking podman
+      # for a pty with no tty on stdin gives the command a terminal nothing
+      # ever closes, so a scripted caller waits forever instead of getting an
+      # exit status.
+      if [ -t 0 ]; then exec_tty=-it; else exec_tty=-i; fi
+      pm exec "$exec_tty" -u "$SHELL_USER" "$NAME" "$@"
       ;;
     develop)
       # Container-declared default flags (mkContainer `sessionFlags`),
@@ -266,6 +271,7 @@
       env_specs=()
       ${sessionEnvLines}
       develop_args=()
+      session_cmd=""
       ${developArgLines}
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -333,6 +339,11 @@
               echo "develop: --host-port requires a port" >&2; exit 2
             fi
             host_ports+=("$2"); shift 2 ;;
+          -c|--command)
+            if [ -z "''${2:-}" ]; then
+              echo "develop: --command requires a command" >&2; exit 2
+            fi
+            session_cmd="$2"; shift 2 ;;
           -D|--develop-arg)
             if [ -z "''${2:-}" ]; then
               echo "develop: --develop-arg requires a value" >&2; exit 2
@@ -842,6 +853,15 @@
         develop_cmd="$develop_cmd $(printf '%q' "$arg")"
       done
 
+      # --command: run one command in the dev shell and exit, instead of
+      # dropping into an interactive one. `nix develop --command` consumes
+      # the rest of its argv as the command, so it has to come last -- after
+      # the developArgs above -- and the whole thing goes through bash -lc so
+      # a command with pipes or redirections behaves the way it reads.
+      if [ -n "$session_cmd" ]; then
+        develop_cmd="$develop_cmd --command ${tools.bash} -lc $(printf '%q' "$session_cmd")"
+      fi
+
       # Hand the joiner registration over to the scope itself: by the time
       # this runs, the scope exists, so the watchdog can see a live shell.
       # Dropping the marker any earlier would reopen the window this is
@@ -1042,7 +1062,14 @@
         echo "develop: joining live session as shell #$shell_idx (its forwards stay up until the last shell exits)"
       fi
       echo "develop: $hostpath -> $proj_dir (HOME: $home_dir, scope: $scope)"
-      pm exec -it -u root "$NAME" \
+      # A TTY is what an interactive shell needs and what a one-shot
+      # command must not get: with -t podman allocates a pty that nothing
+      # ever closes, so a non-interactive caller (a test, a script, cron)
+      # hangs forever instead of collecting an exit status. Same when there
+      # is no terminal at all -- then even a bare `develop` reads its stdin
+      # and ends at EOF rather than waiting on a pty nobody is typing at.
+      if [ -n "$session_cmd" ] || [ ! -t 0 ]; then exec_tty=-i; else exec_tty=-it; fi
+      pm exec "$exec_tty" -u root "$NAME" \
         /run/current-system/sw/bin/systemd-run \
           --scope --collect --quiet \
           --unit="$scope" \
@@ -1399,6 +1426,10 @@
                                 that buys and what it costs. Use
                                 --template instead when the session must
                                 not be able to change it.
+    -c, --command CMD           run CMD in the dev shell and exit with
+                                its status, instead of opening an
+                                interactive shell. No TTY is allocated,
+                                so this is the form to use from a script.
     -D, --develop-arg ARG       extra argument for the session's
                                 \`nix develop\` (e.g. -D --impure).
                                 Repeatable; appended after any the

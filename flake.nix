@@ -564,7 +564,7 @@
           # into (and thus builds) the layer derivations as well as the
           # subcommand packages.
           ctTargets = ct: ct.packages // {
-            inherit (ct) rootfsFolder rootfsSquashfs
+            inherit (ct) run rootfsFolder rootfsSquashfs
                          nixStoreLower systemLower fuse;
             portable = ct.portable;
           };

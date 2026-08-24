@@ -1,0 +1,5 @@
+# Everything a test run touches lands here: podman storage, container state
+# dirs, the redirected XDG dirs, TMPDIR, build caches and logs. The suite
+# deletes it at the end and the last check asserts it is gone, so anything
+# still here after a run is either a bug or a `--keep` debugging session.
+scratch/
