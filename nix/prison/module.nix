@@ -119,7 +119,12 @@ let
           # and an empty file conjured here would hide it.
           ${concatMapStringsSep "\n" (s: concatMapStringsSep "\n" (pm: ''
             mkdir -p ${escapeShellArg pm.host}
-            chown ${escapeShellArg p.user} ${escapeShellArg pm.host}
+            # chown from inside the user namespace: the service runs as an
+            # unprivileged uid *in the container*, which on the host is a
+            # mapped subuid, not this user. Chowning to the host user would
+            # give the container root's id and leave the service unable to
+            # write its own state.
+            podman unshare chown ${toString s.uid}:${toString s.gid} ${escapeShellArg pm.host}
           '') (lib.filter (pm: !(pm.readOnly or false)) s.persist)) p.allServices}
 
           # One store view per service: each sees its own closure and nothing
