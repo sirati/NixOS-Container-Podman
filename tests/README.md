@@ -81,47 +81,39 @@ does: no gc root of this suite's is still live, so nothing is pinned.
 
 ## A failing check is a finding, not noise
 
-Several bugs turned up the first time these ran. All but one are fixed; that
-one's checks are left failing on purpose rather than skipped, because a skipped
-check is one nobody looks at again.
+Every bug below was found by these tests on their first run, and every one of
+them is the same bug wearing a different hat.
 
-**Fixed — unix socket paths could exceed `sun_path`, in three places.**
-`--host-port`, the `--agent-*` filter and `--git-serve` each create a socket
-under `$STATE_DIR` named after the project path. A unix socket address is
-capped at 108 bytes, so a deep project or a state dir anywhere but the default
-pushed it past the limit. `bind` then failed, and the symptoms were a port that
-simply never answered, "communication with agent failed", and "git server did
-not come up" — none of which points at a path being too long. All three now
-bind relative to the socket's own directory, where the name is a few bytes
-whatever the directory is called. Two of the three only surfaced after the
-first was fixed, which is the argument for having the suite at all.
+**Unix socket paths could exceed `sun_path`, in four places.** A unix socket
+address is capped at 108 bytes. Four sockets in this framework are named after
+the project path, under `$STATE_DIR`, so a deep project or any state dir but
+the default pushes them past the cap — and none of the four says so when it
+happens:
 
-**Open — only the first `develop` session on a container gets a working `-A`.**
-Every session after it gets an `$SSH_AUTH_SOCK` that exists, is a socket, and
-is served by an active in-container socat proxy — but the proxy's connect
-target, `$WORK_SHARED/.sockets/<session>/ssh-agent`, is never created for it,
-so the connection is accepted and then dies mid-protocol. `ssh-add` reports
-"error fetching identities: communication with agent failed".
+| site | what you saw instead |
+| --- | --- |
+| `--host-port` | the port simply never answered |
+| `--agent-*` filter | "communication with agent failed" |
+| `--git-serve` | "git server did not come up" |
+| the per-session host watchdog | *every* forward silently torn down |
 
-Reproduced on a fresh container, with the suite's own throwaway agent:
+The last is the one worth dwelling on. The watchdog listens on
+`$STATE_DIR/host-watchdog/<mount-id>/sock` and, on any connection, tears the
+session's host-side forwards down. Over the cap, `socat` could not listen at
+all — so the script fell straight through to the teardown code and dismantled
+the session it had just been started for. The forwards were created and, a
+quarter of a second later, deleted. What the session got was an
+`$SSH_AUTH_SOCK` that existed, was a socket, and had nothing behind it; what
+`ssh-add` reported was "communication with agent failed", which names neither
+the watchdog nor the path.
 
-```console
-$ develop -A --command 'ssh-add -l' /tmp/p1   # lists the key
-$ develop -A --command 'ssh-add -l' /tmp/p2   # communication with agent failed
-$ develop -A --command 'ssh-add -l' /tmp/p3   # and every one after
-```
+It presented as "only the first `develop` session on a container gets a working
+`-A`", because the first session's forwards had already been used by the time
+its watchdog killed them. That is why it survived normal use: a session you
+keep open works, and only the second project of the day does not.
 
-It is not a teardown race — a session started long after the previous one has
-settled fails the same way — and not key count. The project bind for the later
-session is made correctly; only the agent socket is unreachable.
+All four now bind relative to the socket's own directory, where the name is a
+few bytes whatever the directory is called. `bind_socket` also asserts its own
+post-condition, so a forward that is set up but not mounted fails where it
+happens rather than as a protocol error somewhere else.
 
-`bind_socket` now asserts its own post-condition, and that assertion does *not*
-fire here: the bind genuinely happens. It happens inside a `podman unshare`,
-which is a fresh mount namespace each time, and for the second session onward
-it does not propagate into the running container's namespace — where
-`$WORK_SHARED` is a peer of the mount the unshare sees, `shared:N master:1`.
-So the container has a socket to connect to and a proxy to serve it, and the
-proxy's target is a bind that only exists somewhere else.
-
-Four checks in `40-develop-options.sh` fail on this: `-A`, `--agent`,
-`--agent-allow` and `--agent-deny`.

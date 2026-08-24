@@ -1228,6 +1228,7 @@
         allowed="
           upper work merged nix-store-upper nix-store-work
           nix-store-lower.gcroot work-shared socket-mounts host-ports
+          socket-relays
           podman-root podman-runroot host-watchdog session-gcroots
           wprs-viewers wayland-acl native-acl agent-filter git-serve lower-mount fuse-store fuse-store.log
           .idle-activity .idle-monitor.lock .keepid-migrated

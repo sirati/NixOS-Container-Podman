@@ -30,10 +30,38 @@ in
   ${bin "rm"} -f "$SOCK"
 
   # Wait for any connection (= notification from inner watchdog).
-  ${tools.socat} -u UNIX-LISTEN:"$SOCK" - >/dev/null 2>&1
+  #
+  # Listened for from inside $SOCK_DIR, under the bare name. A unix socket
+  # address is capped at 108 bytes (sun_path), and this one is $STATE_DIR plus
+  # a mount id encoding the whole project path -- past the cap for a deep
+  # project or any state dir but the default. socat then failed to listen and
+  # this script fell straight through to the teardown below, dismantling the
+  # session it had just been started for: the forwards were set up, and a
+  # quarter of a second later they were gone. What the session saw was an
+  # agent socket with nothing behind it.
+  cd -- "$SOCK_DIR" || exit 0
+  ${tools.socat} -u UNIX-LISTEN:sock - >/dev/null 2>&1
 
   # Teardown host-side binds for THIS mount_id only.
   SM=$STATE_DIR/socket-mounts
+
+  # Socket forwards are host-side relays, so the sockets under $SM go away
+  # with the processes serving them; kill those first, by pid from their own
+  # pidfiles, so nothing is left forwarding into a session that has ended.
+  SR=$STATE_DIR/socket-relays/$MOUNT_ID
+  if [ -d "$SR" ]; then
+    for pf in "$SR"/*.pid; do
+      [ -e "$pf" ] || continue
+      rp=$(cat "$pf" 2>/dev/null || true)
+      case "$rp" in
+        ""|*[!0-9]*) ;;
+        *) kill "$rp" 2>/dev/null || true ;;
+      esac
+      ${bin "rm"} -f -- "$pf" "$pf.src" 2>/dev/null
+    done
+    ${bin "rmdir"} -- "$SR" 2>/dev/null
+  fi
+
   export _MID="$MOUNT_ID" _WS="$WORK_SHARED" _SM="$SM"
   ${tools.podman} unshare \
     ${tools.bash} -c '
