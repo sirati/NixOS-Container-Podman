@@ -396,9 +396,8 @@
           # than throwing at eval, which would break `nix flake check`).
           portable =
             if includeStore then portableTarball
-            else pkgs.runCommand "${name}-portable-unsupported" { } ''
-              echo "error: a portable tarball requires a self-contained container;" >&2
-              echo "       hostNixStore/hostNixDaemon containers have no portable target." >&2
+            else pkgs.runCommand "${name}-portable-not-implemented" { } ''
+              echo "error: portable tarball: hostNixStore/hostNixDaemon not implemented" >&2
               exit 1
             '';
         in

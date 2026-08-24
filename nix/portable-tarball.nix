@@ -43,18 +43,12 @@
 , useKeepId ? false
 , keepIdUid ? 1000
 , keepIdGid ? 100
-  # A portable tarball is ALWAYS self-contained: it ships its own
-  # /nix/store baked into the rootfs lower (the flake builds the
-  # rootfsFolder/rootfsSquashfs payload with includeStore = true) and
-  # the target host has neither the build host's /nix/store nor a
-  # nix-daemon. Both of these therefore MUST be false; they exist only
-  # so the assertion below can reject a misconfiguration explicitly.
+  # A portable tarball is always self-contained: it ships its own /nix/store
+  # baked into the rootfs lower, and the target host has neither the build
+  # host's store nor a nix-daemon. Taken only so they can be refused.
 , hostNixStore ? false
 , hostNixDaemon ? false
-  # isolateLan needs a namespace-owner rootfs and a catatonit binary, and
-  # this tarball ships neither -- so accepting it would produce a container
-  # with no isolation and no indication that the setting did nothing. It is
-  # taken only so it can be refused.
+  # Taken only so it can be refused; see the assertions below.
 , isolateLan ? false
   # These are plumbed through rather than refused: they become lines in the
   # generated script and need nothing from the host. They were simply never
@@ -70,15 +64,14 @@
 , format ? "squashfs"
 }:
 
-# Fail loudly on anything this target cannot honour. Silently dropping a
-# setting is worse than refusing it: the caller asked for something, got a
-# tarball, and has no way to know the setting did nothing.
+# Refuse anything this target cannot honour. Silently dropping a setting is
+# worse than refusing it: the caller asked for something, got a tarball, and
+# has no way to know the setting did nothing.
 assert pkgs.lib.elem format [ "squashfs" "folder" "both" ]
-  || throw "portable tarball: format must be \"squashfs\", \"folder\" or \"both\", not \"${toString format}\"";
-assert (!hostNixStore && !hostNixDaemon)
-  || throw "portable tarball must be self-contained: hostNixStore/hostNixDaemon are not supported on a portable target (the target host has no shared /nix/store or nix-daemon)";
-assert (!isolateLan)
-  || throw "portable tarball: isolateLan is not supported. It needs a namespace-owner rootfs and a catatonit binary (see nix/net-owner.nix), and this tarball ships neither -- the result would have no network isolation and nothing would say so.";
+  || throw "portable tarball: format \"${toString format}\" not implemented";
+assert (!hostNixStore) || throw "portable tarball: hostNixStore not implemented";
+assert (!hostNixDaemon) || throw "portable tarball: hostNixDaemon not implemented";
+assert (!isolateLan) || throw "portable tarball: isolateLan not implemented";
 
 let
   toolsLib = import ./scripts/tools.nix;

@@ -152,7 +152,7 @@ let
   gitServeGuard =
     if gitServeHooks != null then ""
     else ''
-      echo "git serving is not available in this build" >&2
+      echo "git serving: not implemented in this build" >&2
       return 1
     '';
 
