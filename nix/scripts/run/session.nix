@@ -173,10 +173,15 @@
     # marker would mean writing into the served repository, which is the
     # one thing this mode exists to avoid. The socket is 0600 and is only
     # ever bound into this one session.
-    GIT_CONFIG_SYSTEM="$cfg" NIXCT_GIT_PUSH_GLOB="$glob" \
-      nohup ${tools.socat} "UNIX-LISTEN:$sock,fork,mode=0600" \
-        "EXEC:${tools.git} daemon --inetd --export-all --enable=receive-pack --base-path=$hostpath" \
-        </dev/null >"$dir/$mount_id.log" 2>&1 &
+    # Bound relative to $dir, like the agent filter and the host-port bridge:
+    # $STATE_DIR plus a mount id that encodes the whole project path runs past
+    # the 108-byte cap on a unix socket address, and the only symptom is this
+    # function timing out with "git server did not come up".
+    ( cd "$dir" \
+      && GIT_CONFIG_SYSTEM="$cfg" NIXCT_GIT_PUSH_GLOB="$glob" \
+         exec nohup ${tools.socat} "UNIX-LISTEN:$mount_id.sock,fork,mode=0600" \
+           "EXEC:${tools.git} daemon --inetd --export-all --enable=receive-pack --base-path=$hostpath" \
+           </dev/null >"$mount_id.log" 2>&1 ) &
     disown
     echo $! > "$pid_file"
     local _i

@@ -81,18 +81,20 @@ does: no gc root of this suite's is still live, so nothing is pinned.
 
 ## A failing check is a finding, not noise
 
-Two bugs turned up the first time these ran. One is fixed; the other is not,
-and its checks are left failing on purpose rather than skipped, because a
-skipped check is one nobody looks at again.
+Several bugs turned up the first time these ran. All but one are fixed; that
+one's checks are left failing on purpose rather than skipped, because a skipped
+check is one nobody looks at again.
 
-**Fixed — unix socket paths could exceed `sun_path`.** `--host-port` and the
-`--agent-*` filter each create a socket under `$STATE_DIR`, named after the
-project path. A unix socket address is capped at 108 bytes, so a deep project
-or a state dir anywhere but the default pushed it past the limit; `bind` then
-failed and the symptom was "communication with agent failed" or a port that
-simply never answered — neither of which points at a path being too long. Both
-now bind relative to the socket's own directory, where the name is a few bytes
-whatever the directory is called.
+**Fixed — unix socket paths could exceed `sun_path`, in three places.**
+`--host-port`, the `--agent-*` filter and `--git-serve` each create a socket
+under `$STATE_DIR` named after the project path. A unix socket address is
+capped at 108 bytes, so a deep project or a state dir anywhere but the default
+pushed it past the limit. `bind` then failed, and the symptoms were a port that
+simply never answered, "communication with agent failed", and "git server did
+not come up" — none of which points at a path being too long. All three now
+bind relative to the socket's own directory, where the name is a few bytes
+whatever the directory is called. Two of the three only surfaced after the
+first was fixed, which is the argument for having the suite at all.
 
 **Open — only the first `develop` session on a container gets a working `-A`.**
 Every session after it gets an `$SSH_AUTH_SOCK` that exists, is a socket, and
