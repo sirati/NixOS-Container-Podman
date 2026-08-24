@@ -116,6 +116,14 @@ the next flag as the command: ``executable file `--user` not found in ``.
 on and mounts tmpfs at `/run`, `/tmp` and `/var/tmp`; a read-only rootfs cannot
 create the mount point, and crun fails before the service starts.
 
+**The netns owner is the pod's infra container.** `<n>-infra`, running
+podman's built-in `/catatonit -P`. No image pull, no rootfs derivation, and no
+coreutils in the namespace-owning container -- `net-gateway.nix` needs a store
+rootfs and `sleep infinity` for the same job. Verified: the host loads the
+generated ruleset into it with `podman unshare nsenter --net=/proc/<pid>/ns/net
+nft -f`, and reading it back from inside the namespace shows `policy drop`
+intact.
+
 **The store view needs `--allow-other`.** The FUSE mount is owned by the
 prison's host user; the container runs as a mapped subuid. Without it the
 kernel denies access and crun reports ``failed to exec pid1: Permission
