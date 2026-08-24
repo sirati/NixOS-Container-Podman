@@ -596,6 +596,13 @@
       nixosConfigurations.example = example.nixosSystem;
 
       nixosModules.nixct = import ./nix/nixos-module.nix { inherit mkNixct; };
+
+      # services.prisons. Takes pkgs from the importing configuration rather
+      # than this flake's, so a consumer's nixpkgs is what builds the services.
+      nixosModules.prisons = { pkgs, ... }@args:
+        (import ./nix/prison/module.nix {
+          prison = import ./nix/prison { inherit pkgs; };
+        }) args;
       nixosModules.default = self.nixosModules.nixct;
     };
 }
