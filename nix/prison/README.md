@@ -6,7 +6,14 @@ A default-deny podman jail for services, built on `nix-store-lower`,
 
 ## Shape
 
-`mkPrison` is a podman **pod**; `mkPrisonService` is a container in it.
+`mkPrison` is a set of containers sharing one network namespace. `<n>-net`
+owns it and every service joins with `--network=container:<n>-net`.
+
+No podman pod: a pod's infra container comes from podman's image machinery,
+and whether that pulls an OCI image is decided by `infra_image` in the host's
+`containers.conf` rather than by anything declared here. `<n>-net` is a
+`--rootfs` container from the store running one statically linked binary --
+catatonit copied in at `/pause`, no bind mounts, no `/nix/store`, no libc.
 
 Several services in one *container* would need a supervisor, every supervisor
 worth using (s6, runit) needs a writable scan directory, and this rootfs is a
@@ -116,13 +123,22 @@ the next flag as the command: ``executable file `--user` not found in ``.
 on and mounts tmpfs at `/run`, `/tmp` and `/var/tmp`; a read-only rootfs cannot
 create the mount point, and crun fails before the service starts.
 
-**The netns owner is the pod's infra container.** `<n>-infra`, running
-podman's built-in `/catatonit -P`. No image pull, no rootfs derivation, and no
-coreutils in the namespace-owning container -- `net-gateway.nix` needs a store
-rootfs and `sleep infinity` for the same job. Verified: the host loads the
-generated ruleset into it with `podman unshare nsenter --net=/proc/<pid>/ns/net
-nft -f`, and reading it back from inside the namespace shows `policy drop`
-intact.
+**The namespace owner runs with no image.** Verified on a live container:
+
+```
+image="" path=/pause args=["-P"] status=running
+owner netns  : net:[4026533597]
+service netns: net:[4026533597]
+```
+
+The host loads the ruleset into it with `podman unshare nsenter
+--net=/proc/<pid>/ns/net nft -f`; listing it back from inside shows `policy
+drop` with only the declared ports accepted.
+
+**A static binary must be copied in, not bind-mounted.** crun has to create the
+mount point before mounting, and cannot in a read-only rootfs: `mkdir
+/nix/store/...-catatonit-0.2.1: Permission denied`. `/pause` is a build-time
+copy instead, which is also why that container needs no `/nix/store`.
 
 **The store view needs `--allow-other`.** The FUSE mount is owned by the
 prison's host user; the container runs as a mapped subuid. Without it the

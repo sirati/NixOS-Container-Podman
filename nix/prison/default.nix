@@ -1,16 +1,19 @@
 # mkPrison / mkPrisonService: a default-deny podman jail for services.
 #
-# A prison is a podman *pod*; each service in it is a container in that pod.
+# A prison is a set of containers sharing one network namespace: <n>-net owns
+# it, and every service joins with --network=container:<n>-net. No podman pod,
+# because a pod's infra container comes from podman's image machinery and
+# whether that pulls an OCI image depends on the host's containers.conf.
 # That is a deliberate departure from "several services in one container", and
 # the reason is mechanical rather than stylistic: running N processes inside
 # one container requires a supervisor, every supervisor worth using (s6,
 # runit) needs a writable scan directory, and the rootfs here is a read-only
-# store path with no shell and no coreutils to populate one at startup. A pod
-# gets the same property -- services sharing one loopback interface and
-# nothing else -- with each service confined to its own mount namespace and
-# its own store view, and no supervisor anywhere: systemd on the host restarts
-# a container, and catatonit inside it does nothing but forward signals and
-# reap, because PID 1 in a namespace ignores every signal it has no handler
+# store path with no shell and no coreutils to populate one at startup.
+# Separate containers give the same property -- services sharing one loopback
+# and nothing else -- with each service confined to its own mount namespace
+# and its own store view, and no supervisor anywhere: systemd on the host
+# restarts a container, and catatonit inside it only forwards signals and
+# reaps, because PID 1 in a namespace ignores every signal it has no handler
 # for (pid_namespaces(7)).
 #
 # What each service can see of /nix/store is its own closure and nothing more,
@@ -138,6 +141,28 @@ let
 
       ruleset = mkRuleset { inherit pkgs lib listen egress; };
 
+      # The container that owns the network namespace, following
+      # net-gateway.nix. Deliberately NOT a podman pod: a pod's infra
+      # container comes from podman's own image machinery, and `infra_image`
+      # is a containers.conf setting -- so whether an OCI image gets pulled
+      # depends on host configuration rather than on anything here. A
+      # --rootfs container from the store cannot surprise anyone.
+      #
+      # It runs catatonit in pause mode. catatonit is statically linked, so
+      # the rootfs needs nothing but the skeleton and one bind-mounted store
+      # path: no coreutils, no libc, no `sleep`.
+      netRootfs = mkRootfs {
+        inherit pkgs lib;
+        name = "${name}-net";
+        users = [ ];
+        embed = [ { path = "/pause"; source = "${pkgs.catatonit}/bin/catatonit"; } ];
+      };
+      # Inside the namespace owner. Not a store path: that container has no
+      # /nix/store, by design.
+      pause = "/pause";
+      # For --init on service containers, where podman bind-mounts it itself.
+      initBin = "${pkgs.catatonit}/bin/catatonit";
+
       # No declared port and no declared egress means the pod needs no
       # interface at all: --network=none leaves it with loopback only, which
       # is the documented default rather than a firewall that happens to drop
@@ -153,7 +178,8 @@ let
         (listen.udp or [ ]);
     in
     builtins.seq _check {
-      inherit name svcList ruleset wantsNetwork publishArgs user stateDir listen egress;
+      inherit name svcList ruleset wantsNetwork publishArgs user stateDir listen egress
+        netRootfs pause initBin;
       fuse = fuse;
       __prison = true;
     };
