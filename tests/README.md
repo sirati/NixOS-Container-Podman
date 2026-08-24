@@ -7,113 +7,53 @@ $ tests/run.sh 20 30        # only cases whose filename matches
 $ tests/run.sh --keep       # leave tests/scratch for inspection
 ```
 
-The suite starts real containers. What makes that safe to run on a machine
-that already has its own podman and its own nix-dev-container is that
-`lib.sh` redirects every path a test could write to into `tests/scratch`
-before anything runs:
+The suite starts real containers. What makes that safe on a machine with its
+own podman and its own nix-dev-container is that `lib.sh` redirects every path
+a test could write to into `tests/scratch` first:
 
-| redirected | why it has to be |
+| redirected | why |
 | --- | --- |
-| `STATE_DIR` | the framework's own tree; podman's `--root`/`--runroot` are derived from it, so this redirects podman too |
-| `XDG_RUNTIME_DIR` | holds the pause process that owns the rootless user namespace — left alone, a test would join, or on an idle machine *create*, the user's |
+| `STATE_DIR` | the framework's own tree; podman's `--root`/`--runroot` derive from it |
+| `XDG_RUNTIME_DIR` | holds the rootless pause process |
 | `XDG_CONFIG_HOME` | `containers.conf`, `storage.conf` |
 | `XDG_DATA_HOME` | podman's default storage |
 | `XDG_STATE_HOME` | the run script's default `STATE_DIR` |
 | `XDG_CACHE_HOME` | nix's eval and fetcher caches |
-| `TMPDIR` | podman and nix both scribble here |
+| `TMPDIR` | podman and nix both use it |
 
-`HOME` is deliberately not redirected — nix needs it, and nothing under it
-is written once the four XDG vars point elsewhere. The last check verifies
-that claim rather than trusting it.
+`HOME` is deliberately not redirected — nix needs it, and nothing under it is
+written once the four XDG vars point elsewhere.
 
 ## The last check
 
-Teardown runs each container's own `down` and `purge` (they know about the
-mounts, watchdogs and session users), kills the scratch pause process by
-pid from its own pidfile, and removes the directory. Then:
+Teardown runs each container's own `down` and `purge`, kills the scratch pause
+process by pid, and removes the directory. Then it asserts:
 
 - the scratch directory is gone
 - git sees nothing left in the working tree
-- the host's podman and state dirs are byte-identical to the snapshot
-  taken before the run — read off the filesystem rather than by asking
-  podman, since invoking the user's podman would itself start their pause
-  process
+- the host's podman and state dirs match the snapshot taken before the run
 - nothing is mounted under the scratch path
 - no process is holding it
-- no *live* gc root points into it (a purged state dir leaves its indirect
-  roots dangling; those pin nothing and nix removes them on its next
-  collection — a live one would mean the suite is still holding store
-  paths)
+- no live gc root points into it
+
+Realised store paths are the one thing a run leaves behind, unrooted and
+collected by the next `nix-collect-garbage`.
 
 ## Cases
 
-| case | what it covers |
+| case | covers |
 | --- | --- |
-| `00-eval.sh` | everything decidable without a container: the podman model's ordering and quoting rules, the prison's default-deny invariants and typed capabilities, and that every unsupported value fails with "not implemented" |
-| `10-selfcontained.sh` | store baked into the rootfs, own nix-daemon inside, host store not visible |
-| `20-hostdaemon.sh` | host `/nix` bind-mounted read-only, builds delegated to the host daemon, no daemon inside, and a real dev shell entered non-interactively |
-| `30-nixct.sh` | `mkNixct`'s own choices — root shell user, ephemeral storage, idle timeout — and two sessions sharing one project |
+| `00-eval.sh` | the podman model's ordering and quoting, the prison's default-deny invariants and typed capabilities, and that unsupported values fail with "not implemented" |
+| `10-selfcontained.sh` | store baked into the rootfs, own nix-daemon, host store not visible |
+| `20-hostdaemon.sh` | host `/nix` read-only, builds delegated to the host daemon, no daemon inside |
+| `30-nixct.sh` | `mkNixct`'s own choices, and two sessions sharing one project |
+| `40-develop-options.sh` | all 26 flags `develop` accepts |
 
 Every variant runs the same lifecycle from `lib.sh`: up, status, exec,
-`develop --command` on a project with no flake (which proves the session
-path runs and returns an exit status rather than hanging on a pty), down,
-status, purge, and that purge left no state dir.
+`develop --command`, down, status, purge.
 
-## develop's flags
-
-`40-develop-options.sh` covers all 26 flags `develop` accepts. Its first
-check reads the flag list out of the argument loop in `dispatch.nix` and
-fails if any of them is not named in the file — as covered, or as a skip
-with a reason. A flag added later cannot quietly go untested.
-
-The five that need something the machine may not have — `--x11`,
-`--x11-untrusted`, `--wayland`, `--wprs`, `--dbus` — are attempted when the
-host offers a display or a session bus and reported as skips, with the
-reason, when it does not.
-
-## What a run does leave behind
-
-Store paths. Building a container realises derivations, and those stay in
-`/nix/store` like any other build output — unrooted, so nix collects them
-whenever it next runs a garbage collection. That is the only thing a run
-adds outside `tests/scratch`, and the residue check verifies nothing else
-does: no gc root of this suite's is still live, so nothing is pinned.
-
-## A failing check is a finding, not noise
-
-Every bug below was found by these tests on their first run, and every one of
-them is the same bug wearing a different hat.
-
-**Unix socket paths could exceed `sun_path`, in four places.** A unix socket
-address is capped at 108 bytes. Four sockets in this framework are named after
-the project path, under `$STATE_DIR`, so a deep project or any state dir but
-the default pushes them past the cap — and none of the four says so when it
-happens:
-
-| site | what you saw instead |
-| --- | --- |
-| `--host-port` | the port simply never answered |
-| `--agent-*` filter | "communication with agent failed" |
-| `--git-serve` | "git server did not come up" |
-| the per-session host watchdog | *every* forward silently torn down |
-
-The last is the one worth dwelling on. The watchdog listens on
-`$STATE_DIR/host-watchdog/<mount-id>/sock` and, on any connection, tears the
-session's host-side forwards down. Over the cap, `socat` could not listen at
-all — so the script fell straight through to the teardown code and dismantled
-the session it had just been started for. The forwards were created and, a
-quarter of a second later, deleted. What the session got was an
-`$SSH_AUTH_SOCK` that existed, was a socket, and had nothing behind it; what
-`ssh-add` reported was "communication with agent failed", which names neither
-the watchdog nor the path.
-
-It presented as "only the first `develop` session on a container gets a working
-`-A`", because the first session's forwards had already been used by the time
-its watchdog killed them. That is why it survived normal use: a session you
-keep open works, and only the second project of the day does not.
-
-All four now bind relative to the socket's own directory, where the name is a
-few bytes whatever the directory is called. `bind_socket` also asserts its own
-post-condition, so a forward that is set up but not mounted fails where it
-happens rather than as a protocol error somewhere else.
-
+`40-develop-options.sh` reads the flag list out of the argument loop in
+`dispatch.nix` and fails if a flag is not named in the file, as covered or as
+an explicit skip — so a flag added later cannot go untested. The five needing a
+display (`--x11`, `--x11-untrusted`, `--wayland`, `--wprs`, `--dbus`) are
+attempted when the host offers one and reported as skips when it does not.

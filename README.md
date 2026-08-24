@@ -10,27 +10,17 @@ Most of this repo is meant to be consumed by other nix projects: each primitive
 is a flake output you can take on its own, and `mkContainer` is the one that
 ties them together.
 
-- **Runs on NixOS, and on any other Linux distribution.** On NixOS it uses what
-  is already there. Elsewhere the [portable tarball](#portable-tarball) carries
-  its own store and needs no nix on the host at all.
-- **Shares the host's `/nix`** — the store, the database and the daemon socket —
-  so a container builds through the host's nix-daemon and adds nothing to disk.
-  It runs no daemon of its own and needs no nixbld users.
-- **Or shows the container a restricted store**, with no daemon involved at
-  all. `nix-store-shared-fuse` serves a symlink farm over the host store, so a
-  container sees the paths of its own closure and nothing else — and the farm
-  is just a derivation, so the view can be narrowed or composed to whatever set
-  of paths you want. Because this needs nothing but read access to the store,
-  it is also how a host with a *single-user* nix install shares one.
-- **Podman command lines are a validated nix model, not strings.** Every
-  invocation is typed in `nix/podman.nix` and rendered from it, so the mistakes
-  that actually happen — `--rootfs` not last, a port published into a namespace
-  the container does not own, a capability without its `CAP_` prefix — are
-  evaluation errors instead of runtime ones.
-- **`mkPrison` builds deny-by-default services.** A prison is a set of
-  containers sharing one network namespace, each running one systemd-managed
-  service with no shell, no package manager, no capabilities and no network
-  beyond loopback until something is granted by name.
+- **Runs on NixOS, and on any other Linux distribution.** Elsewhere the
+  [portable tarball](#portable-tarball) carries its own store and needs no nix
+  on the host.
+- **Shares the host's `/nix`** — store, database and daemon socket — so a
+  container builds through the host's nix-daemon and adds nothing to disk.
+- **Or serves a restricted store view** through `nix-store-shared-fuse`: a
+  symlink farm of whatever paths you choose, needing no daemon, so a
+  single-user nix install can share its store too.
+- **Podman command lines are generated from a nix model and validated at eval
+  time.** None are written by hand.
+- **`mkPrison` builds deny-by-default services**, and is backend agnostic.
 
 `nixct`, a develop container with per-project throwaway users and forwarded
 sockets, is one preset built on all of this — see [nixct.md](nixct.md).
@@ -38,43 +28,31 @@ sockets, is one preset built on all of this — see [nixct.md](nixct.md).
 ## What this repo provides
 
 **1. `lib.mkContainer` — a NixOS system as a rootless podman container.**
-Takes NixOS modules, returns a rootfs plus a run script that drives podman
-(`up`, `enter`, `exec`, `boot`, `status`, `logs`, `down`, `purge`). Configured
-along [orthogonal axes](#configuration-axes): where the writable layer lives,
-how the base layer is packaged, and where `/nix/store` comes from. Nothing
-about it is dev-container specific.
+NixOS modules in, a rootfs plus a run script out (`up`, `enter`, `exec`,
+`boot`, `status`, `logs`, `down`, `purge`). Configured along
+[orthogonal axes](#configuration-axes). Nothing about it is dev-container
+specific.
 
 **2. `lib.mkPrison` / `lib.mkPrisonService` — deny-by-default confinement.**
-Describes WHAT a service may do; nothing in it names a container runtime, a
-flag, or a command line. Everything is forbidden until granted by name: no
-network beyond loopback, every listening port declared per protocol, every
-egress destination declared, no capabilities (a typed set, one named field
-per capability, all defaulting to false), read-only root, and writable state
-only where asked for and always `noexec,nosuid,nodev`. See
+Backend agnostic: says what a service may do, never how to run it. See
 [`nix/prison/README.md`](nix/prison/README.md).
 
-**3. Layer derivations, separately consumable.** `systemLower` (FHS skeleton +
-prebuilt nix database), `nixStoreLower` (the closure as a symlink farm),
-`rootfsFolder` / `rootfsSquashfs` (the assembled base), and a
+**3. Layer derivations, separately consumable.** `systemLower`,
+`nixStoreLower`, `rootfsFolder` / `rootfsSquashfs`, and a
 [portable tarball](#portable-tarball) that runs on a host with no nix at all.
 
 **4. `nix-store-shared-fuse` — a read-only FUSE for a host `/nix/store`.**
-Serves the host store into a container through a symlink-farm view, so the
-container gets the paths of its closure and nothing else. It is a standalone
-binary (`nix run .#<container>.fuse`) usable outside this framework; the
-`hostNixStore` axis is just the framework wiring it up. See
-[where `/nix/store` comes from](#hostnixstore--hostnixdaemon--where-nixstore-comes-from).
+Serves a symlink-farm view, so a container sees its own closure and nothing
+else. A standalone binary; the `hostNixStore` axis is the framework wiring it
+up.
 
 **5. `ssh-agent-filter` — a filtering proxy for the SSH agent protocol.**
-Forwards a restricted view of an agent: keys chosen by fingerprint or comment,
-with adding, removing and locking always refused. A standalone binary, not tied
-to containers.
+Forwards only the keys a policy names; adding, removing and locking are always
+refused. A standalone binary, not tied to containers.
 
-**6. `nix/podman.nix` — the validated model of the podman invocations.**
-Callers describe what they want as typed nix and the renderer produces argv;
-no command line is written by hand anywhere in this repo. It needs only `lib`,
-so the portable tarball's script is generated from the same model as the NixOS
-one.
+**6. `nix/podman.nix` — the podman option model.** Typed nix in, argv out,
+validated at eval time. Needs only `lib`, so the portable tarball is generated
+from the same model as the NixOS target.
 
 Also included: `check-host-compat`, a standalone probe that tells you whether a
 host can run any of this (binaries, kernel features, fuse, rootless setup).
@@ -295,18 +273,9 @@ A portable tarball is **self-contained only**: `hostNixStore` and
 
 ## `mkPrison` — deny-by-default services
 
-A **prison** is a set of containers sharing one network namespace. `infra-net`
-owns that namespace and does nothing else; every other service is placed inside
-it rather than getting one of its own. `infra-net` is not special-cased — it is
-an ordinary prison service whose exec happens to be a pause process, so it gets
-the same rootfs, the same store view and the same denials as everything else.
-
-Each service is its own container, so there is no supervisor anywhere: systemd
-on the host restarts a container, and the init inside only forwards signals and
-reaps. What a service sees of `/nix/store` is its own closure and nothing more,
-served by `nix-store-shared-fuse` over the symlink farm. No shell, no
-coreutils, no package manager — a process that achieves code execution has no
-second binary to reach for.
+One container per service, sharing a single network namespace, with nothing
+allowed until it is named. Backend agnostic: the definition says what a service
+may do, never how to run it.
 
 ```nix
 let prison = nixos-container-podman.lib.x86_64-linux; in
@@ -326,10 +295,7 @@ prison.mkPrison {
 }
 ```
 
-A capability is a named field, not a string: an unknown one is an evaluation
-error naming the file and line, where a misspelled string would render a flag
-that grants nothing while reading as though it granted something. Full detail
-in [`nix/prison/README.md`](nix/prison/README.md).
+Detail in [`nix/prison/README.md`](nix/prison/README.md).
 
 ## Tests
 
@@ -338,13 +304,9 @@ $ tests/run.sh              # everything
 $ tests/run.sh --quick      # only what needs no container
 ```
 
-The suite starts real containers, and redirects every path they could write to
-— `STATE_DIR` and with it podman's `--root`/`--runroot`, `XDG_RUNTIME_DIR`, the
-other XDG dirs and `TMPDIR` — into a gitignored `tests/scratch`. The last check
-proves the redirect held and the cleanup was total: the scratch dir is gone,
-git sees nothing left, the host's podman and state dirs are identical to the
-snapshot taken before the run, and nothing is mounted, running, or pinning
-store paths under the scratch path. See [`tests/README.md`](tests/README.md).
+Real containers, with every path they could write to redirected into a
+gitignored `tests/scratch`; the last check proves the cleanup was total. See
+[`tests/README.md`](tests/README.md).
 
 ## `nixct`
 

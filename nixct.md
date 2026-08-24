@@ -65,24 +65,14 @@ session. It can never land in one that is being dismantled.
 
 ### `--native` (`develop` only) — the real filesystem, not FUSE
 
-bindfs rewrites ownership so a session user can write the project. A FUSE
-`ioctl` cannot carry the fd `FICLONE` needs, so reflinks are impossible through
-it and a copy-on-write filesystem degrades to whole-file copies.
-
 ```sh
 nixct develop --native ~/project
 ```
 
-Mounts the project as a plain bind instead. Access comes from an ACL rather
-than rewritten ownership: the container id map already gives the session user a
-real host uid, so granting *that* uid `rwx` — plus default entries, so you keep
-access to what the session creates — lets it in with ownership untouched. An
-idmapped mount would be the obvious alternative; the kernel refuses it rootless
-(`CAP_SYS_ADMIN` in the superblock's user namespace).
-
-Probed, not assumed: one 4 KiB file, an ioctl, an ACL. A directory failing
-either falls back to bindfs and says so, so turning it on cannot break a
-session. `--no-native` forces bindfs.
+Mounts the project as a plain bind instead of bindfs, so reflinks work —
+`FICLONE` cannot pass through a FUSE ioctl. Access comes from an ACL on the
+session user's mapped host uid, leaving ownership untouched. A directory that
+fails the probe falls back to bindfs and says so; `--no-native` forces it.
 
 | | bindfs (default) | `--native` |
 |---|---|---|
@@ -91,11 +81,9 @@ session. `--no-native` forces bindfs.
 | files a session creates | owned by you | mapped subuid (you keep `rwx`) |
 | hidden from other sessions | ✓ (`--perms="og="`) | ✗ — host permissions apply |
 
-Ownership stays with the host, so git and libgit2 reject the repository
-(CVE-2022-24765) and nix fetches flakes through libgit2. Each native mount is
-therefore recorded as a `safe.directory` in whichever global config
-`--mount-gitconfig` did not take. Chowning instead is not an option: a bind
-shares the inode, so it would chown your host directory.
+Ownership stays with the host, so each native mount is recorded as a git
+`safe.directory` — otherwise git and libgit2 refuse the repository
+(CVE-2022-24765) and nix cannot evaluate the flake in it.
 
 Shares take the same mode — `--share hostpath[:name]:native`, or
 `mode = "native"` in `sessionShares`.
@@ -126,15 +114,9 @@ sessionShares = [{
 }];
 ```
 
-**If the host directory does not exist**, the two forms differ on purpose:
-
-- **declared** (`sessionShares`, `sessionTemplates`) — created for you. It is a
-  provisioning statement, so requiring you to pre-create it by hand would be
-  friction for nothing.
-- **CLI** (`--share`, `--template`) — hard error, exit 2, before any session
-  setup: nothing is created and no session starts. Silently creating a
-  mistyped path would hand you an empty directory that looks like your cache
-  and quietly loses what you expected to find in it.
+**If the host directory does not exist**: declared shares and templates are
+created for you; `--share` and `--template` are a hard error, exit 2, before
+any session setup.
 
 The source and target are independent — `name` is the target *inside* the
 session HOME, and defaults to the source's basename only when omitted:
@@ -150,16 +132,10 @@ template.
 
 ### Terminal capabilities
 
-`TERM`, `COLORTERM` and `TERM_PROGRAM*` are forwarded from the invoking
-terminal into `enter` and `develop` sessions, the way ssh does it. Without
-that, `podman exec -t` hands the session a bare `TERM=xterm` whatever the
-real terminal is, and full-screen TUIs drop to 16 colours and no truecolor.
-The container carries a full terminfo database, so the forwarded value
-resolves.
-
-`LANG`/`LC_*` are deliberately **not** forwarded: the container has its own
-locale archive, and a host locale it does not carry would make every program
-warn. Its default is UTF-8 already, which is what TUI drawing needs.
+`TERM`, `COLORTERM` and `TERM_PROGRAM*` are forwarded into `enter` and
+`develop` sessions, the way ssh does it; the container carries a full terminfo
+database so the value resolves. `LANG`/`LC_*` are not forwarded — the container
+has its own locale archive and defaults to UTF-8.
 
 ### `--git-serve BRANCH[:PUSH-GLOB]` (`develop` only) — a remote, not a mount
 
@@ -170,33 +146,21 @@ nixct develop --git-serve 'main:main-*' ~/project
 ```
 
 `~/dev` becomes a **clone**, not the real tree. The session reads only
-`BRANCH` — every other ref is hidden, so the rest of the history is not
-merely unwritable but invisible — and can push only branches matching
-`PUSH-GLOB` (default: `BRANCH` itself). Nothing it does can touch a ref
-outside that, and a mistake lands in its own clone rather than in your
-working tree.
-
-Both halves are git's own, and neither writes to the served repository:
+`BRANCH` — every other ref is hidden — and can push only branches matching
+`PUSH-GLOB` (default: `BRANCH` itself).
 
 | | mechanism |
 |---|---|
 | read | `uploadpack.hideRefs` — hides every ref but `BRANCH` |
 | write | a `pre-receive` hook matching the branch against `PUSH-GLOB` |
 
-The split is forced: git refuses to update a *hidden* ref at all, so
-`hideRefs` cannot express a push policy wider than one exact branch, and the
-hook does that job instead. Both arrive through `GIT_CONFIG_SYSTEM` on the
-daemon, so the repository keeps its own config and hooks untouched.
+Both arrive through `GIT_CONFIG_SYSTEM`, so the served repository keeps its own
+config and hooks. The daemon runs on the host, reached through a unix socket
+bound into the container, and is torn down with the session.
 
-The daemon runs on the **host** and is reached through a unix socket bound
-into the container, with a TCP proxy on the far side because `git://` has no
-unix-socket form. The container has its own netns, so `127.0.0.1:9418` there
-is reachable by nothing else. It is torn down with the session.
-
-Needs `git` in the container package set. Pushing to the branch that is
-checked out on the host is refused by git itself (`receive.denyCurrentBranch`),
-which is why a postfix glob is the useful shape: the session works on
-`main-something` and you merge it yourself.
+Needs `git` in the container package set. Pushing to the branch checked out on
+the host is refused by git itself (`receive.denyCurrentBranch`), so a postfix
+glob is the useful shape.
 
 ### `--agent-allow` / `--agent-deny` (`develop` only) — a filtered agent
 
@@ -208,28 +172,18 @@ nixct develop -A --agent-allow 'Github*' ~/project
 nixct develop -A --agent-deny 'Sudo*'   ~/project
 ```
 
-A spec is a SHA256 fingerprint (as `ssh-add -l` prints it, with or without
-the `SHA256:` prefix) or a key comment, where `*` globs. Repeatable; the two
-are mutually exclusive — with both lists it would be unreadable which way an
-unlisted key falls, and that is not a good thing to guess about an ssh key.
+A spec is a SHA256 fingerprint (as `ssh-add -l` prints it, with or without the
+`SHA256:` prefix) or a key comment, where `*` globs. Repeatable, and the two
+are mutually exclusive.
 
-Filtered keys are removed from identity listings **and** refused for signing,
-so a client that already knows a key blob cannot use it by asking directly.
-Refusals never reach the upstream agent, so a key behind a confirmation
-prompt does not even flash one up.
+Filtered keys are hidden from identity listings and refused for signing, and
+refusals never reach the upstream agent. Anything that would *change* the agent
+— adding or removing identities, smartcard keys, locking — is always refused,
+as are extensions (`--allow-extensions` on the binary opts in).
 
-Independently of any policy, everything that would *change* the agent is
-refused: adding and removing identities, smartcard keys, and locking. A
-sandbox with borrowed keys has no business adding one, and locking would be a
-denial of service against the agent's real owner. Extensions are refused too
-(their semantics cannot be policed); `--allow-extensions` on the binary opts
-in.
-
-The filter — [`ssh-agent-filter`](ssh-agent-filter/), a small Rust proxy —
-runs **on the host**, one per session, and the container is handed only the
-socket it serves. A filter inside the container would sit on the wrong side
-of the boundary it enforces. It is torn down with the session by the host
-watchdog, so the grant does not outlive what it was granted to.
+[`ssh-agent-filter`](ssh-agent-filter/) runs on the host, one per session, and
+the container is handed only the socket it serves. It is torn down with the
+session.
 
 ### `--host-port PORT` (`develop` only) — a host loopback service in the session
 
@@ -240,12 +194,9 @@ session. Repeatable.
 nixct develop --host-port 8787 ~/project
 ```
 
-Deliberately **not** a network route. Loopback-only services often
-authenticate the caller by looking it up in the host's `/proc/net/tcp` and
-reading the socket's owner uid — and fail closed when the peer is not there.
-A connection made from the container's netns is not in that table at all, so
-it would be refused however the packets arrived. So the bridge goes through a
-unix socket instead:
+Not a network route: the bridge goes through a unix socket, so the TCP
+connection the service sees is opened by a host process owned by you. Services
+that authenticate the caller via `/proc/net/tcp` therefore still accept it.
 
 ```
 session → 127.0.0.1:PORT in the container   (socat, container side)
@@ -253,13 +204,8 @@ session → 127.0.0.1:PORT in the container   (socat, container side)
         → 127.0.0.1:PORT on the host        (socat, host side, as you)
 ```
 
-The TCP connection the service sees is opened by a host process owned by the
-invoking user, which is what such a check asks about.
-
-One bridge per port, shared by every session of the container — it has a
-single netns, so the port can only be bound once. Anything running in the
-container can therefore reach that port: it is exactly as trusted as the
-service behind it. The host side is torn down with the container.
+One bridge per port, shared by every session of the container, so anything in
+it can reach that port. Torn down with the container.
 
 ### `--env KEY=VALUE` (`develop` only) — session environment
 
@@ -296,15 +242,9 @@ developArgs = [ "--impure" ];
 
 ### `--template hostpath[:name]` (`develop` only) — inherited state, frozen
 
-A session HOME is wiped when the session ends, and with ephemeral storage the
-whole container goes with it. So state that a *disposable* container must
-**inherit** — tool logins, browser profiles, caches — has to live on the host.
-Handing it over as a plain read-write bind would be the easy answer and the
-wrong one: every throwaway session would get a writable channel into shared,
-credential-bearing state, able to corrupt it for later sessions or persist
-into it.
-
-`--template` hands it over frozen instead:
+Hands a host directory to the session frozen — for state a disposable session
+must inherit (tool logins, browser profiles, caches) without being able to
+change it:
 
 ```
 lower  = the host directory, bound in read-only
@@ -313,10 +253,8 @@ upper  = a fresh per-session dir on the container's own filesystem
 mount  = fuse-overlayfs at ~/<name>
 ```
 
-The session sees an ordinary writable directory — which is what a browser
-profile or a tool's state dir needs — but every write lands in the upper and
-is discarded when the session ends. Two sessions never see each other's
-writes, and the host copy cannot be modified at all.
+The session sees an ordinary writable directory, but every write lands in the
+upper and is discarded when the session ends. The host copy cannot be modified.
 
 ```sh
 nixct develop --template ~/.local/state/mytool:.mytool ~/project
@@ -344,16 +282,12 @@ state dir, where the normal read-write project bind applies).
 
 ### `--wprs` (`develop` only) — proxied Wayland instead of a raw socket share
 
-`--wayland` shares the host's real compositor socket directly with the
-session — full protocol access (SCM_RIGHTS fd-passing, and whatever else the
-compositor exposes to any client) granted to a throwaway, untrusted
-per-session user. `--wprs` avoids that: it runs
-[wprs](https://github.com/wayland-transpositor/wprs)'s `wprsd` **inside** the
-session as its own tiny compositor, and only forwards wprsd's own wire
-protocol out to the host — the session never touches the real socket.
+`--wayland` shares the host's real compositor socket with the session.
+`--wprs` instead runs [wprs](https://github.com/wayland-transpositor/wprs)'s
+`wprsd` inside the session as its own compositor and forwards only wprsd's wire
+protocol, so the session never touches the real socket.
 
-wprs is **not** a dependency of this flake; it's optional and BYO on both
-ends:
+wprs is not a dependency of this flake; BYO on both ends:
 
 - the container needs a `wprsd`-providing package in its own package set
   (e.g. `programs.nixct.packages = [ pkgs.wprs ];` for `nixct`, or via
@@ -368,17 +302,12 @@ nixct wayland-attach ~/project     # from another terminal: view it
 nixct wayland-detach ~/project     # stop viewing; session keeps running
 ```
 
-wprsd's embedded XWayland/X11 support is disabled by default (it otherwise
-hard-crashes if the container doesn't also have an Xwayland binary on
-`$PATH`) — native-Wayland apps only, for now.
+wprsd's embedded XWayland support is disabled by default — native-Wayland apps
+only.
 
-**Known limitation**: the current wprs snapshot only supports shared-memory
-buffers — it has no `linux-dmabuf`/hardware-rendering support (this is
-documented upstream). Simple Wayland clients work fine; complex GUI apps that
-lean on GPU-accelerated compositing or D-Bus-dependent subsystems (e.g.
-keyboard/IME handling) may be unstable regardless of `--gpu`/`--opengl` on the
-container — that's the client or wprs itself, not this framework's plumbing.
-`--dbus` (below) fixes the D-Bus-shaped half of that.
+**Known limitation**: the current wprs snapshot supports shared-memory buffers
+only, with no `linux-dmabuf`, so GPU-accelerated clients may be unstable
+regardless of `--gpu`/`--opengl`.
 
 ### `--dbus` (`develop` only) — per-session D-Bus session bus
 
