@@ -66,6 +66,23 @@ eval_is "a granted capability renders its kernel name" "CAP_NET_BIND_SERVICE" \
 eval_fails "a misspelled capability is an evaluation error" "does not exist" \
   "$PRISON toString (svc { capabilities.netBindServic = true; }).capabilities"
 
+# A credential in the store is readable by every user on the machine.
+eval_fails "a persisted path in the nix store is refused" "in the Nix store" \
+  "$PRISON toString (svc {
+     persist = [ { host = \"\${builtins.storeDir}/aaaa-tsig.conf\"; path = \"/secrets/t\"; } ];
+   }).persist"
+
+eval_fails "a persisted path that is relative is refused" "not an absolute path" \
+  "$PRISON toString (svc {
+     persist = [ { host = \"secrets/tsig.conf\"; path = \"/secrets/t\"; } ];
+   }).persist"
+
+eval_is "a read-only persisted file is mounted where it was asked for" "/secrets/t.conf" \
+  "$PRISON toString (map (x: x.path) (svc {
+     persist = [ { host = \"/var/lib/secrets/t.conf\"; path = \"/secrets/t.conf\";
+                   readOnly = true; file = true; } ];
+   }).persist)"
+
 eval_fails "a service may not run as uid 0" "must not run as uid 0" \
   "$PRISON toString (svc { uid = 0; }).uid"
 

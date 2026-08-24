@@ -66,7 +66,7 @@ let
         type = "bind";
         source = pm.host;
         destination = pm.path;
-        readOnly = false;
+        readOnly = pm.readOnly or false;
       })
       s.persist;
 

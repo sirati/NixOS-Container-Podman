@@ -113,6 +113,15 @@ let
           STATE=${escapeShellArg p.stateDir}
           mkdir -p "$STATE/store" "$STATE/config"
 
+          # A writable persistent path is a host directory bound in; podman
+          # would otherwise create it as root. Read-only entries are not
+          # created: a credential that does not exist is a deployment error,
+          # and an empty file conjured here would hide it.
+          ${concatMapStringsSep "\n" (s: concatMapStringsSep "\n" (pm: ''
+            mkdir -p ${escapeShellArg pm.host}
+            chown ${escapeShellArg p.user} ${escapeShellArg pm.host}
+          '') (lib.filter (pm: !(pm.readOnly or false)) s.persist)) p.allServices}
+
           # One store view per service: each sees its own closure and nothing
           # else, so a service cannot reach a sibling's binaries even though
           # they share a network namespace. The view is owned by this host

@@ -17,7 +17,9 @@
 , name
 , users            # [ { name; uid; gid; } ] -- the service accounts
 , groups ? [ ]     # [ { name; gid; } ]; derived from users when empty
-, extraDirs ? [ ]  # mount points the caller needs to exist before bind time
+, extraDirs ? [ ]  # directory mount points, created before bind time
+, extraFiles ? [ ] # file mount points; crun can bind a file onto an existing
+                   # file in a read-only rootfs, but cannot create one
 , configDir ? "/config"  # where the service's configuration is mounted
 }:
 
@@ -68,6 +70,7 @@ pkgs.runCommand "prison-rootfs-${name}"
   # a reload never has to become a restart.
   mkdir -p "$out${configDir}"
   ${concatMapStringsSep "\n" (d: "mkdir -p $out${d}") extraDirs}
+  ${concatMapStringsSep "\n" (f: "mkdir -p $out$(dirname ${f}) && touch $out${f}") extraFiles}
 
   # podman bind-mounts over each of these, so they have to exist first; a
   # store rootfs is read-only and cannot create them itself.
