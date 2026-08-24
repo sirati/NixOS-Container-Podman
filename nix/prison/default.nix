@@ -42,6 +42,7 @@ let
   nixStoreLower = import ../nix-store-lower.nix;
   mkRootfs = import ./rootfs.nix;
   mkRuleset = import ./ruleset.nix;
+  capsLib = import ./capabilities.nix { inherit lib; };
 
   # Configuration lives at one fixed path in every container, so that changing
   # it never changes anything the container was created with.
@@ -71,7 +72,11 @@ let
     , environment ? { }
     , state ? [ ]
     , persist ? [ ]
-    , capabilities ? [ ]
+    # A typed capability set: one named field per Linux capability, every one
+    # defaulting to false. Not a list of strings -- a misspelled string
+    # renders a flag that grants nothing while reading as though it granted
+    # something, whereas an unknown field is an evaluation error.
+    , capabilities ? { }
     , readOnlyRoot ? true
     , init ? true
     , tmpfsSize ? "16M"
@@ -102,6 +107,12 @@ let
     let
       argv = assertAbsolute name exec;
 
+      # Kernel names of the capabilities this service was granted.
+      grantedCaps = capsLib.granted
+        (lib.evalModules {
+          modules = [ { options = capsLib.options; } capabilities ];
+        }).config;
+
       roots = [ (builtins.head argv) ] ++ packages;
       rootsDrv = pkgs.runCommand "prison-${name}-roots" { } ''
         printf '%s\n' ${lib.escapeShellArgs roots} > $out
@@ -126,9 +137,10 @@ let
         config));
     in
     {
-      inherit name uid gid user argv environment state persist capabilities
+      inherit name uid gid user argv environment state persist
         readOnlyRoot init tmpfsSize openFiles rootfs storeFarm closure
         config configTree reload;
+      capabilities = grantedCaps;
       hasConfig = config != { };
       __prisonService = true;
     };

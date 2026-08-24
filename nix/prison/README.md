@@ -9,6 +9,7 @@ A default-deny podman jail for services, built on `nix-store-lower`,
 ```
 default.nix          what a prison and its services ARE. Names no runtime,
                      no flag, no command line.
+capabilities.nix     the 41 Linux capabilities as typed fields, all false.
 podman.nix           the podman option model: types, defaults, validation,
                      and the only code that produces argv.
 podman-backend.nix   intent -> podman. Container names live here.
@@ -70,7 +71,7 @@ let
     name = "knotd";
     exec = [ "${pkgs.knot-dns}/bin/knotd" "--config" "/etc/knot.conf" "--no-daemon" ];
     uid = 1000;
-    capabilities = [ "NET_BIND_SERVICE" ];
+    capabilities.netBindService = true;
     state = [ { path = "/var/lib/knot"; size = "128M"; } ];
   };
 in {
