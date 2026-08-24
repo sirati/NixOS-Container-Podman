@@ -523,7 +523,14 @@
       #       packages.x86_64-linux.myct = ct.packages;
       #       # `nix run .#myct.enter`, `.#myct.boot`, `.#myct.purge`, ...
       #     };
-      lib.${system} = { inherit mkContainer mkNixct overlay; };
+      lib.${system} = {
+        inherit mkContainer mkNixct overlay;
+        # The prison primitives, exported so a downstream flake can build one
+        # without reaching into this repo's files. `mkPrison` says WHAT a
+        # confined service is allowed to do; nothing in it names a container
+        # runtime (see nix/prison/README.md).
+        inherit (import ./nix/prison { inherit pkgs; }) mkPrison mkPrisonService;
+      };
 
       # Flat outputs (validated by nix flake check). These all resolve to a
       # derivation; running them invokes nix-dev-container with the matching

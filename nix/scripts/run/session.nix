@@ -207,7 +207,16 @@
       printf '%s\n' "$sock"
       return 0
     fi
-    local args=(--upstream "$upstream" --listen "$sock")
+    # Bound relative to $dir, not by absolute path. A unix socket address is
+    # capped at 108 bytes (sun_path in un.h) and this one is $STATE_DIR plus
+    # a mount id that is the whole project path with its separators escaped
+    # -- so a deep project, or a state dir anywhere but the default, pushes
+    # it past the limit. bind() then fails and the session gets an agent
+    # socket that answers "communication with agent failed", which says
+    # nothing about a path being too long. The limit applies to the address
+    # as given, so binding from inside the directory keeps it a few bytes
+    # whatever the directory is called.
+    local args=(--upstream "$upstream" --listen "$mount_id.sock")
     local spec
     for spec in "''${agent_allow[@]+''${agent_allow[@]}}"; do
       args+=(--allow "$spec")
@@ -216,8 +225,8 @@
       args+=(--deny "$spec")
     done
     rm -f "$sock"
-    nohup ${tools.sshAgentFilter} "''${args[@]}" \
-      </dev/null >"$dir/$mount_id.log" 2>&1 &
+    ( cd "$dir" && exec nohup ${tools.sshAgentFilter} "''${args[@]}" \
+        </dev/null >"$mount_id.log" 2>&1 ) &
     disown
     echo $! > "$pid_file"
     local _i
@@ -335,8 +344,10 @@
     chmod 0711 "$dir"
     if [ ! -s "$pidfile" ] || ! kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
       rm -f "$sock"
-      nohup ${tools.socat} UNIX-LISTEN:"$sock",fork,mode=0600 \
-        TCP:127.0.0.1:"$port" >/dev/null 2>&1 &
+      # Relative for the same reason as the agent filter above: the address
+      # is capped at 108 bytes and $SOCKET_MOUNTS is as deep as $STATE_DIR.
+      ( cd "$dir" && exec nohup ${tools.socat} UNIX-LISTEN:"$port",fork,mode=0600 \
+          TCP:127.0.0.1:"$port" >/dev/null 2>&1 ) &
       echo $! > "$pidfile"
       # Give socat a moment to create the socket, so the container-side
       # listener does not race it on first use.

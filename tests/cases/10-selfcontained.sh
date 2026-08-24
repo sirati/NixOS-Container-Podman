@@ -13,24 +13,24 @@ ct_new sc testcontainer.run
 ct_core_checks_with_store() {
   check "up" ct up
 
-  # The container's store must be its own. A path that exists on the host
-  # but is not in the container's closure -- the nixpkgs source this repo
-  # is locked to -- is the cheapest proof that nothing of the host leaked
-  # in, and it is a path `develop` would silently make work if the store
-  # were shared.
-  local nixpkgs; nixpkgs=$(nix_eval 'flake.inputs.nixpkgs.outPath')
+  # The container's store must be its own. The probe has to be a path that
+  # is on the host and genuinely not in the container's closure: nixpkgs is
+  # NOT such a path, because NixOS pins it into every system closure through
+  # nix.registry and nix.nixPath. This repo's own source is -- the container
+  # was built from it, but a build input is not a runtime dependency.
+  local hostonly; hostonly=$(nix_eval 'flake.outPath')
   check "the host store is not visible inside" \
-    ct exec -- /run/current-system/sw/bin/test '!' -e "$nixpkgs"
+    ct exec -- /run/current-system/sw/bin/test '!' -e "$hostonly"
 
-  # Its own daemon has to be up: this is the container whose nix-daemon
-  # failed with 214/SETSCHEDULER until CPUSchedulingPolicy and the IO
-  # scheduling settings were cleared, and a container whose daemon is dead
-  # still starts, still execs, and only fails once something builds.
-  check_out "the in-container nix-daemon is running" "active" \
+  # The regression that made this container look fine and be broken: its
+  # nix-daemon failed with 214/SETSCHEDULER until CPUSchedulingPolicy and
+  # the IO scheduling settings were cleared. It is socket-activated, so
+  # `is-active` says inactive until something connects -- which is exactly
+  # why the check has to connect first and only then look at the unit.
+  check "the in-container nix reaches its daemon" \
+    ct exec -- /run/current-system/sw/bin/nix --extra-experimental-features nix-command store ping
+  check_out "and the daemon unit actually started" "active" \
     ct exec -- /run/current-system/sw/bin/systemctl is-active nix-daemon
-  check_out "the in-container nix can talk to its daemon" "/nix/store" \
-    ct exec -- /run/current-system/sw/bin/nix --extra-experimental-features nix-command \
-      eval --raw --expr 'builtins.storeDir' --impure
 }
 
 ct_core_checks_with_store

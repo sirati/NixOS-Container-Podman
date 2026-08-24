@@ -250,16 +250,20 @@ mk_project_bare() {
 # usable where the container can see the host store; a self-contained store
 # holds the container's own closure and nothing else.
 mk_project_flake() {
-  local dir=$1 nixpkgs
+  local dir=$1 nixpkgs system
   nixpkgs=$(nix_eval 'flake.inputs.nixpkgs.outPath')
+  # Spelled out rather than builtins.currentSystem: a flake is evaluated in
+  # pure mode, where currentSystem does not exist, and `nix develop` inside
+  # the container is no exception.
+  system=$(nix_eval 'builtins.currentSystem')
   mkdir -p "$dir"
   cat >"$dir/flake.nix" <<EOF
 {
   inputs.nixpkgs.url = "path:$nixpkgs";
   outputs = { self, nixpkgs }:
-    let pkgs = nixpkgs.legacyPackages.\${builtins.currentSystem};
+    let pkgs = nixpkgs.legacyPackages."$system";
     in {
-      devShells.\${builtins.currentSystem}.default = pkgs.mkShell {
+      devShells."$system".default = pkgs.mkShell {
         NIXCT_TEST_MARKER = "devshell-reached";
       };
     };

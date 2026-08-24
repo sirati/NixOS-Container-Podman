@@ -36,10 +36,20 @@
   #          exec: "newuidmap": executable file not found in $PATH
   # and the container never starts. They cannot come from runtimeInputs
   # either, since a store copy would lose the setuid bit.
+  #
+  # It has to come FIRST, not merely be present. NixOS also ships an ordinary
+  # newuidmap in /run/current-system/sw/bin, without the setuid bit, and
+  # podman runs whichever one the PATH finds first; with that one `up` fails
+  # as
+  #   newuidmap: write to uid_map failed: Operation not permitted
+  #   Error: cannot set up namespace using ".../newuidmap": should have
+  #          setuid or have filecaps setuid
+  # which reads like a kernel or subuid misconfiguration and is neither. Any
+  # caller whose PATH puts the system profile ahead of the wrappers hits it.
   if [ -d /run/wrappers/bin ]; then
-    case ":$PATH:" in
-      *:/run/wrappers/bin:*) ;;
-      *) PATH="$PATH:/run/wrappers/bin" ;;
+    case "$PATH" in
+      /run/wrappers/bin|/run/wrappers/bin:*) ;;
+      *) PATH="/run/wrappers/bin:$PATH" ;;
     esac
   fi
 

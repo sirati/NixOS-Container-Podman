@@ -11,9 +11,11 @@ ct_new hd testdaemon.run
 
 check "up" ct up
 
-nixpkgs=$(nix_eval 'flake.inputs.nixpkgs.outPath')
+# The same probe the self-contained case requires to be absent: a host
+# store path that is not in the container's closure. Here it must be there.
+hostonly=$(nix_eval 'flake.outPath')
 check "the host store IS visible inside" \
-  ct exec -- /run/current-system/sw/bin/test -e "$nixpkgs"
+  ct exec -- /run/current-system/sw/bin/test -e "$hostonly"
 
 # The mount is read-only: a container that can write to the host store can
 # rewrite anything the host runs.
