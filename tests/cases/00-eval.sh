@@ -70,7 +70,7 @@ eval_fails "a service may not run as uid 0" "must not run as uid 0" \
   "$PRISON toString (svc { uid = 0; }).uid"
 
 eval_fails "a service exec must be an absolute path" "not an absolute path" \
-  "$PRISON toString (svc { exec = [ \"knotd\" ]; }).argv"
+  "$PRISON toString (svc { exec = [ \"caddy\" ]; }).argv"
 
 eval_fails "an empty prison is an evaluation error" "has no services" \
   "$PRISON (prison.mkPrison { name = \"p\"; services = [ ]; }).name"

@@ -67,19 +67,20 @@ named private destination beats the blanket rule.
 let
   prison = import ./nix/prison { inherit pkgs; };
 
-  knotd = prison.mkPrisonService {
-    name = "knotd";
-    exec = [ "${pkgs.knot-dns}/bin/knotd" "--config" "/etc/knot.conf" "--no-daemon" ];
+  web = prison.mkPrisonService {
+    name = "web";
+    exec = [ "${pkgs.caddy}/bin/caddy" "run" "--config" "/config/Caddyfile" ];
     uid = 1000;
     capabilities.netBindService = true;
-    state = [ { path = "/var/lib/knot"; size = "128M"; } ];
+    state = [ { path = "/var/lib/caddy"; size = "128M"; } ];
+    config = { Caddyfile = ./Caddyfile; };
   };
 in {
-  services.prisons.dns = prison.mkPrison {
-    name = "dns";
-    services = { inherit knotd; };
-    listen = { tcp = [ 53 ]; udp = [ 53 ]; };
-    egress = { mode = "targets"; targets = [ { address = "198.51.100.2"; port = 53; } ]; };
+  services.prisons.web = prison.mkPrison {
+    name = "web";
+    services = { inherit web; };
+    listen = { tcp = [ 80 443 ]; };
+    egress = { mode = "targets"; targets = [ { address = "198.51.100.2"; port = 443; } ]; };
   };
 }
 ```
@@ -100,18 +101,20 @@ prison-<n>-<svc>.service  Type=exec, BindsTo the pod unit; systemd supervises
 
 ## Measured
 
-For a `knotd` service on this host:
+For the `web` service above, on this host:
 
 ```
-host /nix/store                113628 paths
-knotd store view                   83 paths, 262 executables, no shell
-sibling service's view             10 paths
+host /nix/store                114131 paths
+web store view                      8 paths, 283 executables, no shell
+infra-net's view                    5 paths
 prison rootfs                       0 executables
 ```
 
-`coreutils` is in that 83 because `knot-dns-bin → systemd → coreutils`: the
-view is exactly the closure, so it contains whatever the package references.
-Building the service against a systemd-less variant removes it.
+The view is exactly the closure, so it contains whatever the package
+references and nothing else -- which cuts both ways. A single static binary
+gets a handful of paths; a package that pulls in systemd brings systemd's
+`coreutils`, and with it a shell, unless it is built against a variant that
+does not. Check the view rather than assuming it.
 
 ## Runtime findings
 

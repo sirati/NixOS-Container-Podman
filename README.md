@@ -13,14 +13,15 @@ ties them together.
 - **Runs on NixOS, and on any other Linux distribution.** On NixOS it uses what
   is already there. Elsewhere the [portable tarball](#portable-tarball) carries
   its own store and needs no nix on the host at all.
-- **Shares the host's `/nix` when that makes sense** — the store, the database
-  and the daemon socket — so a container builds through the host's nix-daemon
-  and adds nothing to disk. This works even where nix is a *single-user*
-  install, because nothing here requires a daemon of its own.
-- **Or shows the container a restricted store.** `nix-store-shared-fuse` serves
-  a symlink farm over the host store, so a container sees the paths of its own
-  closure and nothing else — and the farm is just a derivation, so the view can
-  be narrowed or composed to whatever set of paths you want.
+- **Shares the host's `/nix`** — the store, the database and the daemon socket —
+  so a container builds through the host's nix-daemon and adds nothing to disk.
+  It runs no daemon of its own and needs no nixbld users.
+- **Or shows the container a restricted store**, with no daemon involved at
+  all. `nix-store-shared-fuse` serves a symlink farm over the host store, so a
+  container sees the paths of its own closure and nothing else — and the farm
+  is just a derivation, so the view can be narrowed or composed to whatever set
+  of paths you want. Because this needs nothing but read access to the store,
+  it is also how a host with a *single-user* nix install shares one.
 - **Podman command lines are a validated nix model, not strings.** Every
   invocation is typed in `nix/podman.nix` and rendered from it, so the mistakes
   that actually happen — `--rootfs` not last, a port published into a namespace
@@ -310,17 +311,16 @@ second binary to reach for.
 ```nix
 let prison = nixos-container-podman.lib.x86_64-linux; in
 prison.mkPrison {
-  name = "dns";
-  listen.udp = [ 53 ];
-  listen.tcp = [ 53 ];
+  name = "web";
+  listen.tcp = [ 80 443 ];
   services = [
     (prison.mkPrisonService {
-      name = "knot";
-      exec = [ "${pkgs.knot-dns}/bin/knotd" "-c" "/config/knot.conf" ];
+      name = "caddy";
+      exec = [ "${pkgs.caddy}/bin/caddy" "run" "--config" "/config/Caddyfile" ];
       uid  = 1000;
-      capabilities.netBindService = true;     # port 53, and nothing else
-      state  = [ { path = "/var/lib/knot"; } ];
-      config = { "knot.conf" = knotConf; };
+      capabilities.netBindService = true;     # ports 80 and 443, nothing else
+      state  = [ { path = "/var/lib/caddy"; } ];
+      config = { Caddyfile = ./Caddyfile; };
     })
   ];
 }

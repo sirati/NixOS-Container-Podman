@@ -55,7 +55,7 @@ let
         prison: service ${svc} has exec[0] = "${a0}", which is not an absolute path.
 
         A prison has no $PATH and no shell to resolve a name against. Give the
-        store path: "''${pkgs.knot-dns}/bin/knotd".
+        store path: "''${pkgs.caddy}/bin/caddy".
       ''
         argv);
 
