@@ -8,7 +8,7 @@
 # same denials as everything else.
 #
 # This layer says WHAT, never HOW. Nothing here names a container runtime,
-# a flag or a command line; nix/prison/podman.nix is the backend that turns
+# a flag or a command line; nix/prison/podman-backend.nix is what turns
 # this description into something that runs.
 #
 # Several services in one *container* would need a supervisor; every

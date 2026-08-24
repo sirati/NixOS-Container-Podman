@@ -263,6 +263,7 @@
             # drives both NixOS and portable tarball targets; the `tools`
             # attrset carries the path resolution policy.
             text = import ./nix/scripts/run.nix ({
+              inherit (nixpkgs) lib;
               sessionEnv = map (k: "${k}=${builtins.getAttr k sessionEnv}")
                                (builtins.attrNames sessionEnv);
               inherit tools rootfs toplevel shellUser name idleTimeout sessionTemplates
@@ -282,7 +283,9 @@
               lanRuleset = if isolateLan
                            then "${import ./nix/lan-ruleset.nix { inherit pkgs; }}" else null;
               netGatewayRootfs = if isolateLan
-                           then "${import ./nix/net-gateway.nix { inherit pkgs; }}" else null;
+                           then "${(import ./nix/net-owner.nix { inherit pkgs; name = "${name}-net"; }).rootfs}" else null;
+              netOwnerBinary = if isolateLan
+                           then (import ./nix/net-owner.nix { inherit pkgs; }).binary else null;
               checkHostCompatPath = "${checkHostCompatScript}/bin/check-host-compat";
               # Bridge the storage axis to run.nix's stateDirLine: ephemeral
               # storage puts STATE_DIR (overlay upper/work) on tmpfs; all

@@ -12,7 +12,7 @@
 }:
 
 let
-  podman = import ./podman.nix { inherit pkgs lib; };
+  podman = import ../podman.nix { inherit lib; };
   inherit (podman) renderRun;
   podmanBin = "${pkgs.podman}/bin/podman";
   crunBin = "${pkgs.crun}/bin/crun";

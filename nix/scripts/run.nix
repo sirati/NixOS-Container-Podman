@@ -23,7 +23,8 @@
 # lifecycle + dispatch kept here. Splitting keeps each concern editable
 # in isolation; everything is still emitted as one self-contained script.
 
-{ tools
+{ lib
+, tools
 , rootfs ? null
   # The container's system toplevel. Only meaningful with hostNixDaemon,
   # where the container sees the host store and can therefore activate a
@@ -70,6 +71,10 @@
   # use the network but cannot reconfigure it.
 , lanRuleset ? null
 , netGatewayRootfs ? null
+  # The namespace owner's pause binary on the host, bind-mounted onto /pause
+  # inside it. See nix/net-owner.nix: a statically linked catatonit, so that
+  # container needs no store, no libc and no coreutils.
+, netOwnerBinary ? null
   # OCI-runtime flag passed to podman (in pm() + direct podman runs).
   # NixOS: full /nix/store path to crun, pinned at build time. Portable:
   # empty so podman uses whatever it's configured for (typically runc
@@ -133,6 +138,38 @@ let
   # gateway-container networking below.
   lanRulesetLine = if lanRuleset == null then "" else toString lanRuleset;
   gatewayRootfsLine = if netGatewayRootfs == null then "" else toString netGatewayRootfs;
+  netOwnerBinaryLine = if netOwnerBinary == null then "" else toString netOwnerBinary;
+
+  podman = import ../podman.nix { inherit lib; };
+
+  # The namespace owner's invocation, assembled by the validated model rather
+  # than written out here. `rt "gw"` is the shell variable holding the
+  # container name, the one value not known at evaluation time.
+  #
+  # `pm` is a shell function that already supplies --runtime, so the model is
+  # told there is none. The pause binary's mount is explicitly NOT noexec:
+  # it is the one thing in that container that has to be executable, and the
+  # model defaults mounts to noexec precisely so that saying otherwise is
+  # deliberate.
+  netOwnerRunLine =
+    if !isolateLan then "" else
+    podman.renderRunShell "pm" {
+      name = podman.rt "gw";
+      rootfs = gatewayRootfsLine;
+      command = [ "/pause" "-P" ];
+      detach = true;
+      remove = false;
+      readOnly = true;
+      runtime = null;
+      network = { mode = "pasta"; };
+      mounts = [{
+        type = "bind";
+        source = netOwnerBinaryLine;
+        destination = "/pause";
+        readOnly = true;
+        noexec = false;
+      }];
+    };
   isolateLan = lanRuleset != null;
   # Chosen HERE rather than tested in the script: with isolateLan the
   # operand would be a literal store path, which is always non-empty, and
@@ -169,11 +206,7 @@ let
     ensure_net_gateway() {
       local gw="''${NAME}-net"
       if ! pm container exists "$gw" 2>/dev/null; then
-        pm run -d --name "$gw" \
-          --network=pasta \
-          -v /nix/store:/nix/store:ro \
-          --rootfs "${gatewayRootfsLine}:O" \
-          ${tools.coreutils}/sleep infinity >/dev/null
+        ${netOwnerRunLine} >/dev/null
       elif [ "$(pm inspect "$gw" --format '{{.State.Status}}' 2>/dev/null)" != running ]; then
         pm start "$gw" >/dev/null
       fi

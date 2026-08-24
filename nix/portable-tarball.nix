@@ -133,6 +133,7 @@ let
     '';
 
   runText = import ./scripts/run.nix {
+    inherit (pkgs) lib;
     inherit tools shellUser name
             hostHasNvidiaContainerToolkit useKeepId keepIdUid keepIdGid;
     # Portable is always self-contained: persistent on-disk overlay
