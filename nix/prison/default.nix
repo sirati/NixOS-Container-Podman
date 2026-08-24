@@ -1,36 +1,36 @@
-# mkPrison / mkPrisonService: a default-deny podman jail for services.
+# mkPrison / mkPrisonService: a default-deny jail for services.
 #
-# A prison is a set of containers sharing one network namespace: <n>-net owns
-# it, and every service joins with --network=container:<n>-net. No podman pod,
-# because a pod's infra container comes from podman's image machinery and
-# whether that pulls an OCI image depends on the host's containers.conf.
-# That is a deliberate departure from "several services in one container", and
-# the reason is mechanical rather than stylistic: running N processes inside
-# one container requires a supervisor, every supervisor worth using (s6,
-# runit) needs a writable scan directory, and the rootfs here is a read-only
-# store path with no shell and no coreutils to populate one at startup.
-# Separate containers give the same property -- services sharing one loopback
-# and nothing else -- with each service confined to its own mount namespace
-# and its own store view, and no supervisor anywhere: systemd on the host
-# restarts a container, and catatonit inside it only forwards signals and
-# reaps, because PID 1 in a namespace ignores every signal it has no handler
-# for (pid_namespaces(7)).
+# A prison is a set of containers sharing one network namespace. `infra-net`
+# owns it and does nothing else; every other service is placed inside that
+# namespace rather than getting one of its own. `infra-net` is not
+# special-cased: it is an ordinary prison service whose exec happens to be
+# a pause process, so it gets the same rootfs, the same store view and the
+# same denials as everything else.
 #
-# What each service can see of /nix/store is its own closure and nothing more,
+# This layer says WHAT, never HOW. Nothing here names a container runtime,
+# a flag or a command line; nix/prison/podman.nix is the backend that turns
+# this description into something that runs.
+#
+# Several services in one *container* would need a supervisor; every
+# supervisor worth using needs a writable scan directory, and this rootfs is a
+# read-only store path with no shell and no coreutils to populate one.
+# Separate containers give the same property -- one shared loopback and
+# nothing else -- with each service in its own mount namespace with its own
+# store view, and no supervisor anywhere: systemd on the host restarts a
+# container, and catatonit inside it only forwards signals and reaps, because
+# PID 1 in a namespace ignores every signal it has no handler for
+# (pid_namespaces(7)).
+#
+# What each service sees of /nix/store is its own closure and nothing more,
 # served by nix-store-shared-fuse over the symlink farm from nix-store-lower.
-# There is no shell, no coreutils and no package manager in any of it, so a
-# process that achieves code execution has no second binary to reach for.
+# No shell, no coreutils, no package manager: a process that achieves code
+# execution has no second binary to reach for.
 #
-# Everything is denied by default and opened by name:
-#   * no network at all beyond the pod's own loopback
-#   * every listening port declared explicitly, per protocol
-#   * every egress destination declared explicitly, or a named blanket mode
-#   * no capabilities, no privilege escalation, read-only root
-#   * writable state only where asked for, always noexec,nosuid,nodev
-#
-# The pod's network namespace is owned by its infra container and policed
-# from the HOST with nftables, following nix/net-gateway.nix: nothing inside
-# the pod can read or replace the ruleset that governs it.
+# Everything is denied by default and opened by name: no network beyond
+# loopback, every listening port declared per protocol, every egress
+# destination declared or covered by a named mode, no capabilities, no
+# privilege escalation, read-only root, and writable state only where asked
+# for and always noexec,nosuid,nodev.
 
 { pkgs
 , lib ? pkgs.lib
@@ -42,11 +42,11 @@ let
   nixStoreLower = import ../nix-store-lower.nix;
   mkRootfs = import ./rootfs.nix;
   mkRuleset = import ./ruleset.nix;
-  fuse = import ../fuse.nix { inherit pkgs; };
 
-  # A service's entry point is argv, and argv[0] must be a store path. There
-  # is no $PATH in a prison to resolve a bare name against, and a bare name
-  # would be resolved against whatever the store view happens to contain.
+  # Configuration lives at one fixed path in every container, so that changing
+  # it never changes anything the container was created with.
+  configDir = "/config";
+
   assertAbsolute = svc: argv:
     let a0 = builtins.head argv; in
     lib.throwIf (argv == [ ]) "prison: service ${svc} has an empty `exec`."
@@ -63,70 +63,85 @@ let
   # ---------------------------------------------------------------------
   mkPrisonService =
     { name
-    , exec                     # argv; exec[0] must be an absolute store path
+    , exec
     , uid ? 1000
     , gid ? uid
-    , user ? name              # account name inside the container
-    , packages ? [ ]           # extra closure roots visible in the store view
+    , user ? name
+    , packages ? [ ]
     , environment ? { }
-    , state ? [ ]              # [ { path; size ? "64M"; } ] writable tmpfs mounts
-    , persist ? [ ]            # [ { path; host; } ] writable host directories
-    , capabilities ? [ ]       # capability names to ADD back; default none
+    , state ? [ ]
+    , persist ? [ ]
+    , capabilities ? [ ]
     , readOnlyRoot ? true
-    # PID 1 in a namespace only receives signals it has installed a handler
-    # for -- pid_namespaces(7): "a process in an ancestor namespace can send
-    # signals to the init process of a child PID namespace only if the init
-    # process has established a handler for that signal". So `podman stop`
-    # sends SIGTERM, the kernel drops it, and every stop degrades to the
-    # SIGKILL that follows the timeout. PID 1 also inherits orphans and must
-    # reap them.
-    #
-    # catatonit is podman's own answer to both: a few KB of C that forwards
-    # signals to the real process and reaps whatever it is handed. It is
-    # bind-mounted by podman from the host, so it does not enter the store
-    # view and the closure does not grow. Turn this off only for a service
-    # that is genuinely its own init.
     , init ? true
     , tmpfsSize ? "16M"
-    , extraPodmanArgs ? [ ]
+    # Files placed in the container's /config, keyed by name relative to it.
+    # Values are store paths or derivations. Their CONTENTS are copied to a
+    # host directory that is bind-mounted in, rather than the store path being
+    # mounted directly, because a store path changes identity whenever the
+    # content does -- and then the mount, and so the container, would have to
+    # be recreated to pick up a new config. A directory the host rewrites in
+    # place is visible immediately, so a reload stays a reload.
+    , config ? { }
+    # How to tell the service its configuration changed. `signal` is enough
+    # for anything that reloads on SIGHUP; `exec` runs a command in the
+    # container, which needs that binary in `packages`.
+    , reload ? null
+    # Hard RLIMIT_NOFILE for this service's store view.
+    #
+    # Every file held open behind the view costs a descriptor in the FUSE
+    # process serving it, so this -- not the service's own limit -- is what
+    # caps how many files the service can have open in the store at once.
+    # Exceeding it surfaces as EMFILE from the service, a long way from the
+    # cause. The FUSE raises its soft limit to this on startup; null inherits
+    # whatever the prison unit was given.
+    , openFiles ? null
     }:
-    assert lib.assertMsg (uid != 0) "prison: service ${name} must not run as uid 0; that is what the container root account exists to avoid.";
+    assert lib.assertMsg (uid != 0)
+      "prison: service ${name} must not run as uid 0; that is what the container root account exists to avoid.";
     let
       argv = assertAbsolute name exec;
 
-      # The store view is exactly this service's closure. Not the prison's,
-      # not the host's -- a service cannot reach a sibling's binaries.
       roots = [ (builtins.head argv) ] ++ packages;
       rootsDrv = pkgs.runCommand "prison-${name}-roots" { } ''
         printf '%s\n' ${lib.escapeShellArgs roots} > $out
       '';
       closure = pkgs.closureInfo { rootPaths = roots; };
-      storeFarm = nixStoreLower {
-        inherit pkgs closure;
-        toplevel = rootsDrv;
-      };
+      storeFarm = nixStoreLower { inherit pkgs closure; toplevel = rootsDrv; };
 
       rootfs = mkRootfs {
-        inherit pkgs lib name;
+        inherit pkgs lib name configDir;
         users = [ { inherit uid gid; name = user; } ];
         extraDirs = map (s: s.path) state ++ map (p: p.path) persist;
       };
+
+      # The configuration as a store tree. The host copies its contents out;
+      # it is never mounted directly.
+      configTree = pkgs.runCommand "prison-${name}-config" { } (''
+        mkdir -p $out
+      '' + lib.concatStrings (lib.mapAttrsToList
+        (rel: src: ''
+          install -Dm0444 ${src} "$out/${rel}"
+        '')
+        config));
     in
     {
       inherit name uid gid user argv environment state persist capabilities
-        readOnlyRoot init tmpfsSize extraPodmanArgs rootfs storeFarm closure;
+        readOnlyRoot init tmpfsSize openFiles rootfs storeFarm closure
+        config configTree reload;
+      hasConfig = config != { };
       __prisonService = true;
     };
 
   # ---------------------------------------------------------------------
-  # mkPrison: the pod, its network policy, and the host driver.
+  # mkPrison: the namespace owner, the policy, and the service list.
   # ---------------------------------------------------------------------
   mkPrison =
     { name
-    , services                 # attrset or list of mkPrisonService results
+    , services
     , listen ? { tcp = [ ]; udp = [ ]; }
     , egress ? { mode = "none"; targets = [ ]; lan = [ ]; }
-    , user ? name  # unprivileged host account podman runs as
+    , user ? name
     , stateDir ? "/var/lib/${name}"
     }:
     let
@@ -137,55 +152,45 @@ let
       _check = lib.throwIf (svcList == [ ]) "prison: ${name} has no services."
         (lib.throwIf (!(builtins.all (s: s.__prisonService or false) svcList))
           "prison: ${name} was given something that is not a mkPrisonService result."
-          null);
+          (lib.throwIf (builtins.any (s: s.name == "infra-net") svcList)
+            "prison: ${name} declares a service called infra-net, which is the name of the namespace owner."
+            null));
 
       ruleset = mkRuleset { inherit pkgs lib listen egress; };
 
-      # The container that owns the network namespace, following
-      # net-gateway.nix. Deliberately NOT a podman pod: a pod's infra
-      # container comes from podman's own image machinery, and `infra_image`
-      # is a containers.conf setting -- so whether an OCI image gets pulled
-      # depends on host configuration rather than on anything here. A
-      # --rootfs container from the store cannot surprise anyone.
-      #
-      # It runs catatonit in pause mode. catatonit is statically linked, so
-      # the rootfs needs nothing but the skeleton and one bind-mounted store
-      # path: no coreutils, no libc, no `sleep`.
-      netRootfs = mkRootfs {
-        inherit pkgs lib;
-        name = "${name}-net";
-        users = [ ];
-        embed = [ { path = "/pause"; source = "${pkgs.catatonit}/bin/catatonit"; } ];
+      # The namespace owner, built exactly like any other service. catatonit
+      # comes from its own store view, so nothing is copied into a rootfs and
+      # nothing is bind-mounted for it.
+      infraNet = mkPrisonService {
+        name = "infra-net";
+        exec = [ "${pkgs.catatonit}/bin/catatonit" "-P" ];
+        uid = 65000;
+        # It has no init of its own: catatonit IS the init, and wrapping it in
+        # another copy of itself would be silly.
+        init = false;
       };
-      # Inside the namespace owner. Not a store path: that container has no
-      # /nix/store, by design.
-      pause = "/pause";
-      # For --init on service containers, where podman bind-mounts it itself.
-      initBin = "${pkgs.catatonit}/bin/catatonit";
 
-      # No declared port and no declared egress means the pod needs no
-      # interface at all: --network=none leaves it with loopback only, which
-      # is the documented default rather than a firewall that happens to drop
-      # everything.
       wantsNetwork = (listen.tcp or [ ]) != [ ] || (listen.udp or [ ]) != [ ]
         || (egress.mode or "none") != "none";
 
-      publishArgs = lib.concatMap
-        (p: [ "--publish" "${toString (if builtins.isInt p then p else p.port)}:${toString (if builtins.isInt p then p else p.port)}/tcp" ])
-        (listen.tcp or [ ])
-        ++ lib.concatMap
-        (p: [ "--publish" "${toString (if builtins.isInt p then p else p.port)}:${toString (if builtins.isInt p then p else p.port)}/udp" ])
-        (listen.udp or [ ]);
+      toPublish = proto: p:
+        if builtins.isInt p then { port = p; protocol = proto; }
+        else { inherit (p) port; protocol = proto; }
+          // lib.optionalAttrs (p ? hostPort) { inherit (p) hostPort; };
+
+      publish = map (toPublish "tcp") (listen.tcp or [ ])
+        ++ map (toPublish "udp") (listen.udp or [ ]);
     in
     builtins.seq _check {
-      inherit name svcList ruleset wantsNetwork publishArgs user stateDir listen egress
-        netRootfs pause initBin;
-      fuse = fuse;
+      inherit name svcList ruleset wantsNetwork publish user stateDir listen
+        egress infraNet configDir;
+      # Everything that needs a store view mounted, owner included.
+      allServices = [ infraNet ] ++ svcList;
       __prison = true;
     };
 in
 {
-  inherit mkPrison mkPrisonService;
+  inherit mkPrison mkPrisonService configDir;
   ruleset = mkRuleset;
   rootfs = mkRootfs;
 }

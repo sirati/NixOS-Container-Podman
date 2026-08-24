@@ -18,12 +18,7 @@
 , users            # [ { name; uid; gid; } ] -- the service accounts
 , groups ? [ ]     # [ { name; gid; } ]; derived from users when empty
 , extraDirs ? [ ]  # mount points the caller needs to exist before bind time
-  # [ { path; source; } ] copied into the rootfs at build time. Used for the
-  # namespace owner's pause binary: bind-mounting a store path into a
-  # read-only rootfs cannot work, because crun has to create the mount point
-  # first and fails with "mkdir /nix/store/...: Permission denied". A static
-  # binary copied in needs no mount and no /nix/store at all.
-, embed ? [ ]
+, configDir ? "/config"  # where the service's configuration is mounted
 }:
 
 let
@@ -68,10 +63,11 @@ pkgs.runCommand "prison-rootfs-${name}"
   # create the mount point itself, and crun fails with "mkdir `/var/tmp`:
   # Permission denied" before the service ever starts.
   mkdir -p $out/{proc,sys,dev,tmp,run,etc,nix/store,var/empty,var/tmp}
+  # Configuration is bind-mounted here from a directory the host rewrites in
+  # place, so a config change is visible without recreating the container and
+  # a reload never has to become a restart.
+  mkdir -p "$out${configDir}"
   ${concatMapStringsSep "\n" (d: "mkdir -p $out${d}") extraDirs}
-  ${concatMapStringsSep "\n" (e: ''
-    install -Dm0555 ${e.source} "$out${e.path}"
-  '') embed}
 
   # podman bind-mounts over each of these, so they have to exist first; a
   # store rootfs is read-only and cannot create them itself.

@@ -4,6 +4,19 @@ A default-deny podman jail for services, built on `nix-store-lower`,
 `nix-store-shared-fuse` and the network-namespace-owner pattern from
 `net-gateway.nix`.
 
+## Layers
+
+```
+default.nix          what a prison and its services ARE. Names no runtime,
+                     no flag, no command line.
+podman.nix           the podman option model: types, defaults, validation,
+                     and the only code that produces argv.
+podman-backend.nix   intent -> podman. Container names live here.
+module.nix           systemd units. Asks the backend for argv.
+ruleset.nix          the nftables policy.
+rootfs.nix           the toolless filesystem.
+```
+
 ## Shape
 
 `mkPrison` is a set of containers sharing one network namespace. `<n>-net`
