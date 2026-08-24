@@ -7,6 +7,7 @@
 { tools
 , storeLib
 , gitServeHooks
+, gitServeGuard
 , netGatewayStop
 }:
 
@@ -148,6 +149,7 @@
   # Both arrive through GIT_CONFIG_SYSTEM on the daemon, so the repository
   # keeps its own config and hooks untouched.
   start_git_server() {
+    ${gitServeGuard}
     local mount_id=$1 hostpath=$2 branch=$3 glob=$4
     local dir="$STATE_DIR/git-serve"
     local sock="$dir/$mount_id.sock" pid_file="$dir/$mount_id.pid"

@@ -139,6 +139,22 @@ let
   lanRulesetLine = if lanRuleset == null then "" else toString lanRuleset;
   gatewayRootfsLine = if netGatewayRootfs == null then "" else toString netGatewayRootfs;
   netOwnerBinaryLine = if netOwnerBinary == null then "" else toString netOwnerBinary;
+  # gitServeHooks is optional -- the portable tarball does not pass it -- so
+  # it needs the same treatment as every other optional store path here.
+  # Interpolating it raw made the whole portable build fail with "cannot
+  # coerce null to a string" before the script was ever produced.
+  gitServeHooksLine = if gitServeHooks == null then "" else toString gitServeHooks;
+
+  # Chosen here rather than tested in the script: with hooks configured the
+  # operand would be a literal store path, which is always non-empty, and
+  # shellcheck is right to call that a mistake (SC2157). Same reasoning as
+  # netFlagsLine above.
+  gitServeGuard =
+    if gitServeHooks != null then ""
+    else ''
+      echo "git serving is not available in this build" >&2
+      return 1
+    '';
 
   podman = import ../podman.nix { inherit lib; };
 
@@ -313,7 +329,9 @@ let
 
   # Develop sessions: identities, native mounts, git server, agent, ports.
   sessionBody = import ./run/session.nix {
-    inherit tools storeLib gitServeHooks netGatewayStop;
+    inherit tools storeLib netGatewayStop;
+    gitServeHooks = gitServeHooksLine;
+    inherit gitServeGuard;
   };
 
   # Subcommand dispatch: ~1500 lines, half of what this file used to be.
