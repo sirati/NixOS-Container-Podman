@@ -113,6 +113,15 @@ $ develop -A --command 'ssh-add -l' /tmp/p3   # and every one after
 
 It is not a teardown race — a session started long after the previous one has
 settled fails the same way — and not key count. The project bind for the later
-session is made correctly; only the socket bind is missing. Four checks in
-`40-develop-options.sh` fail on this: `-A`, `--agent`, `--agent-allow` and
-`--agent-deny`.
+session is made correctly; only the agent socket is unreachable.
+
+`bind_socket` now asserts its own post-condition, and that assertion does *not*
+fire here: the bind genuinely happens. It happens inside a `podman unshare`,
+which is a fresh mount namespace each time, and for the second session onward
+it does not propagate into the running container's namespace — where
+`$WORK_SHARED` is a peer of the mount the unshare sees, `shared:N master:1`.
+So the container has a socket to connect to and a proxy to serve it, and the
+proxy's target is a bind that only exists somewhere else.
+
+Four checks in `40-develop-options.sh` fail on this: `-A`, `--agent`,
+`--agent-allow` and `--agent-deny`.

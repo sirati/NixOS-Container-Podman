@@ -47,6 +47,15 @@
         umount -- "$_DST" 2>/dev/null || umount -l -- "$_DST" 2>/dev/null || true
       fi
       mount --bind -- "$_SRC" "$_DST"
+      # Verify rather than assume. A forward that is set up but not actually
+      # mounted produces a socket the session can connect to and a proxy with
+      # nothing behind it, so the failure surfaces as a protocol error from
+      # whatever tool uses it -- "communication with agent failed" -- a long
+      # way from here. Failing at the bind names the thing that went wrong.
+      if ! mountpoint -q -- "$_DST"; then
+        echo "develop: could not bind $_SRC onto $_DST (no mount after mount --bind)" >&2
+        exit 1
+      fi
     '
   }
 
