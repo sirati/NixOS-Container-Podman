@@ -99,6 +99,10 @@ let
   # host into a namespace it cannot reach.
   serviceSpec = p: s: baseSpec p s // {
     remove = true;
+    # Foreground: the service unit is Type=exec and supervises this process
+    # directly. Detaching would exit at once, the unit would go dead, and
+    # deactivation would tear the container down with it.
+    detach = false;
     network = { mode = "container"; container = ownerName p; };
   };
 

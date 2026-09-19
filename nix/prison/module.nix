@@ -243,6 +243,13 @@ in
 
     virtualisation.containers.enable = lib.mkDefault true;
 
+    # The owner container runs rootless pasta, which binds the published
+    # host ports itself. Unprivileged binding below 1024 is denied by
+    # default, so a prison publishing 80/443 (or 2222-style SSH) would die
+    # in pasta with "Permission denied". Port policy stays in the prison's
+    # nft ruleset; this only lets the unprivileged pasta process bind.
+    boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = lib.mkDefault 0;
+
     # The store view is a FUSE mount owned by the prison's host user, but the
     # container runs as a mapped subuid. Without allow_other the kernel denies
     # it and crun fails with "failed to exec pid1: Permission denied", which
