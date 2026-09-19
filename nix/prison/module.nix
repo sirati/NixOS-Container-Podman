@@ -136,11 +136,18 @@ let
           ${concatMapStringsSep "\n" (s: ''
             mkdir -p ${escapeShellArg (backend.storeMountPoint p s)}
             if ! mountpoint -q ${escapeShellArg (backend.storeMountPoint p s)}; then
+              # The store view serves in the foreground, so background it
+              # and wait until the mount appears before continuing.
               ${escapeShellArgs (nofileArgs s)} ${fuseBin} \
                 --bind-target ${s.storeFarm}/nix/store \
                 --resolution-root /nix/store \
                 --allow-other \
-                ${escapeShellArg (backend.storeMountPoint p s)}
+                ${escapeShellArg (backend.storeMountPoint p s)} &
+              for _ in $(seq 1 50); do
+                mountpoint -q ${escapeShellArg (backend.storeMountPoint p s)} && break
+                sleep 0.2
+              done
+              mountpoint -q ${escapeShellArg (backend.storeMountPoint p s)}
             fi
           '') p.allServices}
 
@@ -224,6 +231,11 @@ in
         home = p.stateDir;
         createHome = true;
         autoSubUidGidRange = true;
+        # Rootless podman needs a systemd user session (cgroup manager
+        # systemd, XDG_RUNTIME_DIR): without linger the owner unit's
+        # `podman run` degrades to cgroupfs and the pause process setup
+        # hangs. Headless servers have no login session to provide one.
+        linger = true;
       })
       cfg;
 
