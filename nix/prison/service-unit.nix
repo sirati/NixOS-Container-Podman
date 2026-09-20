@@ -47,7 +47,11 @@ let
     in
     nameValuePair "${p.name}-${s.name}" {
       description = "${p.name}: ${s.name}";
-      after = [ "${p.name}.service" ];
+      after = [
+        "${p.name}.service"
+        "user@%U.service"
+      ];
+      requires = [ "user@%U.service" ];
       bindsTo = [ "${p.name}.service" ];
       partOf = [ "${p.name}.service" ];
       wantedBy = [ "multi-user.target" ];

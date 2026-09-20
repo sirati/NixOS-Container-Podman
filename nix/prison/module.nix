@@ -154,11 +154,19 @@ let
         );
       after = [
         (if p.wantsNetwork then "network-online.target" else "network.target")
+        # %U expands to the numeric uid selected by User=.  Keep the
+        # rootless Podman user manager alive until every prison unit has
+        # stopped; otherwise shutdown can remove its D-Bus socket while
+        # podman is still stopping containers.
+        "user@%U.service"
       ]
       ++ storeUnits
       ++ lib.optional joining "${p.joins}.service";
       wants = lib.optional p.wantsNetwork "network-online.target";
-      requires = storeUnits ++ lib.optional joining "${p.joins}.service";
+      requires =
+        [ "user@%U.service" ]
+        ++ storeUnits
+        ++ lib.optional joining "${p.joins}.service";
       bindsTo = storeUnits;
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
