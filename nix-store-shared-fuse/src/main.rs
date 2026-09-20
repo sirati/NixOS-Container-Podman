@@ -5,6 +5,9 @@
 //!
 //! See README.md for the full model.
 
+#![forbid(unsafe_code)]
+
+mod backing;
 mod fs;
 mod realize;
 
@@ -60,55 +63,51 @@ struct Args {
 
     /// Mountpoint.
     mountpoint: PathBuf,
+
+    /// Maximum number of concurrently open passthrough handles. Kernel FUSE
+    /// passthrough references are not charged to this process's RLIMIT_NOFILE,
+    /// so the daemon enforces its own explicit ceiling.
+    #[arg(long, default_value_t = 65_536)]
+    max_open_files: usize,
 }
 
-/// Raise this process's soft RLIMIT_NOFILE to its hard limit.
-///
-/// Every file held open behind the mount costs a descriptor in *this* process,
-/// so the soft limit -- 1024 on a stock login, and whatever systemd hands a
-/// unit otherwise -- caps how many files everything served by this mount can
-/// have open at once, regardless of the limits the readers themselves run
-/// under. Hitting it surfaces as EMFILE from unrelated processes, which is a
-/// long way from the cause.
-///
-/// Raising the soft limit up to the hard limit never requires privilege; only
-/// raising the hard limit does. So the hard limit is the policy knob (set by
-/// whoever starts this process) and the soft limit is simply wrong to leave
-/// below it.
-fn raise_nofile_to_hard() -> Result<(u64, u64)> {
-    // SAFETY: getrlimit/setrlimit on a zeroed rlimit are well-defined; the
-    // pointer is to a live local for the duration of each call.
-    unsafe {
-        let mut rl: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
-            return Err(anyhow::Error::from(std::io::Error::last_os_error()))
-                .context("getrlimit(RLIMIT_NOFILE)");
+/// Whether the daemon holds CAP_SYS_ADMIN (bit 21 of CapEff).
+/// The kernel requires it for FUSE_DEV_IOC_BACKING_OPEN, i.e. for every
+/// passthrough file open this daemon serves. Returns None when the
+/// capability set cannot be determined.
+fn has_cap_sys_admin() -> Option<bool> {
+    const CAP_SYS_ADMIN: u64 = 21;
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            let bits = u64::from_str_radix(hex.trim(), 16).ok()?;
+            return Some(bits & (1 << CAP_SYS_ADMIN) != 0);
         }
-        let before = rl.rlim_cur;
-        if rl.rlim_cur < rl.rlim_max {
-            rl.rlim_cur = rl.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
-                return Err(anyhow::Error::from(std::io::Error::last_os_error()))
-                    .context("setrlimit(RLIMIT_NOFILE): raising the soft limit to the hard limit");
-            }
-        }
-        Ok((before as u64, rl.rlim_max as u64))
+    }
+    None
+}
+
+fn require_cap_sys_admin() -> Result<()> {
+    match has_cap_sys_admin() {
+        Some(true) => Ok(()),
+        Some(false) => anyhow::bail!(
+            "FUSE passthrough requires CAP_SYS_ADMIN; grant only this daemon that capability (for example with systemd AmbientCapabilities=CAP_SYS_ADMIN)"
+        ),
+        None => anyhow::bail!(
+            "cannot verify CAP_SYS_ADMIN from /proc/self/status; refusing to mount because passthrough cannot register backing files without it"
+        ),
     }
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Before anything opens a descriptor.
-    match raise_nofile_to_hard() {
-        Ok((before, hard)) if before < hard => {
-            log::info!("RLIMIT_NOFILE: raised soft limit {before} -> {hard}")
-        }
-        Ok((cur, _)) => log::debug!("RLIMIT_NOFILE: soft limit already at the hard limit ({cur})"),
-        Err(e) => log::warn!("could not raise RLIMIT_NOFILE: {e:#}"),
-    }
-
     let args = Args::parse();
+    require_cap_sys_admin()?;
+    anyhow::ensure!(
+        args.max_open_files > 0,
+        "--max-open-files must be greater than zero"
+    );
 
     let resolution_root = normalize(&args.resolution_root);
     let bind_target_logical = normalize(&args.bind_target);
@@ -137,6 +136,7 @@ fn main() -> Result<()> {
         redirect_dir,
         resolution_root,
         bind_target_logical,
+        args.max_open_files,
     );
 
     // nodev is always on: a Nix store legitimately contains no device nodes.

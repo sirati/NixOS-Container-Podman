@@ -18,8 +18,11 @@ store paths and pointing at them, e.g.
 Instead of bind-mounting each individual store path (one mount per closure
 entry) or mounting the whole host `/nix/store`, this FUSE presents the farm as
 the filesystem root and serves each qualifying symlink **as if it were the real
-store directory** — reading the actual contents from a backing store that may
-live at a different physical location (e.g. a `nix-portable` relocated store).
+store directory**. Metadata and directory traversal go through the daemon;
+regular-file reads, mmap and splice are attached to the backing file with the
+kernel's FUSE passthrough API and do not copy file contents through userspace.
+The backing store may live at a different physical location (e.g. a
+`nix-portable` relocated store).
 
 The result: a process `chroot`/namespaced onto the mount sees a normal-looking
 `/nix/store` populated with exactly the closure in the farm, with the real files
@@ -73,9 +76,17 @@ realize-as-directory treatment applies **only** to symlinks in the
 * All filesystem I/O is performed through [`cap-std`](https://docs.rs/cap-std)
   capability `Dir` handles opened once on `bind_target` and `redirect_root`.
   Every access is a `*at`-style operation relative to one of those handles
-  (`open`, `read_dir`, `symlink_metadata`, `read_link_contents`, `read`). The
+  (`open`, `read_dir`, `symlink_metadata`, `read_link_contents`). The
   process is **physically unable** to read outside those two roots even if a
   symlink target tries to escape with `..` or an absolute path.
+* Regular files are opened read-only through their capability handle with
+  `O_NOFOLLOW`, then registered using upstream
+  [`fuser`](https://docs.rs/fuser)'s safe `BackingId` /
+  `ReplyOpen::opened_passthrough` API. This crate has `unsafe_code = "forbid"`;
+  it contains no local ioctl or raw-fd unsafe block. `fuser` is built with
+  default features disabled, so this uses its pure Rust mount backend rather
+  than linking libfuse; the required ioctl unsafe remains encapsulated in the
+  upstream crate.
 * `resolution_root` is used purely as a logical path prefix for the
   membership / relative-path computation; it is never opened for I/O.
 * **Read-only.** Only read operations are implemented; every mutating operation
@@ -92,7 +103,23 @@ realize-as-directory treatment applies **only** to symlinks in the
 ## FUSE operations implemented
 
 `lookup`, `getattr`, `readlink`, `opendir`, `readdir`, `releasedir`, `open`,
-`read`, `release`, `statfs`, `access`. All mutating ops return `EROFS`.
+`release`, `statfs`, `access`. A successful `open` is always passthrough; the
+daemon's `read` callback deliberately returns `EIO` because reaching it would
+mean the kernel failed to honor that contract. All mutating ops return `EROFS`.
+
+## Kernel requirements
+
+The host kernel must provide `CONFIG_FUSE_PASSTHROUGH` and negotiate the
+`FUSE_PASSTHROUGH` capability. Registering a backing file currently also
+requires `CAP_SYS_ADMIN`; the daemon refuses to mount without it instead of
+starting a filesystem whose file opens all fail. The prison NixOS module runs
+each daemon in a dedicated store-view unit and grants that unit the one ambient
+capability. Prison setup, Podman and service containers receive none of it; the
+containers continue to drop all capabilities.
+
+Kernel backing references bypass the daemon's `RLIMIT_NOFILE`. The daemon
+therefore enforces `--max-open-files` itself (default `65536`) and returns
+`EMFILE` at the ceiling.
 
 ## Example invocation
 
@@ -128,14 +155,18 @@ nix-store-shared-fuse \
 * `--foreground` / `-f` — run in the foreground. This is the default behaviour
   (the process owns the mount session, suitable for `systemd` / launchers); the
   flag is accepted for explicit use.
+* `--max-open-files <N>` — cap concurrent passthrough handles. Defaults to
+  `65536`; must be greater than zero.
 
 ## Building & testing
 
 The toolchain and `libfuse` are provided via a nix shell:
 
 ```sh
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#fuse3 nixpkgs#clippy \
-  -c bash -lc 'cargo build && cargo test && cargo clippy -- -D warnings'
+nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#pkg-config \
+  nixpkgs#fuse3 nixpkgs#clippy \
+  -c bash -lc 'cargo fmt --check && cargo test --all-targets && \
+    cargo test --all-targets -- --ignored && cargo clippy --all-targets -- -D warnings'
 ```
 
 The pure path/predicate logic (target normalization, the "inside
@@ -144,5 +175,8 @@ relative-path mapping) is covered by unit tests in `src/realize.rs`. An
 integration test in `tests/realize_cap.rs` exercises the realization decision
 against a real on-disk farm + store layout through `cap-std`; it is marked
 `#[ignore]` (needs filesystem write access) — run it with
-`cargo test -- --ignored`. A full FUSE mount integration test is not run in the
-sandbox because it requires `/dev/fuse`.
+`cargo test -- --ignored`. Capability-opening unit tests also prove that
+absolute paths, `..` escapes and final/intermediate symlink escapes are refused.
+A full passthrough mount integration test additionally needs `/dev/fuse`, a
+kernel built with `CONFIG_FUSE_PASSTHROUGH`, and `CAP_SYS_ADMIN`, so it is not
+run in the unprivileged build sandbox.

@@ -11,7 +11,4 @@ pkgs.rustPlatform.buildRustPackage {
   src = ../nix-store-shared-fuse;
 
   cargoLock.lockFile = ../nix-store-shared-fuse/Cargo.lock;
-
-  nativeBuildInputs = [ pkgs.pkg-config ];
-  buildInputs = [ pkgs.fuse3 ];
 }

@@ -32,215 +32,197 @@
 # privilege escalation, read-only root, and writable state only where asked
 # for and always noexec,nosuid,nodev.
 
-{ pkgs
-, lib ? pkgs.lib
+{
+  pkgs,
+  lib ? pkgs.lib,
 }:
 
 let
-  inherit (lib) mkOption types;
-
-  nixStoreLower = import ../nix-store-lower.nix;
   mkRootfs = import ./rootfs.nix;
   mkRuleset = import ./ruleset.nix;
-  capsLib = import ./capabilities.nix { inherit lib; };
 
   # Configuration lives at one fixed path in every container, so that changing
   # it never changes anything the container was created with.
   configDir = "/config";
 
-  assertAbsolute = svc: argv:
-    let a0 = builtins.head argv; in
-    lib.throwIf (argv == [ ]) "prison: service ${svc} has an empty `exec`."
-      (lib.throwIf (!lib.hasPrefix "/" a0) ''
-        prison: service ${svc} has exec[0] = "${a0}", which is not an absolute path.
-
-        A prison has no $PATH and no shell to resolve a name against. Give the
-        store path: "''${pkgs.caddy}/bin/caddy".
-      ''
-        argv);
-
-  # ---------------------------------------------------------------------
-  # mkPrisonService: one confined process.
-  # ---------------------------------------------------------------------
-  mkPrisonService =
-    { name
-    , exec
-    , uid ? 1000
-    , gid ? uid
-    , user ? name
-    , packages ? [ ]
-    , environment ? { }
-    , state ? [ ]
-    # Host paths bound into the container:
-    #
-    #   persist = [
-    #     { host = "/var/lib/knot"; path = "/var/lib/knot"; }
-    #     { host = "/var/lib/secrets/tsig.conf"; path = "/secrets/tsig.conf";
-    #       readOnly = true; file = true; }
-    #   ]
-    #
-    # `readOnly` is what a credential wants; `file` binds a single file rather
-    # than the directory holding it, so a service is given one secret and not
-    # everyone else's. `host` is a string, never a path literal -- nix copies
-    # path literals into the store when they are interpolated, and the store is
-    # world-readable.
-    , persist ? [ ]
-    # A typed capability set: one named field per Linux capability, every one
-    # defaulting to false. Not a list of strings -- a misspelled string
-    # renders a flag that grants nothing while reading as though it granted
-    # something, whereas an unknown field is an evaluation error.
-    , capabilities ? { }
-    , readOnlyRoot ? true
-    , init ? true
-    , tmpfsSize ? "16M"
-    # Files placed in the container's /config, keyed by name relative to it.
-    # Values are store paths or derivations. Their CONTENTS are copied to a
-    # host directory that is bind-mounted in, rather than the store path being
-    # mounted directly, because a store path changes identity whenever the
-    # content does -- and then the mount, and so the container, would have to
-    # be recreated to pick up a new config. A directory the host rewrites in
-    # place is visible immediately, so a reload stays a reload.
-    , config ? { }
-    # How to tell the service its configuration changed. `signal` is enough
-    # for anything that reloads on SIGHUP; `exec` runs a command in the
-    # container, which needs that binary in `packages`.
-    , reload ? null
-    # Hard RLIMIT_NOFILE for this service's store view.
-    #
-    # Every file held open behind the view costs a descriptor in the FUSE
-    # process serving it, so this -- not the service's own limit -- is what
-    # caps how many files the service can have open in the store at once.
-    # Exceeding it surfaces as EMFILE from the service, a long way from the
-    # cause. The FUSE raises its soft limit to this on startup; null inherits
-    # whatever the prison unit was given.
-    , openFiles ? null
-    }:
-    assert lib.assertMsg (uid != 0)
-      "prison: service ${name} must not run as uid 0; that is what the container root account exists to avoid.";
-    let
-      argv = assertAbsolute name exec;
-
-      # Kernel names of the capabilities this service was granted.
-      grantedCaps = capsLib.granted
-        (lib.evalModules {
-          modules = [ { options = capsLib.options; } capabilities ];
-        }).config;
-
-      # Every persistent path is a host path bind-mounted in, so all of them
-      # are checked the same way -- read-only or not, credential or not.
-      checkedPersist = map
-        (pm:
-          let h = toString pm.host; in
-          lib.throwIf (!lib.hasPrefix "/" h) ''
-            prison: service ${name} persists host = "${h}", which is not an absolute path.
-
-            It is bound from the host filesystem at run time, so a relative
-            path has nothing to resolve against.
-          ''
-            (lib.throwIf (lib.hasPrefix builtins.storeDir h) ''
-              prison: service ${name} persists a path in the Nix store: ${h}
-
-              The store is read-only, so it is the wrong side of this mount for
-              state, and world-readable, so it is unsafe for a credential. A
-              path literal is the usual way in, since nix copies those into the
-              store when they are interpolated. Quote it, and deploy the file by
-              some means nix does not see.
-            ''
-              (lib.throwIf (!lib.hasPrefix "/" pm.path)
-                "prison: service ${name} mounts a persistent path at \"${pm.path}\", which is not absolute."
-                pm)))
-        persist;
-
-      roots = [ (builtins.head argv) ] ++ packages;
-      rootsDrv = pkgs.runCommand "prison-${name}-roots" { } ''
-        printf '%s\n' ${lib.escapeShellArgs roots} > $out
-      '';
-      closure = pkgs.closureInfo { rootPaths = roots; };
-      storeFarm = nixStoreLower { inherit pkgs closure; toplevel = rootsDrv; };
-
-      rootfs = mkRootfs {
-        inherit pkgs lib name configDir;
-        users = [ { inherit uid gid; name = user; } ];
-        extraDirs = map (s: s.path) state
-          ++ map (p: p.path) (lib.filter (p: !(p.file or false)) checkedPersist);
-        # A single file is bound onto a file: crun can mount a file over an
-        # existing one in a read-only rootfs, but cannot create the target.
-        extraFiles = map (p: p.path) (lib.filter (p: p.file or false) checkedPersist);
-      };
-
-      # The configuration as a store tree. The host copies its contents out;
-      # it is never mounted directly.
-      configTree = pkgs.runCommand "prison-${name}-config" { } (''
-        mkdir -p $out
-      '' + lib.concatStrings (lib.mapAttrsToList
-        (rel: src: ''
-          install -Dm0444 ${src} "$out/${rel}"
-        '')
-        config));
-    in
-    {
-      inherit name uid gid user argv environment state
-        readOnlyRoot init tmpfsSize openFiles rootfs storeFarm closure
-        config configTree reload;
-      persist = checkedPersist;
-      capabilities = grantedCaps;
-      hasConfig = config != { };
-      __prisonService = true;
-    };
+  mkPrisonService = import ./service.nix {
+    inherit
+      pkgs
+      lib
+      mkRootfs
+      configDir
+      ;
+    nixStoreLower = import ../nix-store-lower.nix;
+    capsLib = import ./capabilities.nix { inherit lib; };
+  };
 
   # ---------------------------------------------------------------------
   # mkPrison: the namespace owner, the policy, and the service list.
   # ---------------------------------------------------------------------
   mkPrison =
-    { name
-    , services
-    , listen ? { tcp = [ ]; udp = [ ]; }
-    , egress ? { mode = "none"; targets = [ ]; lan = [ ]; }
-    , user ? name
-    , stateDir ? "/var/lib/${name}"
+    {
+      name,
+      services,
+      listen ? {
+        tcp = [ ];
+        udp = [ ];
+      },
+      egress ? {
+        mode = "none";
+        targets = [ ];
+        lan = [ ];
+      },
+      pastaOptions ? [ ],
+      resolvers ? [ ],
+      user ? name,
+      stateDir ? "/var/lib/${name}",
+      # Share another prison's network namespace instead of owning one. The
+      # prison keeps its own host user, store views, state directory and
+      # units; only the netns -- and with it the shared loopback, the
+      # published ports and the nftables policy -- comes from the named
+      # prison, whose `<name>-infra-net` container every service here joins.
+      # This is how two prisons run as different host users yet still talk
+      # over loopback, e.g. a reverse proxy in front of its backends.
+      #
+      # A prison that joins must not declare `listen` or `egress` of its
+      # own: the namespace owner's ruleset is the only policy in that
+      # netns, so the union of everything reachable there is declared on
+      # the owner. The module rejects a join target that does not exist or
+      # that itself joins another prison (one hop only, no chains).
+      joins ? null,
     }:
     let
       svcList =
-        if builtins.isList services then services
-        else lib.mapAttrsToList (n: s: s // { name = s.name or n; }) services;
+        if builtins.isList services then
+          services
+        else
+          lib.mapAttrsToList (n: s: s // { name = s.name or n; }) services;
 
-      _check = lib.throwIf (svcList == [ ]) "prison: ${name} has no services."
-        (lib.throwIf (!(builtins.all (s: s.__prisonService or false) svcList))
+      joining = joins != null;
+
+      _check = lib.throwIf (svcList == [ ]) "prison: ${name} has no services." (
+        lib.throwIf (!(builtins.all (s: s.__prisonService or false) svcList))
           "prison: ${name} was given something that is not a mkPrisonService result."
-          (lib.throwIf (builtins.any (s: s.name == "infra-net") svcList)
-            "prison: ${name} declares a service called infra-net, which is the name of the namespace owner."
-            null));
+          (
+            lib.throwIf (builtins.any (s: s.name == "infra-net") svcList)
+              "prison: ${name} declares a service called infra-net, which is the name of the namespace owner."
+              (
+                lib.throwIf (joining && joins == name) "prison: ${name} joins itself." (
+                  lib.throwIf (joining && ((listen.tcp or [ ]) != [ ] || (listen.udp or [ ]) != [ ]))
+                    ''
+                      prison: ${name} joins ${joins} and also declares listen ports.
 
-      ruleset = mkRuleset { inherit pkgs lib listen egress; };
+                      The namespace owner's ruleset is the only policy in that
+                      netns. Declare the ports on ${joins} instead.
+                    ''
+                    (
+                      lib.throwIf
+                        (
+                          joining
+                          && (
+                            (egress.mode or "none") != "none" || (egress.targets or [ ]) != [ ] || (egress.lan or [ ]) != [ ]
+                          )
+                        )
+                        ''
+                          prison: ${name} joins ${joins} and also declares egress.
+
+                          The namespace owner's ruleset is the only policy in that
+                          netns. Declare the egress on ${joins} instead.
+                        ''
+                        (
+                          lib.throwIf (
+                            joining && pastaOptions != [ ]
+                          ) "prison: ${name} joins ${joins} and also declares pastaOptions." null
+                        )
+                    )
+                )
+              )
+          )
+      );
+
+      ruleset =
+        if joining then
+          null
+        else
+          mkRuleset {
+            inherit
+              pkgs
+              lib
+              listen
+              egress
+              resolvers
+              ;
+          };
 
       # The namespace owner, built exactly like any other service. catatonit
       # comes from its own store view, so nothing is copied into a rootfs and
-      # nothing is bind-mounted for it.
-      infraNet = mkPrisonService {
-        name = "infra-net";
-        exec = [ "${pkgs.catatonit}/bin/catatonit" "-P" ];
-        uid = 65000;
-        # It has no init of its own: catatonit IS the init, and wrapping it in
-        # another copy of itself would be silly.
-        init = false;
-      };
+      # nothing is bind-mounted for it. A prison that joins another's netns
+      # has no owner of its own.
+      infraNet =
+        if joining then
+          null
+        else
+          mkPrisonService {
+            name = "infra-net";
+            exec = [
+              "${pkgs.catatonit}/bin/catatonit"
+              "-P"
+            ];
+            uid = 65000;
+            # It has no init of its own: catatonit IS the init, and wrapping it in
+            # another copy of itself would be silly.
+            init = false;
+          };
 
-      wantsNetwork = (listen.tcp or [ ]) != [ ] || (listen.udp or [ ]) != [ ]
-        || (egress.mode or "none") != "none";
+      wantsNetwork =
+        (!joining)
+        && (
+          (listen.tcp or [ ]) != [ ]
+          || (listen.udp or [ ]) != [ ]
+          || (egress.mode or "none") != "none"
+          || pastaOptions != [ ]
+        );
 
-      toPublish = proto: p:
-        if builtins.isInt p then { port = p; protocol = proto; }
-        else { inherit (p) port; protocol = proto; }
+      toPublish =
+        proto: p:
+        if builtins.isInt p then
+          {
+            port = p;
+            protocol = proto;
+          }
+        else
+          {
+            inherit (p) port;
+            protocol = proto;
+          }
           // lib.optionalAttrs (p ? hostPort) { inherit (p) hostPort; };
 
-      publish = map (toPublish "tcp") (listen.tcp or [ ])
-        ++ map (toPublish "udp") (listen.udp or [ ]);
+      publish =
+        if joining then
+          [ ]
+        else
+          map (toPublish "tcp") (listen.tcp or [ ]) ++ map (toPublish "udp") (listen.udp or [ ]);
     in
     builtins.seq _check {
-      inherit name svcList ruleset wantsNetwork publish user stateDir listen
-        egress infraNet configDir;
-      # Everything that needs a store view mounted, owner included.
-      allServices = [ infraNet ] ++ svcList;
+      inherit
+        name
+        svcList
+        ruleset
+        wantsNetwork
+        publish
+        pastaOptions
+        resolvers
+        user
+        stateDir
+        listen
+        egress
+        infraNet
+        joins
+        configDir
+        ;
+      # Everything that needs a store view mounted, owner included. A
+      # prison that joins has no owner, so only its own services.
+      allServices = (if joining then [ ] else [ infraNet ]) ++ svcList;
       __prison = true;
     };
 in

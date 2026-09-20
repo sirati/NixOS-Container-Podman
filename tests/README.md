@@ -44,6 +44,7 @@ collected by the next `nix-collect-garbage`.
 | case | covers |
 | --- | --- |
 | `00-eval.sh` | the podman model's ordering and quoting, the prison's default-deny invariants and typed capabilities, and that unsupported values fail with "not implemented" |
+| `05-podman-tmpfs.sh` | the rendered Podman invocation accepts the tmpfs options and creates a service-owned writable `noexec,nosuid,nodev` mount |
 | `10-selfcontained.sh` | store baked into the rootfs, own nix-daemon, host store not visible |
 | `20-hostdaemon.sh` | host `/nix` read-only, builds delegated to the host daemon, no daemon inside |
 | `30-nixct.sh` | `mkNixct`'s own choices, and two sessions sharing one project |

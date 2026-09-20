@@ -87,6 +87,46 @@ to resolve a name against.
 A capability is a named field, not a string, so an unknown one is an
 evaluation error rather than a flag that grants nothing.
 
+## Sharing one netns between prisons
+
+Services in one prison share a loopback, and one prison runs as one host
+user. When the front door and its backends must run as *different* host
+users yet still talk over loopback, split them into two prisons and let
+one join the other's namespace:
+
+```nix
+services.prisons.caddy = prison.mkPrison {
+  name = "caddy";            # user `caddy` owns 80/443 and the policy
+  services = { inherit caddy; };
+  listen.tcp = [ 80 443 ];
+  egress.mode = "internet";
+};
+services.prisons."octoai-git" = prison.mkPrison {
+  name = "octoai-git";       # user `octoai-git`, same loopback
+  joins = "caddy";
+  services = { inherit forgejo; };
+};
+```
+
+Every `state` entry is a `noexec,nosuid,nodev` tmpfs. Its root defaults to the
+service's `uid` and `gid`, so a non-root daemon can create sockets, pid files
+and cache entries immediately. Podman derives that ownership from the service
+user via its `chown=true` tmpfs option. Arbitrary per-mount owners are rejected
+because Podman does not support them for tmpfs mounts.
+
+Each service's restricted `/nix/store` is owned by a separate FUSE daemon unit.
+Linux currently requires `CAP_SYS_ADMIN` to register passthrough backing files,
+so only that fixed daemon receives it; the prison setup unit, Podman and the
+service containers do not.
+
+The joiner keeps its own user, store views, state and units; only the
+netns is shared, so `reverse_proxy 127.0.0.1:3000` keeps working across
+the user boundary. The owner's ruleset is the only policy in that netns,
+so a joining prison must not declare `listen` or `egress` of its own --
+the union of everything reachable there is declared on the owner, and a
+misplaced declaration is an evaluation error. Joins are one hop only:
+a prison that itself joins cannot be joined.
+
 ## Units
 
 ```

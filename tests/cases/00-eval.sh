@@ -51,6 +51,23 @@ eval_fails "publishing a port while joining another namespace is a type error" \
      };
    }"
 
+eval_is "pasta options are rendered inside the network argument" \
+  "pasta:--map-gw,--dns-forward,192.0.2.3" \
+  "$PODMAN let argv = p.renderRun \"podman\" {
+      name = \"c\"; command = [ \"/init\" ]; rootfs = \"/r\";
+      network = {
+        mode = \"pasta\";
+        pastaOptions = [ \"--map-gw\" \"--dns-forward\" \"192.0.2.3\" ];
+      };
+    }; i = lib.lists.findFirstIndex (x: x == \"--network\") null argv;
+    in builtins.elemAt argv (i + 1)"
+
+eval_fails "pasta options require pasta mode" "sets pastaOptions" \
+  "$PODMAN p.renderRunShell \"pm\" {
+     name = \"c\"; command = [ \"/init\" ]; rootfs = \"/r\";
+     network.pastaOptions = [ \"--map-gw\" ];
+   }"
+
 echo "== eval: prison =="
 
 PRISON='let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
@@ -83,6 +100,71 @@ eval_is "a read-only persisted file is mounted where it was asked for" "/secrets
                    readOnly = true; file = true; } ];
    }).persist)"
 
+eval_fails "ephemeral state cannot promise an unsupported arbitrary owner" \
+  "cannot assign an arbitrary owner" \
+  "$PRISON toString (svc {
+      state = [ { path = \"/run/service\"; uid = 42; } ];
+    }).state"
+
+eval_is "tmpfs renders owner, mode and hardening flags" \
+  "type=tmpfs,destination=/run/service,chown=true,rw,noexec,nosuid,nodev,tmpfs-size=8M,tmpfs-mode=0750" \
+  "$PODMAN let argv = p.renderRun \"podman\" {
+      name = \"c\"; command = [ \"/bin/true\" ]; rootfs = \"/root\";
+      mounts = [ { type = \"tmpfs\"; destination = \"/run/service\";
+                   readOnly = false; size = \"8M\"; mode = \"0750\";
+                   chown = true; } ];
+    }; i = lib.lists.findFirstIndex (x: x == \"--mount\") null argv;
+    in builtins.elemAt argv (i + 1)"
+
+# Evaluate the final NixOS units, not only the intermediate service model.
+# The passthrough ioctl needs CAP_SYS_ADMIN for every backing-file open, but
+# that capability must stop at its dedicated FUSE daemon.
+PRISON_SYSTEM='let
+  prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+  svc = prison.mkPrisonService {
+    name = "s"; uid = 1234; exec = [ "/bin/true" ];
+  };
+  p = prison.mkPrison {
+    name = "p"; services = [ svc ]; resolvers = [ "192.0.2.3" ];
+    pastaOptions = [ "--map-gw" ];
+  };
+  system = lib.nixosSystem {
+    modules = [
+      (import (flake.outPath + "/nix/prison/module.nix") { inherit prison; })
+      { services.prisons.p = p; system.stateVersion = "26.05";
+        nixpkgs.hostPlatform = builtins.currentSystem; }
+    ];
+  };
+in'
+
+eval_is "only the store daemon receives the passthrough capability" \
+  "CAP_SYS_ADMIN:CAP_SYS_ADMIN:true:0:0" \
+  "$PRISON_SYSTEM let
+      store = system.config.systemd.services.p-store-s.serviceConfig;
+      setup = system.config.systemd.services.p.serviceConfig;
+      service = system.config.systemd.services.p-s.serviceConfig;
+    in \"\${builtins.head store.AmbientCapabilities}:\${builtins.head store.CapabilityBoundingSet}:\${lib.boolToString store.NoNewPrivileges}:\${toString (builtins.length (setup.AmbientCapabilities or []))}:\${toString (builtins.length (service.AmbientCapabilities or []))}\""
+
+eval_is "the generated service container drops every capability" "true" \
+  "$PRISON_SYSTEM let
+      argv = system.config.systemd.services.p-s.serviceConfig.ExecStart;
+    in lib.boolToString
+      (lib.hasInfix \"--cap-drop=ALL\" argv && !lib.hasInfix \"--cap-add\" argv)"
+
+eval_is "a prison mounts its explicit resolver configuration read-only" "true" \
+  "$PRISON_SYSTEM let
+      argv = system.config.systemd.services.p-s.serviceConfig.ExecStart;
+    in lib.boolToString
+      (lib.hasInfix \"destination=/etc/resolv.conf\" argv
+       && lib.hasInfix \"source=/nix/store/\" argv)"
+
+eval_is "a networked prison waits for the host network to be online" "true" \
+  "$PRISON_SYSTEM let
+      unit = system.config.systemd.services.p;
+    in lib.boolToString
+      (builtins.elem \"network-online.target\" unit.after
+       && builtins.elem \"network-online.target\" unit.wants)"
+
 eval_fails "a service may not run as uid 0" "must not run as uid 0" \
   "$PRISON toString (svc { uid = 0; }).uid"
 
@@ -107,8 +189,54 @@ eval_is "a prison wants no network until something asks for one" "false" \
       name = \"p\"; services = [ (svc { }) ];
     }).wantsNetwork"
 
+eval_is "pasta options make a prison request a network" "true" \
+  "$PRISON lib.boolToString (prison.mkPrison {
+      name = \"p\"; services = [ (svc { }) ]; pastaOptions = [ \"--map-gw\" ];
+    }).wantsNetwork"
+
 eval_is "the namespace owner is an ordinary service, not a special case" "infra-net" \
   "$PRISON (prison.mkPrison { name = \"p\"; services = [ (svc { }) ]; }).infraNet.name"
+
+# A prison can share another prison's netns while keeping its own host
+# user: one loopback, two users. The joiner owns nothing networked.
+eval_is "a joining prison wants no network of its own" "false" \
+  "$PRISON lib.boolToString (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+    }).wantsNetwork"
+
+eval_is "a joining prison publishes nothing" "0" \
+  "$PRISON toString (builtins.length (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+    }).publish)"
+
+eval_is "a joining prison mounts no owner store view" "1" \
+  "$PRISON toString (builtins.length (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+    }).allServices)"
+
+eval_is "a joining service is placed in the owning prison's namespace" "caddy-infra-net" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+       backend = import (flake.outPath + "/nix/prison/podman-backend.nix") { inherit pkgs; };
+   in (backend.serviceSpec
+     { name = "g"; joins = "caddy"; stateDir = "/var/lib/g"; configDir = "/config"; }
+     (prison.mkPrisonService { name = "s"; exec = [ "/bin/true" ]; })).network.container'
+
+eval_fails "a joining prison may not declare listen ports" "joins" \
+  "$PRISON (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+      listen.tcp = [ 80 ];
+    }).name"
+
+eval_fails "a joining prison may not declare egress" "joins" \
+  "$PRISON (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+      egress.mode = \"internet\";
+    }).name"
+
+eval_fails "a prison may not join itself" "joins itself" \
+  "$PRISON (prison.mkPrison {
+      name = \"g\"; joins = \"g\"; services = [ (svc { }) ];
+    }).name"
 
 echo "== eval: unsupported values fail loud =="
 
