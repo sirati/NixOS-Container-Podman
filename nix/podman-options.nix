@@ -188,6 +188,11 @@ let
       default = true;
       description = "Remove the container when it exits (`--rm`).";
     };
+    replace = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Replace a stale container with the same name (`--replace`).";
+    };
     detach = mkOption {
       type = types.bool;
       default = false;

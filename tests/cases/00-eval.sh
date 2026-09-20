@@ -151,6 +151,15 @@ eval_is "the generated service container drops every capability" "true" \
     in lib.boolToString
       (lib.hasInfix \"--cap-drop=ALL\" argv && !lib.hasInfix \"--cap-add\" argv)"
 
+eval_is "only the namespace owner replaces a stale reboot remnant" "true:false" \
+  "$PRISON let
+      serviceModel = svc { };
+      p = prison.mkPrison { name = \"p\"; services = [ serviceModel ]; };
+      backend = import (flake.outPath + \"/nix/prison/podman-backend.nix\") { inherit pkgs lib; };
+      owner = backend.runOwner p;
+      service = backend.runService p serviceModel;
+    in \"\${lib.boolToString (builtins.elem \"--replace\" owner)}:\${lib.boolToString (builtins.elem \"--replace\" service)}\""
+
 eval_is "a prison mounts its explicit resolver configuration read-only" "true" \
   "$PRISON_SYSTEM let
       argv = system.config.systemd.services.p-s.serviceConfig.ExecStart;

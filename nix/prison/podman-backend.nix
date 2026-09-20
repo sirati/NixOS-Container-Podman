@@ -117,6 +117,10 @@ let
     baseSpec p p.infraNet
     // {
       remove = false;
+      # Podman can retain this namespace holder as an external container
+      # across a host reboot. Replacing that stopped object lets the prison
+      # reclaim its stable name without touching a live owner.
+      replace = true;
       network =
         if p.wantsNetwork then
           {

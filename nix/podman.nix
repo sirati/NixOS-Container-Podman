@@ -111,6 +111,7 @@ let
       "run"
     ]
     ++ optionals c.remove [ "--rm" ]
+    ++ optionals c.replace [ "--replace" ]
     ++ optionals c.detach [ "-d" ]
     ++ [
       "--name"
