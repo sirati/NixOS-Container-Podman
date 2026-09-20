@@ -225,7 +225,10 @@ in
 
     users.groups = mapAttrs' (_: p: nameValuePair p.user { }) cfg;
 
-    virtualisation.containers.enable = lib.mkDefault true;
+    # Rootless Podman also needs the newuidmap/newgidmap setuid wrappers.
+    # Enabling only the generic containers module creates the subuid ranges,
+    # but leaves every prison unable to construct its user namespace.
+    virtualisation.podman.enable = lib.mkDefault true;
 
     # The owner container runs rootless pasta, which binds the published
     # host ports itself. Unprivileged binding below 1024 is denied by
