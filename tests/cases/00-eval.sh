@@ -238,6 +238,17 @@ eval_fails "a prison may not join itself" "joins itself" \
       name = \"g\"; joins = \"g\"; services = [ (svc { }) ];
     }).name"
 
+eval_is "internet mode blocks the synthetic host gateway unless targeted" "true" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+       rules = prison.ruleset {
+         inherit pkgs;
+         egress.mode = "internet";
+         egress.targets = [ { address = "192.0.2.1"; port = 53; } ];
+       };
+   in lib.boolToString
+     (lib.hasInfix "ip daddr 192.0.2.1 tcp dport 53 accept" (builtins.readFile rules)
+      && lib.hasInfix "192.0.2.0/24" (builtins.readFile rules))'
+
 echo "== eval: unsupported values fail loud =="
 
 # Every one of these must say "not implemented" -- the point is that an

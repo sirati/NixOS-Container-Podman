@@ -4,10 +4,11 @@
 # a build-time artifact on purpose: nothing inside either container writes,
 # reads or can replace it, and its content is fixed by the configuration
 # rather than by anything the container does at runtime.
-{ pkgs
-, allow ? [ ]      # extra IPv4 destinations to permit
-, allow6 ? [ ]     # extra IPv6 destinations to permit
-, resolver ? [ "169.254.1.1" ]  # pasta's own DNS forwarder
+{
+  pkgs,
+  allow ? [ ], # extra IPv4 destinations to permit
+  allow6 ? [ ], # extra IPv6 destinations to permit
+  resolver ? [ "169.254.1.1" ], # pasta's own DNS forwarder
 }:
 
 let
@@ -22,11 +23,28 @@ pkgs.writeText "nixct-isolate-lan.nft" ''
       ${optRule resolver "ip daddr ${set resolver} accept"}
       ${optRule allow "ip daddr ${set allow} accept"}
       ${optRule allow6 "ip6 daddr ${set allow6} accept"}
-      ip daddr ${set [
-        "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16"
-        "169.254.0.0/16" "100.64.0.0/10"
-      ]} reject with icmp type admin-prohibited
-      ip6 daddr ${set [ "fc00::/7" "fe80::/10" ]} \
+      ip daddr ${
+        set [
+          "0.0.0.0/8"
+          "10.0.0.0/8"
+          "100.64.0.0/10"
+          "127.0.0.0/8"
+          "169.254.0.0/16"
+          "172.16.0.0/12"
+          "192.0.2.0/24"
+          "192.168.0.0/16"
+          "198.51.100.0/24"
+          "203.0.113.0/24"
+          "224.0.0.0/4"
+          "240.0.0.0/4"
+        ]
+      } reject with icmp type admin-prohibited
+      ip6 daddr ${
+        set [
+          "fc00::/7"
+          "fe80::/10"
+        ]
+      } \
         reject with icmpv6 type admin-prohibited
     }
   }

@@ -35,11 +35,21 @@ let
   # "internet"` rejects these so that "may talk to the internet" cannot be
   # quietly read as "may talk to the machine next to it".
   privateV4 = [
+    "0.0.0.0/8"
+    "127.0.0.0/8"
     "10.0.0.0/8"
     "172.16.0.0/12"
     "192.168.0.0/16"
     "169.254.0.0/16"
     "100.64.0.0/10"
+    # Documentation ranges are also used as synthetic pasta links. Treating
+    # them as internet would let an internet-mode prison reach every host
+    # service through its mapped gateway instead of only declared targets.
+    "192.0.2.0/24"
+    "198.51.100.0/24"
+    "203.0.113.0/24"
+    "224.0.0.0/4"
+    "240.0.0.0/4"
   ];
   privateV6 = [
     "fc00::/7"
