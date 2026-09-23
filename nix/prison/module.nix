@@ -66,6 +66,15 @@ let
   serviceHelpers = import ./service-unit.nix { inherit lib pkgs backend; };
   inherit (serviceHelpers) syncCmd serviceUnit;
 
+  # These are the files copied by each generated service unit's ExecStartPre
+  # and ExecReload. Keep the inventory derived from the same configTree as
+  # syncCmd, so a configuration snapshot cannot drift from the active unit.
+  generatedConfigFilesByService = lib.mapAttrs (_: p:
+    lib.listToAttrs (map (s: lib.nameValuePair s.name (
+      map (rel: "${s.configTree}/${rel}") (builtins.attrNames s.config)
+    )) p.svcList)
+  ) cfg;
+
   prisonUnit =
     p:
     let
@@ -190,6 +199,30 @@ in
       owner, store views and network policy, plus one supervised unit per
       service.
     '';
+  };
+
+  options.services.nixDevContainer = {
+    generatedConfigFilesByService = mkOption {
+      type = types.attrsOf (types.attrsOf (types.listOf types.str));
+      readOnly = true;
+      default = generatedConfigFilesByService;
+      description = ''
+        Store files copied into each prison service's /config directory,
+        grouped by prison and service name. This contains configuration
+        files only, not a service's package or store closure.
+      '';
+    };
+
+    generatedConfigFiles = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      default = lib.concatMap (services: lib.concatLists (builtins.attrValues services))
+        (builtins.attrValues generatedConfigFilesByService);
+      description = ''
+        Flat list of store files copied into prison service /config
+        directories. Derived from the same config trees used by systemd.
+      '';
+    };
   };
 
   config = mkIf (cfg != { }) {

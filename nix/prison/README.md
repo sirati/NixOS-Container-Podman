@@ -84,6 +84,13 @@ in {
 `exec[0]` must be an absolute store path: a prison has no `$PATH` and no shell
 to resolve a name against.
 
+The NixOS module exposes the generated files copied into service `/config`
+directories as `services.nixDevContainer.generatedConfigFiles`. The companion
+`generatedConfigFilesByService` groups those store-file paths by prison name
+and service name. Both outputs are read-only and are derived from the same
+config trees used by each service unit's start and reload commands. They do
+not include package closures or other store inputs.
+
 A capability is a named field, not a string, so an unknown one is an
 evaluation error rather than a flag that grants nothing.
 

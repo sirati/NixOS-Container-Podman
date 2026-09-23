@@ -123,6 +123,7 @@ PRISON_SYSTEM='let
   prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
   svc = prison.mkPrisonService {
     name = "s"; uid = 1234; exec = [ "/bin/true" ];
+    config."nested/test.conf" = pkgs.writeText "prison-test.conf" "ok";
   };
   p = prison.mkPrison {
     name = "p"; services = [ svc ]; resolvers = [ "192.0.2.3" ];
@@ -136,6 +137,18 @@ PRISON_SYSTEM='let
     ];
   };
 in'
+
+eval_is "config inventory names the exact file copied by the generated unit" "true" \
+  "$PRISON_SYSTEM let
+      files = system.config.services.nixDevContainer.generatedConfigFiles;
+      grouped = system.config.services.nixDevContainer.generatedConfigFilesByService.p.s;
+      unit = system.config.systemd.services.p-s.serviceConfig;
+      expected = \"\${svc.configTree}/nested/test.conf\";
+    in lib.boolToString
+      (files == [ expected ] && grouped == files
+       && lib.hasInfix
+         (builtins.unsafeDiscardStringContext (toString svc.configTree))
+         (builtins.unsafeDiscardStringContext (builtins.head unit.ExecStartPre)))"
 
 eval_is "only the store daemon receives the passthrough capability" \
   "CAP_SYS_ADMIN:CAP_SYS_ADMIN:true:0:0" \
