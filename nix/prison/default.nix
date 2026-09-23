@@ -26,8 +26,8 @@
 # No shell, no coreutils, no package manager: a process that achieves code
 # execution has no second binary to reach for.
 #
-# Everything is denied by default and opened by name: no network beyond
-# loopback, every listening port declared per protocol, every egress
+# Everything is denied by default and opened by name: no application network
+# beyond loopback, every listening port declared per protocol, every egress
 # destination declared or covered by a named mode, no capabilities, no
 # privilege escalation, read-only root, and writable state only where asked
 # for and always noexec,nosuid,nodev.

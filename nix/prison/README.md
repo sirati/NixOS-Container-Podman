@@ -36,9 +36,9 @@ coreutils, no package manager.
 
 | | |
 |---|---|
-| network | loopback only, shared across the prison |
+| network | loopback and IPv6 link control, shared across the prison |
 | listen | every port declared per protocol, or it is not bound |
-| egress | `mode = "none"`; nothing leaves but loopback and replies |
+| egress | `mode = "none"`; only loopback, replies, and IPv6 link control |
 | capabilities | all dropped, `no-new-privileges` |
 | root filesystem | read-only |
 | writable paths | none unless declared; always `noexec,nosuid,nodev` |
@@ -56,6 +56,10 @@ egress.mode = "unrestricted";  # escape hatch
 
 Explicit `targets` and `lan` are matched before the private-range drops, so a
 named private destination beats the blanket rule.
+
+IPv6 Neighbor Discovery and router messages on the prison link are allowed
+with hop limit 255. They let the kernel maintain its next-hop route; they do
+not grant application traffic to any address or port.
 
 ## Usage
 

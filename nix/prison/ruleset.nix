@@ -91,7 +91,7 @@ let
 
   egressBody =
     if mode == "none" then
-      "    # egress.mode = \"none\": nothing leaves but loopback and replies."
+      "    # egress.mode = \"none\": only loopback, replies, and IPv6 link control."
     else if mode == "targets" then
       concatMapStringsSep "\n" targetRule targets
     else if mode == "internet" then
@@ -122,6 +122,9 @@ pkgs.writeText "prison-ruleset.nft" ''
     chain input {
       type filter hook input priority filter; policy drop;
       iif "lo" accept
+      # IPv6 cannot use its next-hop route without Neighbor Discovery.
+      # These messages are link-local control traffic, not application ingress.
+      iif "eth0" ip6 hoplimit 255 icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
       ct state established,related accept
       ct state invalid drop
   ${optionalString (tcpListens != [ ]) (concatMapStringsSep "\n" (listenRule "tcp") tcpListens)}
@@ -131,6 +134,7 @@ pkgs.writeText "prison-ruleset.nft" ''
     chain output {
       type filter hook output priority filter; policy drop;
       oif "lo" accept
+      oif "eth0" ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
       ct state established,related accept
       ct state invalid drop
   ${optionalString (resolvers != [ ])
