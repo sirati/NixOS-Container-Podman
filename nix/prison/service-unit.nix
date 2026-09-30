@@ -49,9 +49,9 @@ let
       description = "${p.name}: ${s.name}";
       after = [
         "${p.name}.service"
-        "user@%U.service"
+        "prison-user-${p.user}.target"
       ];
-      requires = [ "user@%U.service" ];
+      requires = [ "prison-user-${p.user}.target" ];
       bindsTo = [ "${p.name}.service" ];
       partOf = [ "${p.name}.service" ];
       wantedBy = [ "multi-user.target" ];
