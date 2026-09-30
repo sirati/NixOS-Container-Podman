@@ -164,17 +164,15 @@ let
       after = [
         (if p.wantsNetwork then "network-online.target" else "network.target")
         "suid-sgid-wrappers.service"
-        # %U expands to the numeric uid selected by User=.  Keep the
-        # rootless Podman user manager alive until every prison unit has
-        # stopped; otherwise shutdown can remove its D-Bus socket while
-        # podman is still stopping containers.
-        "user@%U.service"
+        # Dependency specifiers use the system manager's identity, not User=.
+        # The generator resolves the account's allocated UID at boot/reload.
+        "prison-user-${p.user}.target"
       ]
       ++ storeUnits
       ++ lib.optional joining "${p.joins}.service";
       wants = lib.optional p.wantsNetwork "network-online.target";
       requires =
-        [ "user@%U.service" "suid-sgid-wrappers.service" ]
+        [ "prison-user-${p.user}.target" "suid-sgid-wrappers.service" ]
         ++ storeUnits
         ++ lib.optional joining "${p.joins}.service";
       bindsTo = storeUnits;
@@ -286,6 +284,12 @@ in
     # looks like a missing binary rather than a mount permission.
     programs.fuse.userAllowOther = lib.mkDefault true;
 
+    systemd.generators.prison-user-managers = "${import ./user-manager-generator.nix { inherit pkgs lib; prisons = cfg; }}/bin/prison-user-managers";
+    systemd.targets = mapAttrs' (_: p: nameValuePair "prison-user-${p.user}" {
+      description = "User manager for prison account ${p.user}";
+      # Fail closed if the account lookup generator cannot resolve a UID.
+      unitConfig.AssertPathExists = "/run/systemd/generator/prison-user-${p.user}.target.d/account.conf";
+    }) cfg;
     systemd.services =
       (mapAttrs' (_: p: prisonUnit p) cfg)
       // lib.listToAttrs (
