@@ -140,10 +140,12 @@ let
     baseSpec p s
     // {
       remove = true;
-      # Foreground: the service unit is Type=exec and supervises this process
-      # directly. Detaching would exit at once, the unit would go dead, and
-      # deactivation would tear the container down with it.
-      detach = false;
+      # Podman sends READY and MAINPID for conmon after a detached start.
+      # The notify unit then supervises conmon for the container's lifetime.
+      detach = true;
+      # Dependent units may exec inside the container only after conmon
+      # confirms that the container exists and its process has started.
+      extraArgs = [ "--sdnotify=conmon" ];
       network = {
         mode = "container";
         container = netnsOwner p;
