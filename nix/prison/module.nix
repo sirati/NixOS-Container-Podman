@@ -173,7 +173,10 @@ let
       # BindsTo stops every child when a store view tears down this owner.
       # Starting the owner must bring back unchanged children as well.
       wants = lib.optional p.wantsNetwork "network-online.target"
-        ++ map (s: "${p.name}-${s.name}.service") p.svcList;
+        ++ map (s: "${p.name}-${s.name}.service") (lib.filter
+          (s: builtins.elem "multi-user.target"
+            config.systemd.services."${p.name}-${s.name}".wantedBy)
+          p.svcList);
       requires =
         [ "prison-user-${p.user}.target" "suid-sgid-wrappers.service" ]
         ++ storeUnits
