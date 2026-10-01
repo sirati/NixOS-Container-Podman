@@ -55,9 +55,12 @@ let
       bindsTo = [ "${p.name}.service" ];
       partOf = [ "${p.name}.service" ];
       wantedBy = [ "multi-user.target" ];
+      environment.PODMAN_SYSTEMD_UNIT = "${p.name}-${s.name}.service";
 
       serviceConfig = {
-        Type = "exec";
+        Type = "notify";
+        NotifyAccess = "all";
+        Delegate = true;
         User = p.user;
         Restart = "on-failure";
         RestartSec = 2;
