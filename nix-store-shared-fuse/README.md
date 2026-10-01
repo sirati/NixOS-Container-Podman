@@ -52,11 +52,11 @@ the two are identical and `--redirect-root` may be omitted.
 
 For an entry in the `bind_target` tree that is a **symlink** with target `T`:
 
-* **Realize it as a directory** (serve its contents) **iff**:
+* **Realize it as a directory or regular file** (serve its contents) **iff**:
   1. `T` (normalized, absolute) is **inside** `resolution_root`, **and**
   2. `T` is **not inside** `bind_target` (loop guard — a farm symlink pointing
      back into the farm must stay a symlink), **and**
-  3. the realized location is actually a directory.
+  3. the realized location is a directory or regular file.
 
   The realized location is `redirect_root / (T relative to resolution_root)`.
 

@@ -35,22 +35,23 @@ impl StoreFs {
                 &self.bind_target_logical,
             ) {
                 Realization::Realize { rel } => {
-                    // Verify the realized location is actually a directory,
-                    // read through the redirect capability dir.
-                    let realized_is_dir = if rel.as_os_str().is_empty() {
-                        // redirect root itself.
-                        true
+                    // A store path may be a directory or a regular file.
+                    // Returning its farm link for a file would point back to
+                    // itself when the view is mounted at /nix/store.
+                    let kind = if rel.as_os_str().is_empty() {
+                        Some(NodeKind::RealizedDir)
                     } else {
                         self.redirect_dir
                             .metadata(&rel)
-                            .map(|m| m.is_dir())
-                            .unwrap_or(false)
+                            .ok()
+                            .and_then(|m| if m.is_dir() { Some(NodeKind::RealizedDir) }
+                                else if m.is_file() { Some(NodeKind::File) } else { None })
                     };
-                    if realized_is_dir {
+                    if let Some(kind) = kind {
                         return Some(Node {
                             backing: Backing::Redirect,
                             rel,
-                            kind: NodeKind::RealizedDir,
+                            kind,
                         });
                     }
                     // Falls through to plain symlink.
@@ -237,5 +238,20 @@ mod tests {
             .is_none());
         drop(fs);
         fs::remove_dir_all(base).expect("remove fixture");
+    }
+
+    #[test]
+    fn farm_file_is_realized_without_a_self_referencing_symlink() {
+        let (base, fs) = fixture();
+        symlink("/nix/store/file", base.join("bind/file")).unwrap();
+        let node = fs.resolve_bind_child(Path::new(""), OsStr::new("file")).unwrap();
+        assert_eq!(node.kind, NodeKind::File);
+        assert!(matches!(node.backing, Backing::Redirect));
+        assert_eq!(fs.attr_for(2, &node).unwrap().kind, FileType::RegularFile);
+        assert_eq!(fs.redirect_dir.read(&node.rel).unwrap(), b"regular");
+        symlink("/nix/store/socket", base.join("bind/socket")).unwrap();
+        assert_eq!(fs.resolve_bind_child(Path::new(""), OsStr::new("socket")).unwrap().kind, NodeKind::Symlink);
+        drop(fs);
+        fs::remove_dir_all(base).unwrap();
     }
 }

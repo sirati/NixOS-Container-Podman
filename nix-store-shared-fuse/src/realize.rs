@@ -84,13 +84,13 @@ pub enum Realization {
 /// Decide how to treat a farm symlink whose (lexically normalized, absolute)
 /// target is `target`.
 ///
-/// Realize as a directory IFF:
+/// Realize as a directory or regular file IFF:
 ///   * `target` is inside `resolution_root`, AND
 ///   * `target` is NOT inside `bind_target` (loop guard).
 ///
-/// The "is the realized location actually a directory" check is intentionally
+/// The "is the realized location a directory or regular file" check is intentionally
 /// NOT done here (it requires I/O); the caller verifies that via cap-std and
-/// falls back to `KeepSymlink` if the redirect path is missing or not a dir.
+/// falls back to `KeepSymlink` for missing or unsupported file types.
 ///
 /// When realizing, the returned `rel` is `target` stripped of the
 /// `resolution_root` prefix, so the content location is
