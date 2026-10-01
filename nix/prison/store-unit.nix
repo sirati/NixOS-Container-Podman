@@ -32,6 +32,9 @@ lib.nameValuePair unitName {
   description = "${p.name}: passthrough store view for ${s.name}";
   before = [ "${p.name}.service" ];
   partOf = [ "${p.name}.service" ];
+  # A changed or recovered store view must restart its namespace owner,
+  # even when the owner's own unit definition did not change.
+  wants = [ "${p.name}.service" ];
 
   serviceConfig = {
     Type = "exec";

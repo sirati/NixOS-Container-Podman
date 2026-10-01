@@ -170,7 +170,10 @@ let
       ]
       ++ storeUnits
       ++ lib.optional joining "${p.joins}.service";
-      wants = lib.optional p.wantsNetwork "network-online.target";
+      # BindsTo stops every child when a store view tears down this owner.
+      # Starting the owner must bring back unchanged children as well.
+      wants = lib.optional p.wantsNetwork "network-online.target"
+        ++ map (s: "${p.name}-${s.name}.service") p.svcList;
       requires =
         [ "prison-user-${p.user}.target" "suid-sgid-wrappers.service" ]
         ++ storeUnits
