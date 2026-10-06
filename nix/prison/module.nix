@@ -12,10 +12,11 @@
 #                       ruleset into its network namespace from the host.
 #                       Torn down in reverse on stop.
 #
-#   <n>-<svc>.service   Type=exec, one per service, BindsTo <n>.service.
-#                       Runs the container in the foreground so systemd
-#                       supervises and restarts it directly -- there is
-#                       nothing inside the prison that could.
+#   <n>-<svc>.service   Type=forking, one per service, BindsTo <n>.service.
+#                       Ready once the detached `podman run` has started the
+#                       container; systemd then supervises and restarts it
+#                       through conmon's pidfile -- there is nothing inside
+#                       the prison that could.
 #
 # The ruleset is loaded into a namespace the prison owns but cannot reach:
 # `podman unshare` enters the rootless user namespace that owns the netns,

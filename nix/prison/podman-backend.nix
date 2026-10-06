@@ -32,6 +32,11 @@ let
   # that prison's owner.
   netnsOwner = p: if (p.joins or null) != null then "${p.joins}-infra-net" else ownerName p;
 
+  # Created by systemd for the service unit (RuntimeDirectory=) and owned by
+  # the prison user, so conmon can write its pidfile there.
+  runtimeDirName = p: s: containerName p s;
+  conmonPidFile = p: s: "/run/${runtimeDirName p s}/conmon.pid";
+
   storeMountPoint = p: s: "${p.stateDir}/store/${s.name}";
   configMountPoint = p: s: "${p.stateDir}/config/${s.name}";
 
@@ -140,12 +145,18 @@ let
     baseSpec p s
     // {
       remove = true;
-      # Podman sends READY and MAINPID for conmon after a detached start.
-      # The notify unit then supervises conmon for the container's lifetime.
+      # A detached `podman run` exits only once the container's process has
+      # started, so its exit is the readiness signal for the forking unit.
+      # conmon stays behind, and its pidfile names the process systemd then
+      # supervises for the container's lifetime. Readiness is never an
+      # sd_notify datagram: podman sends that from a short-lived child, and
+      # PID 1 drops it when the child is gone before the message is read.
       detach = true;
-      # Dependent units may exec inside the container only after conmon
-      # confirms that the container exists and its process has started.
-      extraArgs = [ "--sdnotify=conmon" ];
+      extraArgs = [
+        "--sdnotify=ignore"
+        "--conmon-pidfile"
+        (conmonPidFile p s)
+      ];
       network = {
         mode = "container";
         container = netnsOwner p;
@@ -202,6 +213,8 @@ in
     netnsOwner
     storeMountPoint
     configMountPoint
+    runtimeDirName
+    conmonPidFile
     ownerSpec
     serviceSpec
     runOwner

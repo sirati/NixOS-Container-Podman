@@ -58,8 +58,9 @@ let
       environment.PODMAN_SYSTEMD_UNIT = "${p.name}-${s.name}.service";
 
       serviceConfig = {
-        Type = "notify";
-        NotifyAccess = "all";
+        Type = "forking";
+        PIDFile = backend.conmonPidFile p s;
+        RuntimeDirectory = backend.runtimeDirName p s;
         Delegate = true;
         User = p.user;
         Restart = "on-failure";

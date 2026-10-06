@@ -164,6 +164,23 @@ eval_is "the generated service container drops every capability" "true" \
     in lib.boolToString
       (lib.hasInfix \"--cap-drop=ALL\" argv && !lib.hasInfix \"--cap-add\" argv)"
 
+# Readiness must not hang on an sd_notify datagram from a short-lived podman
+# child, which PID 1 drops once the child has exited. The unit forks, is
+# ready when the detached run has started the container, and then follows
+# conmon through the pidfile podman is told to write.
+eval_is "a service unit is ready when the detached run returns and then follows conmon" \
+  "forking:/run/p-s/conmon.pid:p-s:absent:true:true:false" \
+  "$PRISON_SYSTEM let
+      unit = system.config.systemd.services.p-s.serviceConfig;
+      argv = unit.ExecStart;
+    in lib.concatStringsSep \":\" [
+      unit.Type unit.PIDFile unit.RuntimeDirectory
+      (if unit ? NotifyAccess then unit.NotifyAccess else \"absent\")
+      (lib.boolToString (lib.hasInfix \" -d \" argv))
+      (lib.boolToString (lib.hasInfix (lib.escapeShellArgs [ \"--sdnotify=ignore\" \"--conmon-pidfile\" \"/run/p-s/conmon.pid\" ]) argv))
+      (lib.boolToString (lib.hasInfix \"--sdnotify=conmon\" argv))
+    ]"
+
 eval_is "only the namespace owner replaces a stale reboot remnant" "true:false" \
   "$PRISON let
       serviceModel = svc { };
