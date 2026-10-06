@@ -18,6 +18,7 @@ podman-backend.nix   intent -> podman, including container names
 module.nix           systemd units
 ruleset.nix          the nftables policy
 rootfs.nix           the toolless filesystem
+no-shell.nix         refuses a store view that contains a shell
 ```
 
 ## Shape
@@ -149,3 +150,11 @@ do not.
 A service's store view is exactly its closure, so it contains whatever the
 package references. A static binary needs a few paths, and anything that
 depends on systemd brings coreutils and a shell with it.
+
+No shell may be in that closure. `no-shell.nix` checks every service's closure
+and the store farm is built from its output, so a closure with bash,
+bash-interactive, another shell package, or any path that ships `bin/sh` (or
+another shell name in `bin/` or `sbin/`) fails the build and names what refers
+to it. There is no opt-out. The usual causes are a `writeShellScript` wrapper,
+a package whose `bin/` also holds helper scripts (`curl-config`, `zstdgrep`),
+and single-output libraries that propagate `-dev` outputs.

@@ -53,6 +53,7 @@ let
       configDir
       ;
     nixStoreLower = import ../nix-store-lower.nix;
+    noShell = import ./no-shell.nix;
     capsLib = import ./capabilities.nix { inherit lib; };
   };
 

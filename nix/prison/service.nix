@@ -3,6 +3,7 @@
   pkgs,
   lib,
   nixStoreLower,
+  noShell,
   mkRootfs,
   capsLib,
   configDir,
@@ -140,7 +141,12 @@ let
       rootsDrv = pkgs.runCommand "prison-${name}-roots" { } ''
         printf '%s\n' ${lib.escapeShellArgs roots} > $out
       '';
-      closure = pkgs.closureInfo { rootPaths = roots; };
+      # The checked closure is the only one the store farm is built from, so
+      # a service whose closure holds a shell has no store view to run in.
+      closure = noShell {
+        inherit pkgs name;
+        closure = pkgs.closureInfo { rootPaths = roots; };
+      };
       storeFarm = nixStoreLower {
         inherit pkgs closure;
         toplevel = rootsDrv;

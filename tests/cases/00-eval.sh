@@ -277,6 +277,42 @@ eval_fails "a prison may not join itself" "joins itself" \
       name = \"g\"; joins = \"g\"; services = [ (svc { }) ];
     }).name"
 
+echo "== build: a prison store view holds no shell =="
+
+# build_expr <expr> -- realise an expression against the flake
+build_expr() {
+  nix build "${NIX_FLAGS[@]}" --impure --no-link --print-out-paths --expr "$(nix_expr "$1")"
+}
+
+# The store farm is what the FUSE view serves, so that is what must refuse
+# to build -- not only a side check that a consumer could leave unbuilt.
+FARM='let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+          farm = args: (prison.mkPrisonService ({ name = "s"; } // args)).storeFarm; in'
+
+check "a service without a shell gets its store view" \
+  build_expr "$FARM farm { exec = [ \"\${pkgs.coreutils}/bin/sleep\" \"infinity\" ]; }"
+
+check "the namespace owner's store view holds no shell" \
+  build_expr "$FARM (prison.mkPrison { name = \"p\"; services = [
+      (prison.mkPrisonService { name = \"s\"; exec = [ \"\${pkgs.coreutils}/bin/true\" ]; }) ];
+    }).infraNet.storeFarm"
+
+check_err "a service that execs bash has no store view" "contains a shell" \
+  build_expr "$FARM farm { exec = [ \"\${pkgs.bashInteractive}/bin/bash\" ]; }"
+
+check_err "a writeShellScript wrapper names its referrer" "referenced by" \
+  build_expr "$FARM farm { exec = [ \"\${pkgs.writeShellScript \"wrapper\" \"exec true\"}\" ]; }"
+
+check_err "a shell reached only through packages is refused" "contains a shell" \
+  build_expr "$FARM farm { exec = [ \"\${pkgs.coreutils}/bin/true\" ]; packages = [ pkgs.busybox ]; }"
+
+# Named like nothing in particular, but it is a /bin/sh.
+check_err "a /bin/sh provider under an innocent name is refused" "provides bin/sh" \
+  build_expr "$FARM farm {
+      exec = [ \"\${pkgs.coreutils}/bin/true\" ];
+      packages = [ (pkgs.runCommand \"innocent\" { } \"mkdir -p \$out/bin; cp \${pkgs.dash}/bin/dash \$out/bin/sh\") ];
+    }"
+
 eval_is "internet mode blocks the synthetic host gateway unless targeted" "true" \
   'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
        rules = prison.ruleset {
