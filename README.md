@@ -1,63 +1,61 @@
 # NixOS-Container-Podman
 
-Primitives for running **NixOS systems, and NixOS-built containers, under
-rootless podman** — real systemd in a user namespace, described as an ordinary
-NixOS configuration. Everything is assembled from nix primitives: a closure, a
-symlink farm, a squashfs, a rootfs directory. **There is no OCI image anywhere**
-— nothing is pulled, nothing is layered, nothing is tagged.
+Nix functions for running NixOS systems and NixOS-built containers under
+rootless podman, with real systemd in a user namespace and the system described
+as an ordinary NixOS configuration. Every container is built from a closure, a
+symlink farm, a squashfs or a rootfs directory. There are no OCI images, so
+nothing is pulled, layered or tagged.
 
-Most of this repo is meant to be consumed by other nix projects: each primitive
-is a flake output you can take on its own, and `mkContainer` is the one that
-ties them together.
+Each part is a flake output that other nix projects can use on its own, and
+`mkContainer` combines them.
 
-- **Runs on NixOS, and on any other Linux distribution.** Elsewhere the
+- It runs on NixOS and on other Linux distributions. Elsewhere, the
   [portable tarball](#portable-tarball) carries its own store and needs no nix
   on the host.
-- **Shares the host's `/nix`** — store, database and daemon socket — so a
-  container builds through the host's nix-daemon and adds nothing to disk.
-- **Or serves a restricted store view** through `nix-store-shared-fuse`: a
-  symlink farm of whatever paths you choose, needing no daemon, so a
-  single-user nix install can share its store too.
-- **Podman command lines are generated from a nix model and validated at eval
-  time.** None are written by hand.
-- **`mkPrison` builds deny-by-default services**, and is backend agnostic.
+- A container can share the host's `/nix` (store, database and daemon socket),
+  so it builds through the host's nix-daemon and adds nothing to disk.
+- A container can instead get a restricted store view from
+  `nix-store-shared-fuse`. The view is a symlink farm of chosen paths and needs
+  no daemon, so a single-user nix install can share its store too.
+- Podman command lines are generated from a nix model and validated at eval
+  time.
+- `mkPrison` builds services that are denied everything they do not declare. It
+  does not depend on a particular container runtime.
 
-`nixct`, a develop container with per-project throwaway users and forwarded
-sockets, is one preset built on all of this — see [nixct.md](nixct.md).
+`nixct` is a develop container with per-project throwaway users and forwarded
+sockets, built on these parts. See [nixct.md](nixct.md).
 
 ## What this repo provides
 
-**1. `lib.mkContainer` — a NixOS system as a rootless podman container.**
-NixOS modules in, a rootfs plus a run script out (`up`, `enter`, `exec`,
-`boot`, `status`, `logs`, `down`, `purge`). Configured along
-[orthogonal axes](#configuration-axes). Nothing about it is dev-container
-specific.
+**1. `lib.mkContainer`, a NixOS system as a rootless podman container.** It
+takes NixOS modules and returns a rootfs and a run script with `up`, `enter`,
+`exec`, `boot`, `status`, `logs`, `down` and `purge`. It is configured through
+[independent settings](#configuration-axes) and has nothing specific to
+develop containers.
 
-**2. `lib.mkPrison` / `lib.mkPrisonService` — deny-by-default confinement.**
-Backend agnostic: says what a service may do, never how to run it. See
+**2. `lib.mkPrison` and `lib.mkPrisonService`, deny-by-default confinement.**
+They declare what a service may do and leave running it to a backend. See
 [`nix/prison/README.md`](nix/prison/README.md).
 
-**3. Layer derivations, separately consumable.** `systemLower`,
-`nixStoreLower`, `rootfsFolder` / `rootfsSquashfs`, and a
-[portable tarball](#portable-tarball) that runs on a host with no nix at all.
+**3. Layer derivations.** `systemLower`, `nixStoreLower`, `rootfsFolder`,
+`rootfsSquashfs`, and a [portable tarball](#portable-tarball) that runs on a
+host with no nix. Each can be used on its own.
 
-**4. `nix-store-shared-fuse` — a read-only FUSE for a host `/nix/store`.**
-Serves a symlink-farm view, so a container sees its own closure and nothing
-else. A standalone binary; the `hostNixStore` axis is the framework wiring it
-up.
+**4. `nix-store-shared-fuse`, a read-only FUSE filesystem for a host
+`/nix/store`.** It serves a symlink-farm view, so a container sees its own
+closure and nothing else. It is a standalone binary; the `hostNixStore` setting
+mounts it for a container.
 
-**5. `ssh-agent-filter` — a filtering proxy for the SSH agent protocol.**
-Forwards only the keys a policy names; adding, removing and locking are always
-refused. A standalone binary, not tied to containers.
+**5. `ssh-agent-filter`, a filtering proxy for the SSH agent protocol.** It
+forwards only the keys a policy names and always refuses adding, removing and
+locking keys. It is a standalone binary and does not need containers.
 
-**6. `nix/podman.nix` — the podman option model.** Typed nix in, argv out,
-validated at eval time. Needs only `lib`, so the portable tarball is generated
-from the same model as the NixOS target.
+**6. `nix/podman.nix`, the podman option model.** It turns typed nix values into
+an argv and validates them at eval time. It needs only `lib`, so the portable
+tarball and the NixOS target use the same model.
 
-Also included: `check-host-compat`, a standalone probe that tells you whether a
-host can run any of this (binaries, kernel features, fuse, rootless setup).
-
-And built on top: [`nixct`](nixct.md), the develop-container preset.
+`check-host-compat` is a standalone probe that reports whether a host has the
+binaries, kernel features, fuse and rootless setup this repo needs.
 
 ## Quick start
 
@@ -79,112 +77,110 @@ outputs = { nixpkgs, nixos-container-podman, ... }:
 ```
 
 `lib.x86_64-linux` exports `mkContainer`, `mkNixct` and the `overlay` helper.
-Example containers: `.#testcontainer` (persistent overlay), `.#testdaemon`
-(host nix-daemon), `.#testnvidia`, `.#nixct-nvidia`.
+The example containers are `.#testcontainer` (persistent overlay),
+`.#testdaemon` (host nix-daemon), `.#testnvidia` and `.#nixct-nvidia`.
 
 `mkNixct` adds `modules`, `runName`, `sessionTemplates`, `sessionShares` and
-`developArgs` — the extension points out-of-tree presets build on.
-`nixct-chrome` is one: a separate flake shipping Google Chrome with the Claude
-in Chrome extension preinstalled.
+`developArgs` for presets kept in other repositories. `nixct-chrome` is one such
+preset, a separate flake that ships Google Chrome with the Claude in Chrome
+extension installed.
 
 ## Subcommands
 
-Invoke as `nix run .#<container>.<subcommand> -- [args]` (or build the combined
-`run` package and call it as `<runName> <subcommand>`, `nix-dev-container`
-by default):
+Run `nix run .#<container>.<subcommand> -- [args]`, or build the combined `run`
+package and call `<runName> <subcommand>`. `runName` defaults to
+`nix-dev-container`.
 
-- `up [--gpu] [--opengl]` — start the persistent container (idempotent).
-  `--gpu` enables nvidia/CUDA passthrough, `--opengl` enables OpenGL/DRI
-  passthrough. Both must be set at `up` time; auto-up never enables either.
-- `down` / `stop` `[--force]` — stop and remove the container; state in
-  `$STATE_DIR` persists. Refuses while `develop` sessions are live — tearing
-  the container down kills them and (with ephemeral storage) takes their
-  session HOMEs with it — and names the projects involved. `--force` proceeds
-  anyway. Same for `purge` and `boot`.
-- `enter` / `shell` — open a login shell as `shellUser`; auto-runs `up` if needed.
-- `develop [hostpath]` — bind-mount `<hostpath>` into the running container and
-  `nix develop` there as a fresh per-session user. Defaults to the current
-  working directory. Re-running on the same path opens another shell in the
-  same session (see [sessions and shells](nixct.md#sessions-and-shells)).
-- `wayland-attach <hostpath>` — start (or reuse) a host-side `wprsc` viewer for
-  a `develop` session started with `--wprs`. Requires `wprsc` on the host's
-  `$PATH`.
-- `wayland-detach <hostpath>` — stop that viewer; the session's apps and
-  `wprsd` keep running untouched.
-- `exec -- CMD...` — run `CMD` inside the container as `shellUser`.
-- `boot` — ephemeral foreground systemd boot for debugging; wipes any existing
-  persistent container first.
-- `status` — show container state, store source, and disk usage.
-- `logs` — tail container logs.
-- `purge` — `down` plus wipe of `$STATE_DIR`.
-- `switch` / `upgrade` — activate this build's system inside the **running**
-  container, keeping it and its develop sessions up. Host-nix-daemon
-  containers only; see
+- `up [--gpu] [--opengl]` starts the persistent container and does nothing if
+  it already runs. `--gpu` passes nvidia/CUDA through and `--opengl` passes
+  OpenGL/DRI through. Both must be given to `up`; an automatic `up` enables
+  neither.
+- `down` / `stop` `[--force]` stops and removes the container and keeps
+  `$STATE_DIR`. While `develop` sessions are live it lists their projects and
+  refuses, because stopping the container kills them and, with ephemeral
+  storage, deletes their session HOMEs. `--force` stops it anyway. `purge` and
+  `boot` behave the same way.
+- `enter` / `shell` opens a login shell as `shellUser` and runs `up` first if
+  needed.
+- `develop [hostpath]` bind-mounts `<hostpath>` into the running container and
+  runs `nix develop` there as a new per-session user. It defaults to the
+  current directory. Running it again on the same path opens another shell in
+  the same session (see [sessions and shells](nixct.md#sessions-and-shells)).
+- `wayland-attach <hostpath>` starts a host-side `wprsc` viewer for a `develop`
+  session started with `--wprs`, or reuses a running one. It needs `wprsc` on
+  the host's `$PATH`.
+- `wayland-detach <hostpath>` stops that viewer. The session's apps and `wprsd`
+  keep running.
+- `exec -- CMD...` runs `CMD` in the container as `shellUser`.
+- `boot` boots systemd in the foreground in a throwaway container for
+  debugging. It removes any persistent container first.
+- `status` shows the container state, store source and disk usage.
+- `logs` follows the container log.
+- `purge` runs `down` and deletes `$STATE_DIR`.
+- `switch` / `upgrade` activates this build's system in the running container
+  and keeps it and its develop sessions up. It only works for host nix-daemon
+  containers; see
   [rebuilds upgrade in place](nixct.md#nixos-rebuild-switch-upgrades-the-container-in-place).
-- `check-host-compat` — probe the host for required binaries, kernel features,
-  fuse, and rootless setup. Touches no container.
+- `check-host-compat` checks the host for the binaries, kernel features, fuse
+  and rootless setup it needs. It does not touch any container.
 
 ## Configuration axes
 
-`mkContainer` is configured along **orthogonal axes** — each controls one
-independent concern. All are optional; the defaults reproduce the historical
-persistent-overlay behavior of the example containers.
+Each setting below controls one concern and can be combined freely with the
+others. All are optional, and the defaults give the persistent overlay the
+example containers use.
 
-### `storage` — writable strategy for the rootfs
+### `storage`, the writable layer
 
-How the writable layer over the immutable base is provided:
+- `lib.overlay { lower ? "squashfs"; }` (default) is an overlay with an on-disk
+  upper under `$STATE_DIR`, so changes made in the container survive restarts.
+- `"ephemeral"` is an overlay with a tmpfs upper under `$XDG_RUNTIME_DIR`. Its
+  state is lost when the container is removed.
+- `"directory"` is a writable rootfs directory with no overlay.
 
-- `lib.overlay { lower ? "squashfs"; }` **(default)** — overlay with a
-  persistent **on-disk** upper under `$STATE_DIR`; in-container changes survive
-  across runs.
-- `"ephemeral"` — overlay with a **tmpfs** upper under `$XDG_RUNTIME_DIR`; state
-  is lost when the container is removed.
-- `"directory"` — a materialized writable rootfs with **no overlay** at all.
+### `lower`, the read-only base
 
-### `lower` — packaging of the immutable base
+`"squashfs"` (default) or `"folder"`. squashfs is smaller but needs squashfuse
+on the host, and folder ships plain files. It only applies to the `ephemeral`
+and overlay storage settings, and it also picks the portable tarball format.
 
-`"squashfs"` (default) | `"folder"`. squashfs is the smallest but needs
-squashfuse on the host; folder ships plain files. Only meaningful for the
-`ephemeral` / overlay storage strategies, and it also selects the portable
-tarball format.
+### `hostNixStore` and `hostNixDaemon`, the source of `/nix/store`
 
-### `hostNixStore` / `hostNixDaemon` — where `/nix/store` comes from
+By default the container is self-contained and its closure is part of the
+read-only base. Two booleans change where `/nix/store` comes from:
 
-By default the container is **self-contained**: its closure is baked into the
-immutable lower. Two booleans change the source of `/nix/store`:
+- `hostNixStore = true` serves `/nix/store` from the host at runtime through
+  `nix-store-shared-fuse`, over a symlink farm of exactly the container's
+  closure. A writable overlay upper sits over it so builds in the container
+  still work; with `directory` storage the store is mounted read-only with no
+  overlay. A host GC root keeps the closure alive while the container exists
+  and is removed at teardown. The host's `/etc/fuse.conf` needs
+  `user_allow_other` because the FUSE mount uses `--allow-other`;
+  `check-host-compat` checks for it.
+- `hostNixDaemon = true` sends every build and query to the host nix-daemon.
+  The whole host `/nix` (store, `/nix/var` database and daemon socket) is
+  bind-mounted read-only, and the container has no nix-daemon and no nixbld
+  users. The closure is already in the host store because the container is
+  built there. This setting overrides `hostNixStore`, and `mkNixct` uses it.
 
-- `hostNixStore = true` — `/nix/store` is served from the **host** at runtime by
-  a host-side Rust FUSE (`nix-store-shared-fuse`) over a GC-pinned, exact-closure
-  symlink farm, instead of being baked into the lower. A writable overlay upper
-  is stacked over it so in-container builds still work (in `directory` storage
-  the FUSE store is mounted read-only — no overlays). A per-instance host GC root
-  pins the closure for the container's lifetime and is released at teardown.
-  **Requires `user_allow_other` in the host's `/etc/fuse.conf`** (the FUSE is
-  mounted `--allow-other`); `check-host-compat` probes this.
-- `hostNixDaemon = true` — delegate every build and query to the **host
-  nix-daemon**: the whole host `/nix` is rbind-mounted read-only (store +
-  `/nix/var` db + daemon socket), the container runs **no in-container daemon**
-  and has **no nixbld users**. The closure must already be realised in the host
-  store (it is, since the container is built against it). When this is on,
-  `hostNixStore` is ignored. This is what `mkNixct` uses.
+Each store source works with each storage setting. `status` reports the source
+as `self-contained`, `host-store` or `host-daemon`.
 
-The three store sources — self-contained (baked) / `hostNixStore` (FUSE) /
-`hostNixDaemon` (rbind) — compose with all three storage strategies. `status`
-reports the active source as `self-contained`, `host-store`, or `host-daemon`.
+`storage` (env `STORAGE`) and `hostNixStore` (env `HOST_NIX_STORE`) can change
+at runtime. `hostNixDaemon` (env `HOST_NIX_DAEMON`) is fixed at build time
+because the container's NixOS configuration depends on it.
 
-`storage` (the `STORAGE` env) and `hostNixStore` (the `HOST_NIX_STORE` env) can
-be switched at runtime; `hostNixDaemon` (`HOST_NIX_DAEMON`) is **fixed at build
-time**, since it is coupled to the in-container NixOS host-daemon profile.
+### Other settings
 
-### Other axes
-
-- `gpu.hostHasToolkit` — `up --gpu` uses the host nvidia-container-toolkit (CDI,
-  `--device nvidia.com/gpu=all`) instead of manual `/dev/nvidia*` binds.
-- `keepId.enable` / `keepId.uid` / `keepId.gid` — `--userns=keep-id` so
-  `shellUser` maps 1:1 to the invoking host user (uid/gid default `1000`/`100`).
-- `modules`, `shellUser`, `name`, `runName`, `idleTimeout` — as in the quick
-  start; `idleTimeout` (seconds, `0` disables) stops the container after no
-  active `develop` session.
+- `gpu.hostHasToolkit` makes `up --gpu` use the host's
+  nvidia-container-toolkit (CDI, `--device nvidia.com/gpu=all`) instead of
+  binding `/dev/nvidia*` by hand.
+- `keepId.enable`, `keepId.uid` and `keepId.gid` use `--userns=keep-id`, so
+  `shellUser` maps to the invoking host user. uid and gid default to `1000` and
+  `100`.
+- `modules`, `shellUser`, `name`, `runName` and `idleTimeout` are as in the
+  quick start. `idleTimeout` is in seconds and stops the container once no
+  `develop` session has been active for that long; `0` disables it.
 
 ### Example: host nix-daemon container
 
@@ -197,45 +193,38 @@ ct = nixos-container-podman.lib.x86_64-linux.mkContainer {
 };
 ```
 
-The `.#testdaemon` flake attribute is a ready-made example:
+`.#testdaemon` is a ready-made example:
 
 ```sh
 nix run .#testdaemon.enter
 nix run .#testdaemon.develop -- ./my-project
 ```
 
-
 ### GC roots in host-daemon develop sessions
 
 A `develop` session in a host-daemon container registers the store paths it
-uses as gc roots for its lifetime, so a host `nix-collect-garbage` cannot
-collect the shell out from under it. See
-[nixct.md](nixct.md#gc-roots-in-host-daemon-develop-sessions).
-### `isolateLan` (build-time) — no route to the local network
+uses as GC roots while it runs, so a host `nix-collect-garbage` cannot delete
+them. See [nixct.md](nixct.md#gc-roots-in-host-daemon-develop-sessions).
 
-A rootless container gets its network from **pasta**, which hands the
-namespace a *copy* of the host interface — same address, same on-link route.
-So by default a session can open a connection to anything the host can reach
-locally. With a forwarded ssh-agent that is a way out: the agent cannot be
-aimed at the host itself (loopback is not mapped), but it can be aimed at
-every other machine on the LAN that trusts those keys.
+### `isolateLan` (build time), no route to the local network
+
+pasta gives a rootless container a copy of the host interface, with the same
+address and on-link route. By default a session can therefore connect to
+anything the host reaches on the LAN. With a forwarded ssh-agent, that means a
+session can use the agent's keys against every LAN machine that trusts them.
+Loopback is not mapped, so the host itself is out of reach.
 
 ```nix
 mkNixct { isolateLan = true; }        # or programs.nixct.isolateLan = true;
 ```
 
-**The filter is not in the container.** A second, near-empty container — the
-gateway — owns the network namespace and runs nothing but `sleep`. The dev
-container joins that namespace with `--network=container:<name>-net`, so it
-has no namespace of its own to reconfigure, and the host loads the ruleset
-into the namespace with `nsenter` before anything joins it. Neither container
-polices itself.
+A separate gateway container owns the network namespace and only runs
+`sleep`. The host loads the nftables ruleset into that namespace with `nsenter`
+before the dev container joins it with `--network=container:<name>-net`.
 
-What makes it hold is the capability set, which is decided by the host and
-cannot be widened from inside: with `isolateLan` the dev container is started
-**without `CAP_NET_ADMIN`**. A process that unshares a fresh user namespace
-becomes root only over what *that* namespace owns, which is not this network
-namespace. Measured inside a running container:
+The dev container runs without `CAP_NET_ADMIN`, so it cannot change the
+ruleset. A process that creates a new user namespace inside it still has no
+`CAP_NET_ADMIN` over this network namespace. Inside a running container:
 
 ```
 CapEff = 00000000802425fb     → NET_ADMIN absent
@@ -243,12 +232,12 @@ CapEff = 00000000802425fb     → NET_ADMIN absent
 RTNETLINK answers: Operation not permitted
 ```
 
-The ruleset refuses RFC1918, CGNAT/tailnet (`100.64.0.0/10`), link-local and
-IPv6 ULA; loopback and the public internet stay reachable. `reject`, not
-`drop`, so a blocked connect fails at once instead of hanging until the TCP
-timeout. `isolateLan.allow` / `.allow6` punch holes; `.resolver` (default
-`169.254.1.1`, pasta's own DNS forwarder) is permitted ahead of the
-link-local refusal, since refusing it would take DNS down with the LAN:
+The ruleset rejects RFC1918, CGNAT and tailnet (`100.64.0.0/10`), link-local
+and IPv6 ULA destinations, and allows loopback and the public internet. It
+uses `reject` instead of `drop`, so a blocked connect fails at once instead of
+waiting for the TCP timeout. `isolateLan.allow` and `.allow6` add exceptions.
+`.resolver` (default `169.254.1.1`, pasta's DNS forwarder) is allowed before
+the link-local rule so DNS keeps working:
 
 ```
 LAN gateway 192.168.176.1:80   -> blocked
@@ -260,22 +249,21 @@ DNS                            -> OK
 
 ## Portable tarball
 
-`nix build .#<container>.portable` produces a **self-contained tarball** that
-runs on non-NixOS hosts with rootless podman + fuse-overlayfs (and squashfuse
-for the squashfs layout) — no Nix required on the host. The `lower` axis
-selects its layout (`"squashfs"`, default — needs squashfuse on the host — or
-`"folder"`, plain files). Run `check-host-compat` first to probe whether a
-target host meets the prerequisites before building or deploying the tarball.
+`nix build .#<container>.portable` builds a self-contained tarball for non-NixOS
+hosts with rootless podman and fuse-overlayfs, plus squashfuse for the squashfs
+layout. The host needs no nix. The `lower` setting picks the layout:
+`"squashfs"` (default) or `"folder"`. Run `check-host-compat` on the target
+host first.
 
-A portable tarball is **self-contained only**: `hostNixStore` and
-`hostNixDaemon` containers have no portable target (they rely on the host's
-`/nix`), so building `.portable` for one fails with a clear message.
+Only self-contained containers have a portable tarball. `hostNixStore` and
+`hostNixDaemon` containers need the host's `/nix`, so building `.portable` for
+them fails with an error.
 
-## `mkPrison` — deny-by-default services
+## `mkPrison`, deny-by-default services
 
-One container per service, sharing a single network namespace, with nothing
-allowed until it is named. Backend agnostic: the definition says what a service
-may do, never how to run it.
+Each service runs in its own container. The containers of a prison share one
+network namespace, and a service gets nothing it does not declare. The
+definition names what a service may do, not how to run it.
 
 ```nix
 let prison = nixos-container-podman.lib.x86_64-linux; in
@@ -295,7 +283,7 @@ prison.mkPrison {
 }
 ```
 
-Detail in [`nix/prison/README.md`](nix/prison/README.md).
+See [`nix/prison/README.md`](nix/prison/README.md) for details.
 
 ## Tests
 
@@ -304,12 +292,13 @@ $ tests/run.sh              # everything
 $ tests/run.sh --quick      # only what needs no container
 ```
 
-Real containers, with every path they could write to redirected into a
-gitignored `tests/scratch`; the last check proves the cleanup was total. See
-[`tests/README.md`](tests/README.md).
+The tests start real containers and redirect every path they write to into the
+gitignored `tests/scratch`. The last check verifies that teardown removed
+everything. See [`tests/README.md`](tests/README.md).
 
 ## `nixct`
 
-The develop-container preset built on these primitives — per-project throwaway
-users, forwarded sockets, shared or frozen host directories, and a NixOS module
-that keeps it running and upgrades it in place: [nixct.md](nixct.md).
+`nixct` is the develop container built on this repo. It has per-project
+throwaway users, forwarded sockets, shared or frozen host directories, and a
+NixOS module that keeps it running and upgrades it in place. See
+[nixct.md](nixct.md).

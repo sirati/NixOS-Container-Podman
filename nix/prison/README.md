@@ -1,17 +1,17 @@
 # prison
 
-Default-deny confinement for services: one container per service, all sharing a
-single network namespace, with nothing allowed until it is named.
+Default-deny confinement for services. Each service runs in its own container,
+all containers of a prison share one network namespace, and a service gets
+nothing it does not declare.
 
-`mkPrison` and `mkPrisonService` say what a service is and what it may do.
-They are backend agnostic — nothing in them names a container runtime, a flag
-or a command line; `podman-backend.nix` is what turns a prison into something
-that runs.
+`mkPrison` and `mkPrisonService` declare what a service is and what it may do.
+They name no container runtime, flag or command line. `podman-backend.nix`
+turns a prison into podman containers.
 
 ## Layers
 
 ```
-default.nix          what a prison and its services ARE
+default.nix          what a prison and its services are
 capabilities.nix     the 41 Linux capabilities as typed fields, all false
 podman.nix           the podman option model and the only code producing argv
 podman-backend.nix   intent -> podman, including container names
@@ -22,27 +22,27 @@ rootfs.nix           the toolless filesystem
 
 ## Shape
 
-A prison is a set of containers sharing one network namespace. `infra-net`
-owns it and every other service joins with `--network=container:<n>-infra-net`.
-It is an ordinary service whose exec happens to be a pause process, so it gets
-the same rootfs, store view and denials as everything else.
+`infra-net` owns the prison's network namespace, and every other service joins
+it with `--network=container:<n>-infra-net`. `infra-net` is an ordinary service
+that runs a pause process, so it gets the same rootfs, store view and denials as
+the others.
 
-Each service is its own container, so there is no supervisor: systemd on the
-host restarts a container, and the init inside only forwards signals and reaps.
-A service sees its own closure of `/nix/store` and nothing more — no shell, no
-coreutils, no package manager.
+There is no supervisor inside a prison. systemd on the host restarts a
+container, and the init inside only forwards signals and reaps children. A
+service sees its own closure of `/nix/store` and nothing else: no shell, no
+coreutils and no package manager.
 
 ## Denied by default
 
 | | |
 |---|---|
 | network | loopback and IPv6 link control, shared across the prison |
-| listen | every port declared per protocol, or it is not bound |
-| egress | `mode = "none"`; only loopback, replies, and IPv6 link control |
+| listen | only the ports declared per protocol are bound |
+| egress | `mode = "none"`: only loopback, replies and IPv6 link control |
 | capabilities | all dropped, `no-new-privileges` |
 | root filesystem | read-only |
-| writable paths | none unless declared; always `noexec,nosuid,nodev` |
-| binaries | the service's own closure, nothing else |
+| writable paths | none unless declared, always `noexec,nosuid,nodev` |
+| binaries | the service's own closure |
 
 ## Egress modes
 
@@ -50,17 +50,17 @@ coreutils, no package manager.
 egress.mode = "none";          # default
 egress.mode = "targets";       # only egress.targets = [ { address; port; protocol; } ]
 egress.mode = "internet";      # public addresses only; RFC1918/CGNAT/ULA/link-local dropped
-egress.mode = "internet";      # ...plus egress.lan = [ "192.168.176.0/24" ] to carve LAN back in
-egress.mode = "internet";      # ...narrowed to public ports: egress.ports = [ { port = 25; } { port = 443; protocol = "tcp"; } ]
-egress.mode = "unrestricted";  # escape hatch
+egress.mode = "internet";      # ...plus egress.lan = [ "192.168.176.0/24" ] to allow a LAN range
+egress.mode = "internet";      # ...limited to public ports: egress.ports = [ { port = 25; } { port = 443; protocol = "tcp"; } ]
+egress.mode = "unrestricted";  # no egress filter
 ```
 
-Explicit `targets` and `lan` are matched before the private-range drops, so a
-named private destination beats the blanket rule.
+Explicit `targets` and `lan` entries match before the private-range drops, so a
+named private destination is allowed.
 
-IPv6 Neighbor Discovery and router messages on the prison link are allowed
-with hop limit 255. They let the kernel maintain its next-hop route; they do
-not grant application traffic to any address or port.
+IPv6 Neighbor Discovery and router messages with hop limit 255 are allowed on
+the prison link so the kernel can keep its next-hop route. They allow no
+application traffic.
 
 ## Usage
 
@@ -86,25 +86,25 @@ in {
 }
 ```
 
-`exec[0]` must be an absolute store path: a prison has no `$PATH` and no shell
-to resolve a name against.
+`exec[0]` must be an absolute store path, because a prison has no `$PATH` and no
+shell to look a name up.
 
-The NixOS module exposes the generated files copied into service `/config`
-directories as `services.nixDevContainer.generatedConfigFiles`. The companion
-`generatedConfigFilesByService` groups those store-file paths by prison name
-and service name. Both outputs are read-only and are derived from the same
-config trees used by each service unit's start and reload commands. They do
-not include package closures or other store inputs.
+The NixOS module lists the generated files copied into service `/config`
+directories in `services.nixDevContainer.generatedConfigFiles`.
+`generatedConfigFilesByService` groups the same store paths by prison and
+service name. Both are read-only and come from the config trees each service
+unit's start and reload commands use. They do not include package closures or
+other store inputs.
 
-A capability is a named field, not a string, so an unknown one is an
-evaluation error rather than a flag that grants nothing.
+A capability is a named field, so a misspelled one fails evaluation instead of
+granting nothing.
 
 ## Sharing one netns between prisons
 
-Services in one prison share a loopback, and one prison runs as one host
-user. When the front door and its backends must run as *different* host
-users yet still talk over loopback, split them into two prisons and let
-one join the other's namespace:
+Services in one prison share a loopback, and one prison runs as one host user.
+When a front door and its backends must run as different host users but still
+talk over loopback, put them in two prisons and let one join the other's
+namespace:
 
 ```nix
 services.prisons.caddy = prison.mkPrison {
@@ -120,33 +120,32 @@ services.prisons."octoai-git" = prison.mkPrison {
 };
 ```
 
-Every `state` entry is a `noexec,nosuid,nodev` tmpfs. Its root defaults to the
-service's `uid` and `gid`, so a non-root daemon can create sockets, pid files
-and cache entries immediately. Podman derives that ownership from the service
-user via its `chown=true` tmpfs option. Arbitrary per-mount owners are rejected
+The joining prison keeps its own user, store views, state and units and shares
+only the network namespace, so `reverse_proxy 127.0.0.1:3000` works across the
+two users. The owner's ruleset is the only policy in that namespace, so a
+joining prison may not declare `listen` or `egress`; everything reachable there
+is declared on the owner, and a declaration on the joiner fails evaluation. A
+prison that joins another cannot itself be joined.
+
+Every `state` entry is a `noexec,nosuid,nodev` tmpfs. Its root is owned by the
+service's `uid` and `gid` by default, so a non-root daemon can create sockets,
+pid files and cache entries right away. Podman sets that owner from the service
+user through its `chown=true` tmpfs option. Other per-mount owners are rejected
 because Podman does not support them for tmpfs mounts.
 
-Each service's restricted `/nix/store` is owned by a separate FUSE daemon unit.
-Linux currently requires `CAP_SYS_ADMIN` to register passthrough backing files,
-so only that fixed daemon receives it; the prison setup unit, Podman and the
-service containers do not.
-
-The joiner keeps its own user, store views, state and units; only the
-netns is shared, so `reverse_proxy 127.0.0.1:3000` keeps working across
-the user boundary. The owner's ruleset is the only policy in that netns,
-so a joining prison must not declare `listen` or `egress` of its own --
-the union of everything reachable there is declared on the owner, and a
-misplaced declaration is an evaluation error. Joins are one hop only:
-a prison that itself joins cannot be joined.
+A separate FUSE daemon unit serves each service's restricted `/nix/store`.
+Linux requires `CAP_SYS_ADMIN` to register passthrough backing files, so only
+that daemon gets it. The prison setup unit, Podman and the service containers
+do not.
 
 ## Units
 
 ```
 <n>.service         oneshot + RemainAfterExit: the store views, the namespace
                     owner, and the nftables ruleset loaded into its netns
-<n>-<svc>.service   Type=exec, one per service, BindsTo <n>.service
+<n>-<svc>.service   one per service, BindsTo <n>.service
 ```
 
-A service's store view is exactly its closure, so it carries whatever the
-package references — a static binary needs a handful of paths, while anything
-pulling in systemd brings coreutils and a shell with it.
+A service's store view is exactly its closure, so it contains whatever the
+package references. A static binary needs a few paths, and anything that
+depends on systemd brings coreutils and a shell with it.
