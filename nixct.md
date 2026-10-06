@@ -40,8 +40,7 @@ nixct develop ~/project        # shell 1
 nixct develop -A ~/project     # shell 2, this one with agent forwarding
 ```
 
-Forwards belong to the session, not to the shell that asked for them. This
-works like logging into a machine twice with ssh, once with `-A`:
+Forwards belong to the session. This works like logging into a machine twice with ssh, once with `-A`:
 
 - Only the shell started with `-A` gets `$SSH_AUTH_SOCK` set. Other shells run
   as the same user and can use the socket by its path.
@@ -144,7 +143,7 @@ This serves the project to the session as a git remote instead of mounting it:
 nixct develop --git-serve 'main:main-*' ~/project
 ```
 
-`~/dev` is a clone, not the project directory. The session can only read
+`~/dev` is a clone of the project. The session can only read
 `BRANCH`, since every other ref is hidden, and can only push branches that match
 `PUSH-GLOB`. `PUSH-GLOB` defaults to `BRANCH`.
 
@@ -192,7 +191,7 @@ session. The flag can be repeated.
 nixct develop --host-port 8787 ~/project
 ```
 
-The bridge goes through a unix socket, not a network route, so the TCP
+The bridge goes through a unix socket, so the TCP
 connection the service sees comes from a host process running as you. Services
 that check the caller through `/proc/net/tcp` accept it.
 

@@ -3,8 +3,7 @@
 Nix functions for running NixOS systems and NixOS-built containers under
 rootless podman, with real systemd in a user namespace and the system described
 as an ordinary NixOS configuration. Every container is built from a closure, a
-symlink farm, a squashfs or a rootfs directory. There are no OCI images, so
-nothing is pulled, layered or tagged.
+symlink farm, a squashfs or a rootfs directory, without OCI images.
 
 Each part is a flake output that other nix projects can use on its own, and
 `mkContainer` combines them.
@@ -19,8 +18,8 @@ Each part is a flake output that other nix projects can use on its own, and
   no daemon, so a single-user nix install can share its store too.
 - Podman command lines are generated from a nix model and validated at eval
   time.
-- `mkPrison` builds services that are denied everything they do not declare. It
-  does not depend on a particular container runtime.
+- `mkPrison` builds services that get no network ports, egress, capabilities or
+  writable paths unless they declare them.
 
 `nixct` is a develop container with per-project throwaway users and forwarded
 sockets, built on these parts. See [nixct.md](nixct.md).
@@ -30,11 +29,11 @@ sockets, built on these parts. See [nixct.md](nixct.md).
 **1. `lib.mkContainer`, a NixOS system as a rootless podman container.** It
 takes NixOS modules and returns a rootfs and a run script with `up`, `enter`,
 `exec`, `boot`, `status`, `logs`, `down` and `purge`. It is configured through
-[independent settings](#configuration-axes) and has nothing specific to
-develop containers.
+[independent settings](#configuration-axes).
 
 **2. `lib.mkPrison` and `lib.mkPrisonService`, deny-by-default confinement.**
-They declare what a service may do and leave running it to a backend. See
+They declare a service's ports, egress, capabilities and writable paths, and
+`podman-backend.nix` runs it with podman. See
 [`nix/prison/README.md`](nix/prison/README.md).
 
 **3. Layer derivations.** `systemLower`, `nixStoreLower`, `rootfsFolder`,
@@ -42,8 +41,8 @@ They declare what a service may do and leave running it to a backend. See
 host with no nix. Each can be used on its own.
 
 **4. `nix-store-shared-fuse`, a read-only FUSE filesystem for a host
-`/nix/store`.** It serves a symlink-farm view, so a container sees its own
-closure and nothing else. It is a standalone binary; the `hostNixStore` setting
+`/nix/store`.** It serves a symlink-farm view, so a container sees only its
+own closure. It is a standalone binary; the `hostNixStore` setting
 mounts it for a container.
 
 **5. `ssh-agent-filter`, a filtering proxy for the SSH agent protocol.** It
@@ -262,8 +261,8 @@ them fails with an error.
 ## `mkPrison`, deny-by-default services
 
 Each service runs in its own container. The containers of a prison share one
-network namespace, and a service gets nothing it does not declare. The
-definition names what a service may do, not how to run it.
+network namespace. Ports, egress, capabilities and writable paths are denied
+unless the service declares them.
 
 ```nix
 let prison = nixos-container-podman.lib.x86_64-linux; in

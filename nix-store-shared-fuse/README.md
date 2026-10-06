@@ -22,8 +22,8 @@ listings. Regular-file reads, mmap and splice use the kernel's FUSE passthrough
 API, so file contents never pass through the daemon. The backing store can be
 relocated, for example a `nix-portable` store.
 
-A process namespaced onto the mount sees a `/nix/store` that contains exactly
-the farm's closure and nothing else from the host store.
+A process namespaced onto the mount sees a `/nix/store` that contains only the
+farm's closure.
 
 ## The three roots
 
@@ -61,8 +61,8 @@ Any other symlink is shown as a normal symlink with its original target.
 Everything under a realized node is served from `redirect_root` unchanged.
 Symlinks inside a realized store path stay ordinary symlinks; the kernel
 resolves their absolute `/nix/store/…` targets against the mount root, which
-works for a complete closure. Only symlinks in the `bind_target` tree are
-realized, never symlinks inside `redirect_root` content.
+works for a complete closure. Symlinks inside
+`redirect_root` content are never realized.
 
 ## Safety model
 

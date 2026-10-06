@@ -1,12 +1,12 @@
 # prison
 
 Default-deny confinement for services. Each service runs in its own container,
-all containers of a prison share one network namespace, and a service gets
-nothing it does not declare.
+and all containers of a prison share one network namespace. Ports, egress,
+capabilities and writable paths are denied unless declared.
 
-`mkPrison` and `mkPrisonService` declare what a service is and what it may do.
-They name no container runtime, flag or command line. `podman-backend.nix`
-turns a prison into podman containers.
+`mkPrison` and `mkPrisonService` declare a service's command, user, ports,
+egress, capabilities and writable paths. `podman-backend.nix` turns them into
+podman command lines.
 
 ## Layers
 
@@ -29,8 +29,8 @@ the others.
 
 There is no supervisor inside a prison. systemd on the host restarts a
 container, and the init inside only forwards signals and reaps children. A
-service sees its own closure of `/nix/store` and nothing else: no shell, no
-coreutils and no package manager.
+service's `/nix/store` holds only its own closure, so it has no shell, coreutils
+or package manager unless the service depends on them.
 
 ## Denied by default
 

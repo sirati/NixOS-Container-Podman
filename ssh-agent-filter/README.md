@@ -13,5 +13,5 @@ forwards requests to an upstream agent and applies a policy in between.
 - **Extensions.** They are refused by default because the filter cannot know
   what they do. `--allow-extensions` allows them.
 
-The proxy runs outside what it protects the agent from. For nix-dev-container
-it runs on the host, and a container only gets the filtered socket.
+nix-dev-container runs the proxy on the host and gives a container only the
+filtered socket.
