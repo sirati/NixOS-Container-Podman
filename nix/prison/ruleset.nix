@@ -85,12 +85,36 @@ let
   mode = egress.mode or "none";
   targets = egress.targets or [ ];
   lanAllow = egress.lan or [ ];
+  # Internet mode may be narrowed to the public ports a service needs; an
+  # empty list keeps every port.
+  publicPorts = map (
+    p:
+    let
+      proto = p.protocol or "tcp";
+    in
+    if !(builtins.isInt (p.port or null)) || p.port < 1 || p.port > 65535 then
+      throw "prison: egress.ports entries need a port between 1 and 65535"
+    else if proto != "tcp" && proto != "udp" then
+      throw "prison: egress.ports protocol must be tcp or udp, not ${proto}"
+    else
+      { port = p.port; protocol = proto; }
+  ) (egress.ports or [ ]);
+  publicAccept =
+    fam: any:
+    if publicPorts == [ ] then
+      "${fam} daddr ${any} accept"
+    else
+      concatMapStringsSep "\n        " (
+        p: "${fam} daddr ${any} ${p.protocol} dport ${toString p.port} accept"
+      ) publicPorts;
 
   lanV4 = lib.filter (a: !(isV6 a)) lanAllow;
   lanV6 = lib.filter isV6 lanAllow;
 
   egressBody =
-    if mode == "none" then
+    if publicPorts != [ ] && mode != "internet" then
+      throw "prison: egress.ports only narrows egress.mode = \"internet\""
+    else if mode == "none" then
       "    # egress.mode = \"none\": only loopback, replies, and IPv6 link control."
     else if mode == "targets" then
       concatMapStringsSep "\n" targetRule targets
@@ -104,8 +128,8 @@ let
         # `accept` below cannot be reached by a private destination.
         ip daddr ${set privateV4} drop
         ip6 daddr ${set privateV6} drop
-        ip daddr 0.0.0.0/0 accept
-        ip6 daddr ::/0 accept''
+        ${publicAccept "ip" "0.0.0.0/0"}
+        ${publicAccept "ip6" "::/0"}''
     else if mode == "unrestricted" then
       ''
         # egress.mode = "unrestricted": the escape hatch. Everything the

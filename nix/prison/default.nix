@@ -120,7 +120,7 @@ let
                         (
                           joining
                           && (
-                            (egress.mode or "none") != "none" || (egress.targets or [ ]) != [ ] || (egress.lan or [ ]) != [ ]
+                            (egress.mode or "none") != "none" || (egress.targets or [ ]) != [ ] || (egress.lan or [ ]) != [ ] || (egress.ports or [ ]) != [ ]
                           )
                         )
                         ''

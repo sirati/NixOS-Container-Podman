@@ -51,6 +51,7 @@ egress.mode = "none";          # default
 egress.mode = "targets";       # only egress.targets = [ { address; port; protocol; } ]
 egress.mode = "internet";      # public addresses only; RFC1918/CGNAT/ULA/link-local dropped
 egress.mode = "internet";      # ...plus egress.lan = [ "192.168.176.0/24" ] to carve LAN back in
+egress.mode = "internet";      # ...narrowed to public ports: egress.ports = [ { port = 25; } { port = 443; protocol = "tcp"; } ]
 egress.mode = "unrestricted";  # escape hatch
 ```
 

@@ -271,6 +271,48 @@ eval_is "internet mode blocks the synthetic host gateway unless targeted" "true"
      (lib.hasInfix "ip daddr 192.0.2.1 tcp dport 53 accept" (builtins.readFile rules)
       && lib.hasInfix "192.0.2.0/24" (builtins.readFile rules))'
 
+eval_is "internet ports narrow public egress and keep private drops first" "true" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+       text = builtins.readFile (prison.ruleset {
+         inherit pkgs;
+         egress.mode = "internet";
+         egress.lan = [ "192.0.2.1/32" ];
+         egress.ports = [ { port = 25; } { port = 443; } ];
+       });
+       before = a: b: builtins.stringLength (builtins.head (lib.splitString a text))
+                      < builtins.stringLength (builtins.head (lib.splitString b text));
+   in lib.boolToString
+     (lib.hasInfix "ip daddr 0.0.0.0/0 tcp dport 25 accept" text
+      && lib.hasInfix "ip6 daddr ::/0 tcp dport 443 accept" text
+      && !(lib.hasInfix "ip daddr 0.0.0.0/0 accept" text)
+      && !(lib.hasInfix "ip6 daddr ::/0 accept" text)
+      && !(lib.hasInfix "tcp dport 80 accept" text)
+      && lib.hasInfix "ip daddr { 192.0.2.1/32 } accept" text
+      && before "ip daddr { 0.0.0.0/8" "tcp dport 25 accept")'
+
+eval_is "internet mode without ports still reaches every public port" "true" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+       text = builtins.readFile (prison.ruleset { inherit pkgs; egress.mode = "internet"; });
+   in lib.boolToString (lib.hasInfix "ip daddr 0.0.0.0/0 accept" text)'
+
+eval_fails "egress ports only narrow internet mode" "only narrows" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+   in builtins.readFile (prison.ruleset { inherit pkgs; egress.mode = "targets"; egress.ports = [ { port = 25; } ]; })'
+
+eval_fails "egress ports reject an invalid port" "between 1 and 65535" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+   in builtins.readFile (prison.ruleset { inherit pkgs; egress.mode = "internet"; egress.ports = [ { port = 0; } ]; })'
+
+eval_fails "egress ports reject an unknown protocol" "tcp or udp" \
+  'let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+   in builtins.readFile (prison.ruleset { inherit pkgs; egress.mode = "internet"; egress.ports = [ { port = 25; protocol = "sctp"; } ]; })'
+
+eval_fails "a joining prison may not declare egress ports" "joins" \
+  "$PRISON (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+      egress.ports = [ { port = 25; } ];
+    }).name"
+
 echo "== eval: unsupported values fail loud =="
 
 # Every one of these must say "not implemented" -- the point is that an
