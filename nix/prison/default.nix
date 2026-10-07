@@ -91,6 +91,14 @@ let
       # the owner. The module rejects a join target that does not exist or
       # that itself joins another prison (one hop only, no chains).
       joins ? null,
+      # Who may open which loopback port, by service name. null leaves the
+      # shared loopback open to every service in the netns. Otherwise:
+      #   loopback.ports   = [ { port = 8443; clients = [ "caddy" ]; } ];
+      #   loopback.sources = [ { address = "127.0.0.2"; clients = [ "caddy" ]; } ];
+      # Ports this prison listens on are open to all, as they are published.
+      # A source entry reserves a loopback address to its clients, so an
+      # upstream can trust that address as their identity.
+      loopback ? null,
     }:
     let
       svcList =
@@ -133,13 +141,39 @@ let
                         (
                           lib.throwIf (
                             joining && pastaOptions != [ ]
-                          ) "prison: ${name} joins ${joins} and also declares pastaOptions." null
+                          ) "prison: ${name} joins ${joins} and also declares pastaOptions." (
+                            lib.throwIf (joining && loopback != null) ''
+                              prison: ${name} joins ${joins} and also declares loopback.
+
+                              The namespace owner's ruleset is the only policy in that
+                              netns, and a joining prison's uids are not mapped there.
+                            '' null
+                          )
                         )
                     )
                 )
               )
           )
       );
+
+      uidOf =
+        client:
+        let
+          found = lib.filter (s: s.name == client) svcList;
+        in
+        if found == [ ] then
+          throw "prison: ${name} loopback names ${client}, which is not one of its services."
+        else
+          (builtins.head found).uid;
+      resolveClients = entry: entry // { clients = map uidOf (entry.clients or [ ]); };
+      loopbackUids =
+        if loopback == null then
+          null
+        else
+          {
+            ports = map resolveClients (loopback.ports or [ ]);
+            sources = map resolveClients (loopback.sources or [ ]);
+          };
 
       ruleset =
         if joining then
@@ -153,6 +187,7 @@ let
               egress
               resolvers
               ;
+            loopback = loopbackUids;
           };
 
       # The namespace owner, built exactly like any other service. catatonit

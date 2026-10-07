@@ -366,6 +366,53 @@ eval_fails "a joining prison may not declare egress ports" "joins" \
       egress.ports = [ { port = 25; } ];
     }).name"
 
+LOOPBACK='let prison = import (flake.outPath + "/nix/prison") { inherit pkgs; };
+       svc = name: uid: prison.mkPrisonService { inherit name uid; exec = [ "/bin/true" ]; };
+       mk = loopback: builtins.readFile (prison.mkPrison {
+         name = "p"; services = [ (svc "front" 2000) (svc "back" 2001) (svc "other" 2002) ];
+         listen.tcp = [ 443 ]; inherit loopback;
+       }).ruleset;
+       before = text: a: b: builtins.stringLength (builtins.head (lib.splitString a text))
+                      < builtins.stringLength (builtins.head (lib.splitString b text)); in'
+
+eval_is "a prison without a loopback policy leaves loopback open" "true" \
+  "$LOOPBACK lib.boolToString (!(lib.hasInfix \"jump loopback\" (mk null)))"
+
+eval_is "a declared loopback port admits only its clients, by uid" "true" \
+  "$LOOPBACK let text = mk { ports = [ { port = 8443; clients = [ \"front\" \"back\" ]; } ]; }; in
+   lib.boolToString (
+     lib.hasInfix \"oif \\\"lo\\\" ct state new jump loopback\" text
+     && before text \"jump loopback\" \"oif \\\"lo\\\" accept\"
+     && lib.hasInfix \"tcp dport 8443 meta skuid { 2000, 2001 } accept\" text
+     && lib.hasInfix \"tcp dport 8443 reject with tcp reset\" text
+     && before text \"tcp dport 8443 reject\" \"    tcp dport 443 accept\n    meta l4proto\"
+     && lib.hasInfix \"meta l4proto tcp reject with tcp reset\n    reject\" text)"
+
+eval_is "a reserved loopback source rejects every other uid" "true" \
+  "$LOOPBACK lib.boolToString (lib.hasInfix \"ip saddr 127.0.0.2 meta skuid != { 2000 } reject\"
+     (mk { sources = [ { address = \"127.0.0.2\"; clients = [ \"front\" ]; } ]; }))"
+
+eval_fails "a loopback client must be one of the prison's services" "not one of its services" \
+  "$LOOPBACK mk { ports = [ { port = 1; clients = [ \"stranger\" ]; } ]; }"
+
+eval_fails "a loopback port needs clients" "non-empty list" \
+  "$LOOPBACK mk { ports = [ { port = 1; clients = [ ]; } ]; }"
+
+eval_fails "a loopback port is declared once" "declared twice" \
+  "$LOOPBACK mk { ports = [ { port = 1; clients = [ \"front\" ]; } { port = 1; clients = [ \"back\" ]; } ]; }"
+
+eval_fails "127.0.0.1 cannot be reserved" "cannot be reserved" \
+  "$LOOPBACK mk { sources = [ { address = \"127.0.0.1\"; clients = [ \"front\" ]; } ]; }"
+
+eval_fails "a reserved source is a loopback address" "127.0.0.0/8" \
+  "$LOOPBACK mk { sources = [ { address = \"10.0.0.2\"; clients = [ \"front\" ]; } ]; }"
+
+eval_fails "a joining prison may not declare loopback" "joins" \
+  "$PRISON (prison.mkPrison {
+      name = \"g\"; joins = \"caddy\"; services = [ (svc { }) ];
+      loopback.ports = [ ];
+    }).name"
+
 echo "== eval: unsupported values fail loud =="
 
 # Every one of these must say "not implemented" -- the point is that an

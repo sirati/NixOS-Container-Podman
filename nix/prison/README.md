@@ -100,6 +100,42 @@ other store inputs.
 A capability is a named field, so a misspelled one fails evaluation instead of
 granting nothing.
 
+## Loopback policy
+
+Services in one prison share a loopback, so by default any of them can open
+any loopback port. `loopback` makes every new loopback connection a
+declaration, judged by the uid of the socket that opens it:
+
+```nix
+services.prisons.edge = prison.mkPrison {
+  name = "edge";
+  services = { inherit caddy kanidm stalwart; };
+  listen.tcp = [ 80 443 ];
+  loopback = {
+    ports = [
+      { port = 8443; clients = [ "caddy" "kanidm" ]; }
+      { port = 18081; clients = [ "stalwart" ]; }
+    ];
+    # Only caddy may send from 127.0.0.2, so kanidm can trust that address
+    # as caddy for X-Forwarded-For.
+    sources = [ { address = "127.0.0.2"; clients = [ "caddy" ]; } ];
+  };
+};
+```
+
+Clients are service names, resolved to their uids. A declared port rejects
+everyone else. The prison's own `listen` ports stay open to every service,
+because they are published anyway. Undeclared ports are rejected. uid 0 in the
+namespace is the prison's host user, the one pasta uses to splice host-loopback
+clients into published ports, so it is always allowed. A service can never run
+as uid 0.
+
+Uids are only distinct inside one user namespace, so a prison that `joins`
+another may not declare `loopback`.
+
+The policy covers TCP and UDP. Abstract unix sockets also belong to the netns,
+and nftables does not see them.
+
 ## Sharing one netns between prisons
 
 Services in one prison share a loopback, and one prison runs as one host user.
