@@ -65,6 +65,10 @@ let
         User = p.user;
         Restart = "on-failure";
         RestartSec = 2;
+        # A stop is not a failure. catatonit reports a service that died of
+        # the stop's SIGTERM as 143, and conmon passes that on; a stop that
+        # lands during ExecStartPre kills the sync with SIGTERM itself.
+        SuccessExitStatus = "143 SIGTERM";
         ExecStartPre = lib.optional s.hasConfig (syncCmd p s);
         ExecStart = escapeShellArgs (backend.runService p s);
         ExecStop = escapeShellArgs (backend.stopArgs p s);

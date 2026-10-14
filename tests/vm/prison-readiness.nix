@@ -7,6 +7,9 @@
 # the reliable way to make PID 1 that late. This drives the module's own
 # generated units through start/stop under that load and counts failures.
 #
+# A stop, whether it finds the service running or still in ExecStartPre,
+# must leave the unit inactive and not failed.
+#
 # Driven by tests/cases/50-prison-readiness.sh. `src` is the tree whose
 # nix/prison is tested, so the same script can be pointed at an older
 # checkout to show the race there.
@@ -38,6 +41,18 @@ pkgs.testers.runNixOSTest {
               "${pkgs.coreutils}/bin/sleep"
               "infinity"
             ];
+          })
+          # Its ExecStartPre copies a config tree, long enough for a stop to
+          # land in it.
+          (prison.mkPrisonService {
+            name = "c";
+            exec = [
+              "${pkgs.coreutils}/bin/sleep"
+              "infinity"
+            ];
+            config = pkgs.lib.genAttrs (map (i: "f${toString i}") (pkgs.lib.range 1 100)) (
+              n: pkgs.writeText n n
+            );
           })
         ];
       };
@@ -100,5 +115,28 @@ pkgs.testers.runNixOSTest {
         machine.succeed("su -s /bin/sh r -c 'XDG_RUNTIME_DIR=/run/user/$(id -u r) podman kill r-s'")
         machine.wait_until_succeeds(f"[ $(systemctl show -p NRestarts --value {U}) -gt {before} ]", timeout=60)
         machine.wait_for_unit(U, timeout=60)
+
+    # sleep has no SIGTERM handler: catatonit reports its death as 143.
+    with subtest("a stop of a running service is not a failure"):
+        machine.succeed(f"systemctl stop {U}")
+        state = (show("ActiveState"), show("Result"))
+        assert state == ("inactive", "success"), state
+
+    with subtest("a stop during ExecStartPre is not a failure"):
+        C = "r-c.service"
+        machine.wait_for_unit(C, timeout=120)
+        for _ in range(20):
+            machine.succeed(f"systemctl stop {C}; systemctl reset-failed {C}")
+            machine.succeed(
+                f"systemctl start --no-block {C}; "
+                f"while [ $(systemctl show -p SubState --value {C}) = dead ]; do :; done; "
+                f"systemctl stop {C}"
+            )
+            if "code=killed" in show("ExecStartPre", C):
+                break
+        else:
+            raise AssertionError("no stop landed during ExecStartPre")
+        state = (show("ActiveState", C), show("Result", C))
+        assert state == ("inactive", "success"), state
   '';
 }
