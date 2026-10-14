@@ -10,6 +10,8 @@
 # A stop, whether it finds the service running or still in ExecStartPre,
 # must leave the unit inactive and not failed. So must a stop that
 # interrupts the owner's setup, and it must leave no namespace owner behind.
+# A stop while `podman run` starts a service is a clean stop and leaves no
+# container, and a power cut does not keep any service from starting again.
 #
 # Driven by tests/cases/50-prison-readiness.sh. `src` is the tree whose
 # nix/prison is tested, so the same script can be pointed at an older
@@ -178,5 +180,38 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_fails("pgrep -u n 'pasta|conmon'", timeout=30)
         machine.succeed(f"systemctl start {P}")
         machine.wait_for_unit("n-s.service", timeout=120)
+
+    # Stopped once the container exists but before `podman run` returns,
+    # podman exits 1 and can leave the container behind under its name.
+    with subtest("a stop during podman run is a clean stop and leaves no container"):
+        exists = "su -s /bin/sh r -c 'XDG_RUNTIME_DIR=/run/user/$(id -u r) podman container exists r-s'"
+        machine.succeed(f"systemctl start {U}")
+        interrupted = 0
+        for i in range(20):
+            machine.succeed(f"systemctl stop {U}; systemctl reset-failed {U}")
+            machine.succeed(
+                f"systemctl start --no-block {U}; "
+                f"timeout 60 sh -c \"until {exists}; do :; done\"; "
+                f"systemctl stop {U}"
+            )
+            started = show("ExecStart")
+            if "status=0" not in started:
+                interrupted += 1
+            state = (show("ActiveState"), show("Result"))
+            assert state == ("inactive", "success"), (i, state, started)
+            machine.fail(exists)
+            machine.succeed(f"systemctl start {U}")
+        assert interrupted >= 5, f"only {interrupted} stops landed in podman run"
+
+    # A power cut runs no ExecStopPost: every service container is still
+    # there under its name at the next boot, and the first start must take
+    # the name back rather than fail and wait for a restart.
+    with subtest("every prison service starts again after a power cut"):
+        machine.crash()
+        machine.start()
+        for unit in [U, "r-c.service", "n-s.service"]:
+            machine.wait_for_unit(unit, timeout=300)
+            # The first start succeeds: no failure, no restart.
+            assert show("NRestarts", unit) == "0", (unit, show("NRestarts", unit))
   '';
 }

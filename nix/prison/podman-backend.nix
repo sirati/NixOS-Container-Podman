@@ -145,6 +145,9 @@ let
     baseSpec p s
     // {
       remove = true;
+      # A start that a stop or a crash interrupted can leave the container
+      # behind under its stable name; the next start takes the name back.
+      replace = true;
       # A detached `podman run` exits only once the container's process has
       # started, so its exit is the readiness signal for the forking unit.
       # conmon stays behind, and its pidfile names the process systemd then
@@ -200,6 +203,7 @@ let
     podmanBin
     "rm"
     "-f"
+    "--ignore"
     (containerName p s)
   ];
 in

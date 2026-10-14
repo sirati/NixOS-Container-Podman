@@ -181,7 +181,7 @@ eval_is "a service unit is ready when the detached run returns and then follows 
       (lib.boolToString (lib.hasInfix \"--sdnotify=conmon\" argv))
     ]"
 
-eval_is "only the namespace owner replaces a stale reboot remnant" "true:false" \
+eval_is "the namespace owner and every service replace a stale reboot remnant" "true:true" \
   "$PRISON let
       serviceModel = svc { };
       p = prison.mkPrison { name = \"p\"; services = [ serviceModel ]; };

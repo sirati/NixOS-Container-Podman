@@ -6,6 +6,8 @@
 }:
 
 let
+  prisonStart = import ../prison-start.nix { inherit pkgs; };
+
   inherit (lib) nameValuePair escapeShellArgs;
 
   # Copy a config tree into the directory bind-mounted into the container.
@@ -70,8 +72,14 @@ let
         # lands during ExecStartPre kills the sync with SIGTERM itself.
         SuccessExitStatus = "143 SIGTERM";
         ExecStartPre = lib.optional s.hasConfig (syncCmd p s);
-        ExecStart = escapeShellArgs (backend.runService p s);
+        # prison-start tells a start this unit's stop interrupted from a
+        # start that failed; podman exits 1 for both.
+        ExecStart = escapeShellArgs ([ "${prisonStart}/bin/prison-start" ] ++ backend.runService p s);
         ExecStop = escapeShellArgs (backend.stopArgs p s);
+        # Runs after every stop, including one that interrupted the start or
+        # a start that failed, which skip ExecStop and can leave the
+        # container behind.
+        ExecStopPost = escapeShellArgs (backend.rmArgs p s);
         # Reload re-syncs the configuration and tells the service, without
         # touching the container: the mount is a directory the host rewrites
         # in place, so the new content is already visible inside.
