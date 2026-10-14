@@ -8,7 +8,8 @@
 # generated units through start/stop under that load and counts failures.
 #
 # A stop, whether it finds the service running or still in ExecStartPre,
-# must leave the unit inactive and not failed.
+# must leave the unit inactive and not failed. So must a stop that
+# interrupts the owner's setup, and it must leave no namespace owner behind.
 #
 # Driven by tests/cases/50-prison-readiness.sh. `src` is the tree whose
 # nix/prison is tested, so the same script can be pointed at an older
@@ -53,6 +54,22 @@ pkgs.testers.runNixOSTest {
             config = pkgs.lib.genAttrs (map (i: "f${toString i}") (pkgs.lib.range 1 100)) (
               n: pkgs.writeText n n
             );
+          })
+        ];
+      };
+
+      # Published ports give the owner a network namespace and a ruleset to
+      # load after it starts: a window in which to interrupt its setup.
+      services.prisons.n = prison.mkPrison {
+        name = "n";
+        listen.tcp = [ 8080 ];
+        services = [
+          (prison.mkPrisonService {
+            name = "s";
+            exec = [
+              "${pkgs.coreutils}/bin/sleep"
+              "infinity"
+            ];
           })
         ];
       };
@@ -138,5 +155,28 @@ pkgs.testers.runNixOSTest {
             raise AssertionError("no stop landed during ExecStartPre")
         state = (show("ActiveState", C), show("Result", C))
         assert state == ("inactive", "success"), state
+
+    with subtest("a stop during the owner's setup leaves nothing behind"):
+        P = "n.service"
+        as_n = "su -s /bin/sh n -c 'XDG_RUNTIME_DIR=/run/user/$(id -u n) podman container exists n-infra-net'"
+        machine.wait_for_unit("n-s.service", timeout=120)
+        for _ in range(30):
+            machine.succeed(f"systemctl stop {P}; systemctl reset-failed {P} n-s.service")
+            # Stop once the owner exists, while the ruleset is still loading.
+            machine.succeed(
+                f"systemctl start --no-block {P}; "
+                f"timeout 60 sh -c \"until {as_n}; do :; done\"; "
+                f"systemctl stop {P}"
+            )
+            if "code=killed" in show("ExecStart", P):
+                break
+        else:
+            raise AssertionError("no stop landed in the owner's setup")
+        state = (show("ActiveState", P), show("Result", P))
+        assert state == ("inactive", "success"), state
+        machine.fail(as_n)
+        machine.wait_until_fails("pgrep -u n 'pasta|conmon'", timeout=30)
+        machine.succeed(f"systemctl start {P}")
+        machine.wait_for_unit("n-s.service", timeout=120)
   '';
 }

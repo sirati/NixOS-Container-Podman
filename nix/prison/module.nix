@@ -10,7 +10,8 @@
 #   <n>.service         oneshot + RemainAfterExit. Mounts every service's
 #                       store view, starts the namespace owner, and loads the
 #                       ruleset into its network namespace from the host.
-#                       Torn down in reverse on stop.
+#                       Torn down in reverse on stop, and after a setup
+#                       that failed or that a stop interrupted.
 #
 #   <n>-<svc>.service   Type=forking, one per service, BindsTo <n>.service.
 #                       Ready once the detached `podman run` has started the
@@ -190,7 +191,11 @@ let
         RemainAfterExit = true;
         User = p.user;
         ExecStart = "${setup}/bin/${p.name}-up";
-        ExecStop = "${teardown}/bin/${p.name}-down";
+        # ExecStopPost and not ExecStop: systemd skips ExecStop when a stop
+        # interrupts setup or setup fails, which would leave the namespace
+        # owner running. A stop's SIGTERM ending setup is not a failure.
+        ExecStopPost = "${teardown}/bin/${p.name}-down";
+        SuccessExitStatus = "SIGTERM";
       };
     };
 in
