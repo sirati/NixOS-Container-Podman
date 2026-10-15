@@ -17,7 +17,8 @@
 #                       Ready once the detached `podman run` has started the
 #                       container; systemd then supervises and restarts it
 #                       through conmon's pidfile -- there is nothing inside
-#                       the prison that could.
+#                       the prison that could. Each start first checks that
+#                       the running store views serve this unit's closure.
 #
 # The ruleset is loaded into a namespace the prison owns but cannot reach:
 # `podman unshare` enters the rootless user namespace that owns the netns,
@@ -25,7 +26,8 @@
 # prison is on that side of the boundary.
 #
 # No command line is written here either. This file asks the backend for argv
-# and puts it in a unit.
+# and puts it in a unit: store-unit.nix, owner-unit.nix and service-unit.nix
+# build the three kinds.
 
 { prison }:
 
@@ -44,29 +46,20 @@ let
     mkIf
     mapAttrs'
     nameValuePair
-    concatMapStringsSep
-    escapeShellArg
-    escapeShellArgs
     ;
 
   backend = import ./podman-backend.nix { inherit pkgs lib; };
   fuse = import ../fuse.nix { inherit pkgs; };
-  fuseBin = "${fuse}/bin/nix-store-shared-fuse";
 
-  nftBin = "${pkgs.nftables}/bin/nft";
-  nsenterBin = "${pkgs.util-linux}/bin/nsenter";
-  storeUnit = import ./store-unit.nix {
-    inherit
-      lib
-      pkgs
-      backend
-      fuseBin
-      ;
+  storeView = import ./store-unit.nix {
+    inherit lib pkgs backend;
+    fuseBin = "${fuse}/bin/nix-store-shared-fuse";
   };
-  storeUnitName = p: s: "${p.name}-store-${s.name}";
 
   serviceHelpers = import ./service-unit.nix { inherit lib pkgs backend; };
   inherit (serviceHelpers) syncCmd serviceUnit;
+
+  ownerUnit = import ./owner-unit.nix { inherit lib pkgs backend storeView syncCmd; };
 
   # These are the files copied by each generated service unit's ExecStartPre
   # and ExecReload. Keep the inventory derived from the same configTree as
@@ -77,127 +70,15 @@ let
     )) p.svcList)
   ) cfg;
 
-  prisonUnit =
+  # The services a prison's start brings back: those the system wants at
+  # boot, read from the final unit so a consumer's override counts.
+  bootServices =
     p:
-    let
-      # A prison that joins another's netns owns no namespace: no owner
-      # container to start, no ruleset to load, nothing to tear down but
-      # its own store views. Its unit still mounts the views and syncs
-      # configs, and waits for the owning prison's unit first so the
-      # namespace exists before any service tries to join it.
-      joining = (p.joins or null) != null;
-      storeUnits = map (s: "${storeUnitName p s}.service") p.allServices;
-      setup = pkgs.writeShellApplication {
-        name = "${p.name}-up";
-        runtimeInputs = [
-          pkgs.coreutils
-          pkgs.podman
-          pkgs.util-linux
-          pkgs.nftables
-        ];
-        text = ''
-          set -euo pipefail
-          STATE=${escapeShellArg p.stateDir}
-          mkdir -p "$STATE/store" "$STATE/config"
+    lib.filter (
+      s: builtins.elem "multi-user.target" config.systemd.services."${p.name}-${s.name}".wantedBy
+    ) p.svcList;
 
-          # A writable persistent path is a host directory bound in; podman
-          # would otherwise create it as root. Read-only entries are not
-          # created: a credential that does not exist is a deployment error,
-          # and an empty file conjured here would hide it.
-          ${concatMapStringsSep "\n" (
-            s:
-            concatMapStringsSep "\n" (pm: ''
-              mkdir -p ${escapeShellArg pm.host}
-              # chown from inside the user namespace: the service runs as an
-              # unprivileged uid *in the container*, which on the host is a
-              # mapped subuid, not this user. Chowning to the host user would
-              # give the container root's id and leave the service unable to
-              # write its own state.
-              podman unshare chown ${toString s.uid}:${toString s.gid} ${escapeShellArg pm.host}
-            '') (lib.filter (pm: !(pm.readOnly or false)) s.persist)
-          ) p.allServices}
-
-          ${concatMapStringsSep "\n" (s: syncCmd p s) (lib.filter (s: s.hasConfig) p.allServices)}
-
-          ${lib.optionalString (!joining) ''
-            if ! ${backend.podmanBin} container exists ${backend.ownerName p} 2>/dev/null; then
-              ${escapeShellArgs (backend.runOwner p)} >/dev/null
-            elif [ "$(${backend.podmanBin} inspect ${backend.ownerName p} --format '{{.State.Status}}' 2>/dev/null)" != running ]; then
-              ${backend.podmanBin} start ${backend.ownerName p} >/dev/null
-            fi
-          ''}
-
-          ${lib.optionalString p.wantsNetwork ''
-            gpid=$(${backend.podmanBin} inspect ${backend.ownerName p} --format '{{.State.Pid}}' | tr -d '[:space:]')
-            if [ -z "$gpid" ] || [ "$gpid" = 0 ]; then
-              echo "${p.name}: namespace owner did not start" >&2
-              exit 1
-            fi
-            ${backend.podmanBin} unshare ${pkgs.bash}/bin/bash -c \
-              '${nsenterBin} --net=/proc/'"$gpid"'/ns/net ${nftBin} -f ${p.ruleset}'
-          ''}
-        '';
-      };
-
-      teardown = pkgs.writeShellApplication {
-        name = "${p.name}-down";
-        runtimeInputs = [
-          pkgs.coreutils
-          pkgs.podman
-        ];
-        text = ''
-          set -uo pipefail
-          ${lib.optionalString (
-            !joining
-          ) "${backend.podmanBin} rm -f ${backend.ownerName p} >/dev/null 2>&1 || true"}
-          exit 0
-        '';
-      };
-    in
-    nameValuePair p.name {
-      description =
-        "${p.name}: "
-        + (
-          if joining then
-            "store views and config (shares ${p.joins} network namespace)"
-          else
-            "namespace owner, store views and network policy"
-        );
-      after = [
-        (if p.wantsNetwork then "network-online.target" else "network.target")
-        "suid-sgid-wrappers.service"
-        # Dependency specifiers use the system manager's identity, not User=.
-        # The generator resolves the account's allocated UID at boot/reload.
-        "prison-user-${p.user}.target"
-      ]
-      ++ storeUnits
-      ++ lib.optional joining "${p.joins}.service";
-      # BindsTo stops every child when a store view tears down this owner.
-      # Starting the owner must bring back unchanged children as well.
-      wants = lib.optional p.wantsNetwork "network-online.target"
-        ++ map (s: "${p.name}-${s.name}.service") (lib.filter
-          (s: builtins.elem "multi-user.target"
-            config.systemd.services."${p.name}-${s.name}".wantedBy)
-          p.svcList);
-      requires =
-        [ "prison-user-${p.user}.target" "suid-sgid-wrappers.service" ]
-        ++ storeUnits
-        ++ lib.optional joining "${p.joins}.service";
-      bindsTo = storeUnits;
-      wantedBy = [ "multi-user.target" ];
-      path = [ "/run/wrappers" ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        User = p.user;
-        ExecStart = "${setup}/bin/${p.name}-up";
-        # ExecStopPost and not ExecStop: systemd skips ExecStop when a stop
-        # interrupts setup or setup fails, which would leave the namespace
-        # owner running. A stop's SIGTERM ending setup is not a failure.
-        ExecStopPost = "${teardown}/bin/${p.name}-down";
-        SuccessExitStatus = "SIGTERM";
-      };
-    };
+  prisonUnit = p: ownerUnit p (bootServices p);
 in
 {
   options.services.prisons = mkOption {
@@ -305,7 +186,7 @@ in
     systemd.services =
       (mapAttrs' (_: p: prisonUnit p) cfg)
       // lib.listToAttrs (
-        lib.concatMap (p: map (s: storeUnit p s) p.allServices) (builtins.attrValues cfg)
+        lib.concatMap (p: map (s: storeView.mkUnit p s) p.allServices) (builtins.attrValues cfg)
       )
       // lib.listToAttrs (
         lib.concatMap (p: map (s: serviceUnit p s) p.svcList) (builtins.attrValues cfg)

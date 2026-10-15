@@ -1,4 +1,8 @@
 # One capability-confined FUSE store-view unit per prison service.
+#
+# Also the single place that names a view's unit and the bind target its
+# daemon serves, so the freshness check in every service unit compares
+# against exactly what this unit runs.
 {
   lib,
   pkgs,
@@ -6,62 +10,74 @@
   fuseBin,
 }:
 
-p: s:
 let
-  unitName = "${p.name}-store-${s.name}";
-  mountPoint = backend.storeMountPoint p s;
-  openFileArgs = lib.optionals (s.openFiles != null) [
-    "--max-open-files"
-    (toString s.openFiles)
-  ];
-  prepare = pkgs.writeShellScript "${unitName}-prepare" ''
-    set -eu
-    mkdir -p ${lib.escapeShellArg mountPoint}
-  '';
-  waitUntilMounted = pkgs.writeShellScript "${unitName}-wait" ''
-    set -eu
-    for _ in $(${pkgs.coreutils}/bin/seq 1 50); do
-      ${pkgs.util-linux}/bin/mountpoint -q ${lib.escapeShellArg mountPoint} && exit 0
-      ${pkgs.coreutils}/bin/sleep 0.2
-    done
-    echo "${unitName}: store view did not mount at ${mountPoint}" >&2
-    exit 1
-  '';
+  unitName = p: s: "${p.name}-store-${s.name}";
+
+  # What the daemon serves. prison-store-check reads it back from the running
+  # daemon's command line, so it must be passed as one argv element.
+  bindTarget = s: "${s.storeFarm}/nix/store";
+
+  mkUnit =
+    p: s:
+    let
+      name = unitName p s;
+      mountPoint = backend.storeMountPoint p s;
+      openFileArgs = lib.optionals (s.openFiles != null) [
+        "--max-open-files"
+        (toString s.openFiles)
+      ];
+      prepare = pkgs.writeShellScript "${name}-prepare" ''
+        set -eu
+        mkdir -p ${lib.escapeShellArg mountPoint}
+      '';
+      waitUntilMounted = pkgs.writeShellScript "${name}-wait" ''
+        set -eu
+        for _ in $(${pkgs.coreutils}/bin/seq 1 50); do
+          ${pkgs.util-linux}/bin/mountpoint -q ${lib.escapeShellArg mountPoint} && exit 0
+          ${pkgs.coreutils}/bin/sleep 0.2
+        done
+        echo "${name}: store view did not mount at ${mountPoint}" >&2
+        exit 1
+      '';
+    in
+    lib.nameValuePair name {
+      description = "${p.name}: passthrough store view for ${s.name}";
+      before = [ "${p.name}.service" ];
+      partOf = [ "${p.name}.service" ];
+      # A changed or recovered store view must restart its namespace owner,
+      # even when the owner's own unit definition did not change.
+      wants = [ "${p.name}.service" ];
+
+      serviceConfig = {
+        Type = "exec";
+        User = p.user;
+        ExecStartPre = prepare;
+        ExecStart = lib.escapeShellArgs (
+          [ fuseBin ]
+          ++ openFileArgs
+          ++ [
+            "--bind-target"
+            (bindTarget s)
+            "--resolution-root"
+            "/nix/store"
+            "--allow-other"
+            mountPoint
+          ]
+        );
+        ExecStartPost = waitUntilMounted;
+        ExecStopPost = "-${pkgs.util-linux}/bin/umount ${lib.escapeShellArg mountPoint}";
+        Restart = "on-failure";
+        RestartSec = 2;
+
+        # FUSE_DEV_IOC_BACKING_OPEN currently requires CAP_SYS_ADMIN. It belongs
+        # only to this fixed daemon unit; Podman, the setup script and all service
+        # containers run without it.
+        AmbientCapabilities = [ "CAP_SYS_ADMIN" ];
+        CapabilityBoundingSet = [ "CAP_SYS_ADMIN" ];
+        NoNewPrivileges = true;
+      };
+    };
 in
-lib.nameValuePair unitName {
-  description = "${p.name}: passthrough store view for ${s.name}";
-  before = [ "${p.name}.service" ];
-  partOf = [ "${p.name}.service" ];
-  # A changed or recovered store view must restart its namespace owner,
-  # even when the owner's own unit definition did not change.
-  wants = [ "${p.name}.service" ];
-
-  serviceConfig = {
-    Type = "exec";
-    User = p.user;
-    ExecStartPre = prepare;
-    ExecStart = lib.escapeShellArgs (
-      [ fuseBin ]
-      ++ openFileArgs
-      ++ [
-        "--bind-target"
-        "${s.storeFarm}/nix/store"
-        "--resolution-root"
-        "/nix/store"
-        "--allow-other"
-        mountPoint
-      ]
-    );
-    ExecStartPost = waitUntilMounted;
-    ExecStopPost = "-${pkgs.util-linux}/bin/umount ${lib.escapeShellArg mountPoint}";
-    Restart = "on-failure";
-    RestartSec = 2;
-
-    # FUSE_DEV_IOC_BACKING_OPEN currently requires CAP_SYS_ADMIN. It belongs
-    # only to this fixed daemon unit; Podman, the setup script and all service
-    # containers run without it.
-    AmbientCapabilities = [ "CAP_SYS_ADMIN" ];
-    CapabilityBoundingSet = [ "CAP_SYS_ADMIN" ];
-    NoNewPrivileges = true;
-  };
+{
+  inherit unitName bindTarget mkUnit;
 }
