@@ -15,7 +15,10 @@ default.nix          what a prison and its services are
 capabilities.nix     the 41 Linux capabilities as typed fields, all false
 podman.nix           the podman option model and the only code producing argv
 podman-backend.nix   intent -> podman, including container names
-module.nix           systemd units
+module.nix           systemd units, from:
+  store-unit.nix     the FUSE store view per service
+  owner-unit.nix     the prison unit: views, namespace owner, ruleset
+  service-unit.nix   the supervised service unit and its store check
 ruleset.nix          the nftables policy
 rootfs.nix           the toolless filesystem
 no-shell.nix         refuses a store view that contains a shell
@@ -178,10 +181,21 @@ do not.
 ## Units
 
 ```
+<n>-store-<svc>.service
+                    the FUSE daemon serving one service's closure
 <n>.service         oneshot + RemainAfterExit: the store views, the namespace
                     owner, and the nftables ruleset loaded into its netns
 <n>-<svc>.service   one per service, BindsTo <n>.service
 ```
+
+Every start of `<n>-<svc>` first runs `prison-store-check` as its
+ExecCondition. A start that lands in a switch's window runs the old store-view
+unit, and the switch then finds the view active and leaves it serving the old
+closure. The check reads the bind target from each running view daemon's
+command line. If one serves something other than what this unit was built
+against, it queues a restart of the stale views and of the service, and skips
+the start, which is not a failure. Restarting a view restarts the owner, which
+binds to every view.
 
 A service's store view is exactly its closure, so it contains whatever the
 package references. A static binary needs a few paths, and anything that

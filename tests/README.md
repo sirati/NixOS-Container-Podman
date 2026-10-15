@@ -51,6 +51,7 @@ next `nix-collect-garbage` deletes them.
 | `30-nixct.sh` | `mkNixct`'s own settings, and two sessions sharing one project |
 | `40-develop-options.sh` | all 26 flags `develop` accepts |
 | `50-prison-readiness.sh` | in a NixOS VM, a prison service unit starts every time, quiet and while PID 1 runs a daemon-reload loop, and a dependent unit always finds its container running |
+| `55-prison-store-freshness.sh` | in a NixOS VM, a store view a switch left serving the old closure is replaced by the next service start, which is skipped rather than failed |
 
 Each variant runs the same lifecycle from `lib.sh`: up, status, exec,
 `develop --command`, down, status, purge.

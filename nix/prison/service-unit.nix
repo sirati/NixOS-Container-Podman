@@ -3,10 +3,12 @@
   lib,
   pkgs,
   backend,
+  storeView,
 }:
 
 let
   prisonStart = import ../prison-start.nix { inherit pkgs; };
+  storeCheck = import ../prison-store-check.nix { inherit pkgs; };
 
   inherit (lib) nameValuePair escapeShellArgs;
 
@@ -42,6 +44,35 @@ let
       (backend.configMountPoint p s)
     ];
 
+  # The store views a service runs against: the namespace owner's when the
+  # prison owns one, and its own. Restarting a view restarts the owner, which
+  # BindsTo every view, and with it every service in the prison.
+  viewsOf = p: s: lib.optional (p.infraNet or null != null) p.infraNet ++ [ s ];
+
+  # A start that lands in a switch's window runs the OLD view unit, and the
+  # switch, finding the view active, leaves it serving the old closure. Every
+  # start of a service therefore checks the running daemons first. If one
+  # serves another closure, it queues a restart of the stale views and of
+  # this unit and skips this start. Root ("+"), because it restarts system
+  # units and reads the daemons' command lines.
+  storeCheckCmd =
+    p: s:
+    "+"
+    + escapeShellArgs (
+      [
+        "${storeCheck}/bin/prison-store-check"
+        "--systemctl"
+        "${pkgs.systemd}/bin/systemctl"
+        "--unit"
+        "${p.name}-${s.name}.service"
+      ]
+      ++ lib.concatMap (v: [
+        "--view"
+        "${storeView.unitName p v}.service"
+        (storeView.bindTarget v)
+      ]) (viewsOf p s)
+    );
+
   serviceUnit =
     p: s:
     let
@@ -71,6 +102,9 @@ let
         # the stop's SIGTERM as 143, and conmon passes that on; a stop that
         # lands during ExecStartPre kills the sync with SIGTERM itself.
         SuccessExitStatus = "143 SIGTERM";
+        # Exit 1 skips the start without failing it: the queued restart is
+        # the recovery. A check that cannot decide fails the start.
+        ExecCondition = [ (storeCheckCmd p s) ];
         ExecStartPre = lib.optional s.hasConfig (syncCmd p s);
         # prison-start tells a start this unit's stop interrupted from a
         # start that failed; podman exits 1 for both.
@@ -91,5 +125,5 @@ let
 
 in
 {
-  inherit syncCmd serviceUnit;
+  inherit syncCmd storeCheckCmd serviceUnit;
 }

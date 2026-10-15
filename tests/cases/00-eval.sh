@@ -164,6 +164,43 @@ eval_is "the generated service container drops every capability" "true" \
     in lib.boolToString
       (lib.hasInfix \"--cap-drop=ALL\" argv && !lib.hasInfix \"--cap-add\" argv)"
 
+# A start in a switch's window can leave a view serving the old farm while
+# systemd holds the new unit. Each service start compares every view it runs
+# against with the bind target that view's own unit names, as root, and as
+# a condition so the self-healing restart is a skip, not a failure.
+eval_is "a service start checks every store view against the farm its unit serves" "true" \
+  "$PRISON_SYSTEM let
+      units = system.config.systemd.services;
+      cond = builtins.unsafeDiscardStringContext (builtins.head units.p-s.serviceConfig.ExecCondition);
+      served = v: builtins.head (builtins.match \".*--bind-target ([^ ]+) .*\"
+        (builtins.unsafeDiscardStringContext units.\${v}.serviceConfig.ExecStart));
+      expects = v: lib.hasInfix \"--view \${v}.service \${served v}\" cond;
+    in lib.boolToString
+      (lib.hasPrefix \"+\" cond && lib.hasInfix \"/bin/prison-store-check \" cond
+       && lib.hasInfix \"--unit p-s.service \" cond
+       && expects \"p-store-s\" && expects \"p-store-infra-net\"
+       && builtins.length (lib.splitString \"--view\" cond) == 3)"
+
+eval_is "a joining service checks only its own store view" "true" \
+  "$PRISON_SYSTEM let
+      joined = lib.nixosSystem {
+        modules = [
+          (import (flake.outPath + \"/nix/prison/module.nix\") { inherit prison; })
+          { services.prisons.p = p;
+            services.prisons.g = prison.mkPrison {
+              name = \"g\"; joins = \"p\";
+              services = [ (prison.mkPrisonService { name = \"t\"; uid = 1235; exec = [ \"/bin/true\" ]; }) ];
+            };
+            system.stateVersion = \"26.05\";
+            nixpkgs.hostPlatform = builtins.currentSystem; }
+        ];
+      };
+      cond = builtins.unsafeDiscardStringContext
+        (builtins.head joined.config.systemd.services.g-t.serviceConfig.ExecCondition);
+    in lib.boolToString
+      (lib.hasInfix \"--view g-store-t.service \" cond
+       && builtins.length (lib.splitString \"--view\" cond) == 2)"
+
 # Readiness must not hang on an sd_notify datagram from a short-lived podman
 # child, which PID 1 drops once the child has exited. The unit forks, is
 # ready when the detached run has started the container, and then follows

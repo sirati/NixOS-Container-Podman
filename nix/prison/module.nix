@@ -56,7 +56,7 @@ let
     fuseBin = "${fuse}/bin/nix-store-shared-fuse";
   };
 
-  serviceHelpers = import ./service-unit.nix { inherit lib pkgs backend; };
+  serviceHelpers = import ./service-unit.nix { inherit lib pkgs backend storeView; };
   inherit (serviceHelpers) syncCmd serviceUnit;
 
   ownerUnit = import ./owner-unit.nix { inherit lib pkgs backend storeView syncCmd; };
