@@ -53,8 +53,10 @@ let
   # switch, finding the view active, leaves it serving the old closure. Every
   # start of a service therefore checks the running daemons first. If one
   # serves another closure, it queues a restart of the stale views and of
-  # this unit and skips this start. Root ("+"), because it restarts system
-  # units and reads the daemons' command lines.
+  # this unit, arms a recheck in case that restart is cancelled, and skips
+  # this start; too many skips in a row fail the start. Root ("+"), because
+  # it restarts system units, arms a transient timer and reads the daemons'
+  # command lines.
   storeCheckCmd =
     p: s:
     "+"
@@ -63,6 +65,8 @@ let
         "${storeCheck}/bin/prison-store-check"
         "--systemctl"
         "${pkgs.systemd}/bin/systemctl"
+        "--systemd-run"
+        "${pkgs.systemd}/bin/systemd-run"
         "--unit"
         "${p.name}-${s.name}.service"
       ]
@@ -88,10 +92,6 @@ let
     serviceConfig = {
       Delegate = true;
       User = p.user;
-      # A stop is not a failure. catatonit reports a service that died of
-      # the stop's SIGTERM as 143, and conmon passes that on; a stop that
-      # lands during ExecStartPre kills the sync with SIGTERM itself.
-      SuccessExitStatus = "143 SIGTERM";
       # Exit 1 skips the start without failing it: the queued restart is
       # the recovery. A check that cannot decide fails the start.
       ExecCondition = [ (storeCheckCmd p s) ];
@@ -121,6 +121,10 @@ let
         RuntimeDirectory = backend.runtimeDirName p s;
         Restart = "on-failure";
         RestartSec = 2;
+        # A stop is not a failure. catatonit reports a daemon that died of
+        # the stop's SIGTERM as 143, and conmon passes that on; a stop that
+        # lands during ExecStartPre kills the sync with SIGTERM itself.
+        SuccessExitStatus = "143 SIGTERM";
         ExecStop = escapeShellArgs (backend.stopArgs p s);
         # Reload re-syncs the configuration and tells the service, without
         # touching the container: the mount is a directory the host rewrites
@@ -135,6 +139,10 @@ let
   # unit's result. A stop signals prison-start, and podman passes the signal
   # to the program. Nothing starts it unless asked, and nothing retries it
   # unless the consumer sets Restart=.
+  #
+  # No SuccessExitStatus: a task whose program died of SIGTERM (status 143)
+  # did not finish and has failed. A stop of the unit is still clean, since
+  # prison-start then ends by SIGTERM itself, which systemd counts as clean.
   taskUnit = p: s: {
     wantedBy = [ ];
     serviceConfig = {

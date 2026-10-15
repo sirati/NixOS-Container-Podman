@@ -51,6 +51,15 @@ pkgs.testers.runNixOSTest {
         (task "fails" [
           "${coreutils}/false"
         ])
+        # Exits 143, as a program killed by SIGTERM does through catatonit.
+        (task "terminated" [
+          "${coreutils}/timeout"
+          "--preserve-status"
+          "--signal=TERM"
+          "1"
+          "${coreutils}/sleep"
+          "30"
+        ])
       ];
     };
   };
@@ -64,7 +73,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("o.service", timeout=300)
 
     with subtest("a task is not started with its prison"):
-        for unit in ["o-slow.service", "o-writes.service", "o-fails.service"]:
+        for unit in ["o-slow.service", "o-writes.service", "o-fails.service", "o-terminated.service"]:
             assert show("ActiveState", unit) == "inactive", unit
             assert show("NRestarts", unit) == "0", unit
 
@@ -84,5 +93,16 @@ pkgs.testers.runNixOSTest {
         machine.fail("systemctl start o-fails.service")
         assert show("Result", "o-fails.service") == "exit-code"
         assert show("ExecMainStatus", "o-fails.service") == "1"
+
+    with subtest("a task whose program died of SIGTERM has failed"):
+        machine.fail("systemctl start o-terminated.service")
+        assert show("Result", "o-terminated.service") == "exit-code"
+        assert show("ExecMainStatus", "o-terminated.service") == "143"
+
+    with subtest("stopping a running task is not a failure"):
+        machine.succeed("systemctl start --no-block o-slow.service")
+        machine.wait_until_succeeds("test \"$(systemctl show -p ActiveState --value o-slow.service)\" = activating", timeout=60)
+        machine.succeed("systemctl stop o-slow.service")
+        assert show("Result", "o-slow.service") == "success"
   '';
 }

@@ -178,6 +178,7 @@ eval_is "a service start checks every store view against the farm its unit serve
     in lib.boolToString
       (lib.hasPrefix \"+\" cond && lib.hasInfix \"/bin/prison-store-check \" cond
        && lib.hasInfix \"--unit p-s.service \" cond
+       && lib.hasInfix \"--systemd-run /nix/store/\" cond
        && expects \"p-store-s\" && expects \"p-store-infra-net\"
        && builtins.length (lib.splitString \"--view\" cond) == 3)"
 
@@ -205,7 +206,7 @@ eval_is "a joining service checks only its own store view" "true" \
 # a detached run made a oneshot "succeed" as soon as the container started,
 # and its ExecStopPost then removed the container while the task still ran.
 eval_is "a oneshot service runs attached and only when asked" \
-  "oneshot:no:absent:attached:no-pidfile:checked:not-wanted:not-pulled" \
+  "oneshot:no:absent:attached:no-pidfile:checked:not-wanted:not-pulled:sigterm-fails:daemon-stop-clean" \
   "$PRISON_SYSTEM let
       tasked = lib.nixosSystem {
         modules = [
@@ -232,6 +233,8 @@ eval_is "a oneshot service runs attached and only when asked" \
       (if lib.hasInfix \"prison-store-check\" (builtins.head job.serviceConfig.ExecCondition) then \"checked\" else \"unchecked\")
       (if job.wantedBy == [ ] then \"not-wanted\" else \"wanted\")
       (if builtins.elem \"t-job.service\" units.t.wants then \"pulled\" else \"not-pulled\")
+      (if job.serviceConfig ? SuccessExitStatus then \"sigterm-succeeds\" else \"sigterm-fails\")
+      (if (units.t-d.serviceConfig.SuccessExitStatus or \"\") == \"143 SIGTERM\" then \"daemon-stop-clean\" else \"daemon-stop-fails\")
     ]"
 
 eval_fails "a oneshot service has nothing to reload" "nothing to reload" \

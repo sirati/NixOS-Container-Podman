@@ -107,6 +107,16 @@ pkgs.testers.runNixOSTest {
           machine.fail("journalctl -b -u r-s.service | grep -F 'Failed with result'")
           assert show("Result", "r-s.service") == "success"
 
+      # The skip relied on its queued restart. If that job is cancelled the
+      # unit stays inactive, so the skip also armed a recheck timer, whose
+      # service starts the unit again when it is not running.
+      with subtest("a skip arms a recheck that starts a unit left inactive"):
+          machine.succeed("systemctl is-active prison-store-recheck-r-s.timer")
+          machine.succeed("systemctl stop r-s.service")
+          machine.succeed("systemctl start prison-store-recheck-r-s.service")
+          machine.wait_for_unit("r-s.service", timeout=120)
+          machine.succeed("journalctl -b -u prison-store-recheck-r-s.service | grep -F 'starting it again'")
+
       with subtest("a fresh view is left alone"):
           before = show("MainPID", "r-store-s.service")
           machine.succeed("systemctl restart r-s.service")
