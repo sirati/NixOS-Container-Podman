@@ -154,9 +154,14 @@ let
       # supervises for the container's lifetime. Readiness is never an
       # sd_notify datagram: podman sends that from a short-lived child, and
       # PID 1 drops it when the child is gone before the message is read.
-      detach = true;
+      #
+      # A oneshot runs attached instead: `podman run` returns when the
+      # program does, with its exit status, which is the unit's result.
+      detach = !(s.oneshot or false);
       extraArgs = [
         "--sdnotify=ignore"
+      ]
+      ++ lib.optionals (!(s.oneshot or false)) [
         "--conmon-pidfile"
         (conmonPidFile p s)
       ];

@@ -73,47 +73,55 @@ let
       ]) (viewsOf p s)
     );
 
-  serviceUnit =
+  # What every service unit shares, daemon or task.
+  commonUnit = p: s: {
+    description = "${p.name}: ${s.name}";
+    after = [
+      "${p.name}.service"
+      "prison-user-${p.user}.target"
+    ];
+    requires = [ "prison-user-${p.user}.target" ];
+    bindsTo = [ "${p.name}.service" ];
+    partOf = [ "${p.name}.service" ];
+    environment.PODMAN_SYSTEMD_UNIT = "${p.name}-${s.name}.service";
+
+    serviceConfig = {
+      Delegate = true;
+      User = p.user;
+      # A stop is not a failure. catatonit reports a service that died of
+      # the stop's SIGTERM as 143, and conmon passes that on; a stop that
+      # lands during ExecStartPre kills the sync with SIGTERM itself.
+      SuccessExitStatus = "143 SIGTERM";
+      # Exit 1 skips the start without failing it: the queued restart is
+      # the recovery. A check that cannot decide fails the start.
+      ExecCondition = [ (storeCheckCmd p s) ];
+      ExecStartPre = lib.optional s.hasConfig (syncCmd p s);
+      # prison-start tells a start this unit's stop interrupted from a
+      # start that failed; podman exits 1 for both.
+      ExecStart = escapeShellArgs ([ "${prisonStart}/bin/prison-start" ] ++ backend.runService p s);
+      # Runs after every stop, including one that interrupted the start or
+      # a start that failed, which skip ExecStop and can leave the
+      # container behind.
+      ExecStopPost = escapeShellArgs (backend.rmArgs p s);
+    };
+  };
+
+  # A daemon: forking around the detached run, supervised through conmon's
+  # pidfile, restarted when it dies, started at boot.
+  daemonUnit =
     p: s:
     let
       reload = backend.reloadArgs p s;
     in
-    nameValuePair "${p.name}-${s.name}" {
-      description = "${p.name}: ${s.name}";
-      after = [
-        "${p.name}.service"
-        "prison-user-${p.user}.target"
-      ];
-      requires = [ "prison-user-${p.user}.target" ];
-      bindsTo = [ "${p.name}.service" ];
-      partOf = [ "${p.name}.service" ];
+    {
       wantedBy = [ "multi-user.target" ];
-      environment.PODMAN_SYSTEMD_UNIT = "${p.name}-${s.name}.service";
-
       serviceConfig = {
         Type = "forking";
         PIDFile = backend.conmonPidFile p s;
         RuntimeDirectory = backend.runtimeDirName p s;
-        Delegate = true;
-        User = p.user;
         Restart = "on-failure";
         RestartSec = 2;
-        # A stop is not a failure. catatonit reports a service that died of
-        # the stop's SIGTERM as 143, and conmon passes that on; a stop that
-        # lands during ExecStartPre kills the sync with SIGTERM itself.
-        SuccessExitStatus = "143 SIGTERM";
-        # Exit 1 skips the start without failing it: the queued restart is
-        # the recovery. A check that cannot decide fails the start.
-        ExecCondition = [ (storeCheckCmd p s) ];
-        ExecStartPre = lib.optional s.hasConfig (syncCmd p s);
-        # prison-start tells a start this unit's stop interrupted from a
-        # start that failed; podman exits 1 for both.
-        ExecStart = escapeShellArgs ([ "${prisonStart}/bin/prison-start" ] ++ backend.runService p s);
         ExecStop = escapeShellArgs (backend.stopArgs p s);
-        # Runs after every stop, including one that interrupted the start or
-        # a start that failed, which skip ExecStop and can leave the
-        # container behind.
-        ExecStopPost = escapeShellArgs (backend.rmArgs p s);
         # Reload re-syncs the configuration and tells the service, without
         # touching the container: the mount is a directory the host rewrites
         # in place, so the new content is already visible inside.
@@ -122,6 +130,24 @@ let
         );
       };
     };
+
+  # A task: the attached run is the unit's process and its exit status the
+  # unit's result. A stop signals prison-start, and podman passes the signal
+  # to the program. Nothing starts it unless asked, and nothing retries it
+  # unless the consumer sets Restart=.
+  taskUnit = p: s: {
+    wantedBy = [ ];
+    serviceConfig = {
+      Type = "oneshot";
+      Restart = "no";
+    };
+  };
+
+  serviceUnit =
+    p: s:
+    nameValuePair "${p.name}-${s.name}" (
+      lib.recursiveUpdate (commonUnit p s) ((if s.oneshot or false then taskUnit else daemonUnit) p s)
+    );
 
 in
 {

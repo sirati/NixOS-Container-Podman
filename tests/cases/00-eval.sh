@@ -201,6 +201,42 @@ eval_is "a joining service checks only its own store view" "true" \
       (lib.hasInfix \"--view g-store-t.service \" cond
        && builtins.length (lib.splitString \"--view\" cond) == 2)"
 
+# A task's unit must end with its program, not with the container's start:
+# a detached run made a oneshot "succeed" as soon as the container started,
+# and its ExecStopPost then removed the container while the task still ran.
+eval_is "a oneshot service runs attached and only when asked" \
+  "oneshot:no:absent:attached:no-pidfile:checked:not-wanted:not-pulled" \
+  "$PRISON_SYSTEM let
+      tasked = lib.nixosSystem {
+        modules = [
+          (import (flake.outPath + \"/nix/prison/module.nix\") { inherit prison; })
+          { services.prisons.t = prison.mkPrison {
+              name = \"t\";
+              services = [
+                (prison.mkPrisonService { name = \"d\"; uid = 1235; exec = [ \"/bin/true\" ]; })
+                (prison.mkPrisonService { name = \"job\"; uid = 1236; exec = [ \"/bin/true\" ]; oneshot = true; })
+              ];
+            };
+            system.stateVersion = \"26.05\";
+            nixpkgs.hostPlatform = builtins.currentSystem; }
+        ];
+      };
+      units = tasked.config.systemd.services;
+      job = units.t-job;
+      argv = builtins.unsafeDiscardStringContext job.serviceConfig.ExecStart;
+    in lib.concatStringsSep \":\" [
+      job.serviceConfig.Type job.serviceConfig.Restart
+      (if job.serviceConfig ? PIDFile then \"pidfile\" else \"absent\")
+      (if lib.hasInfix \" -d \" argv then \"detached\" else \"attached\")
+      (if lib.hasInfix \"--conmon-pidfile\" argv then \"conmon-pidfile\" else \"no-pidfile\")
+      (if lib.hasInfix \"prison-store-check\" (builtins.head job.serviceConfig.ExecCondition) then \"checked\" else \"unchecked\")
+      (if job.wantedBy == [ ] then \"not-wanted\" else \"wanted\")
+      (if builtins.elem \"t-job.service\" units.t.wants then \"pulled\" else \"not-pulled\")
+    ]"
+
+eval_fails "a oneshot service has nothing to reload" "nothing to reload" \
+  "$PRISON toString (svc { oneshot = true; reload.signal = \"SIGHUP\"; }).oneshot"
+
 # Readiness must not hang on an sd_notify datagram from a short-lived podman
 # child, which PID 1 drops once the child has exited. The unit forks, is
 # ready when the detached run has started the container, and then follows

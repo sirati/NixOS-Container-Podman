@@ -75,9 +75,16 @@ let
       # view. The kernel's backing-file references bypass RLIMIT_NOFILE, so the
       # FUSE daemon enforces this ceiling itself. Null uses its safe default.
       openFiles ? null,
+      # A task rather than a daemon: the unit is Type=oneshot, `podman run`
+      # stays attached, and the unit ends with the program's exit status.
+      # Not started at boot or by the prison's start; something has to ask
+      # for it, as a dependency, a timer or an operator.
+      oneshot ? false,
     }:
     assert lib.assertMsg (uid != 0)
       "prison: service ${name} must not run as uid 0; that is what the container root account exists to avoid.";
+    assert lib.assertMsg (!(oneshot && reload != null))
+      "prison: service ${name} is a oneshot and has a `reload`; a task that has exited has nothing to reload.";
     let
       argv = assertAbsolute name exec;
 
@@ -203,6 +210,7 @@ let
         config
         configTree
         reload
+        oneshot
         ;
       state = checkedState;
       persist = checkedPersist;

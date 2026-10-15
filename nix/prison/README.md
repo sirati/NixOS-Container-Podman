@@ -185,7 +185,9 @@ do not.
                     the FUSE daemon serving one service's closure
 <n>.service         oneshot + RemainAfterExit: the store views, the namespace
                     owner, and the nftables ruleset loaded into its netns
-<n>-<svc>.service   one per service, BindsTo <n>.service
+<n>-<svc>.service   one per service, BindsTo <n>.service; forking around a
+                    detached run, or, with `oneshot = true`, a oneshot task
+                    whose attached run ends with the program's exit status
 ```
 
 Every start of `<n>-<svc>` first runs `prison-store-check` as its
