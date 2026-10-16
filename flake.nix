@@ -530,6 +530,12 @@
         # confined service is allowed to do; nothing in it names a container
         # runtime (see nix/prison/README.md).
         inherit (import ./nix/prison { inherit pkgs; }) mkPrison mkPrisonService;
+        # A desktop program in a rootless container, shown to the host as an
+        # ordinary Wayland app (see nix/app/default.nix).
+        inherit (import ./nix/app { inherit pkgs; }) mkApp appRunner;
+        # The same, built with the caller's package set (podman, crun, the
+        # runner's compiler) rather than this flake's.
+        appsFor = pkgs: import ./nix/app { inherit pkgs; };
       };
 
       # Flat outputs (validated by nix flake check). These all resolve to a
@@ -596,6 +602,9 @@
       nixosConfigurations.example = example.nixosSystem;
 
       nixosModules.nixct = import ./nix/nixos-module.nix { inherit mkNixct; };
+
+      # Host support for `lib.mkApp` apps: users, GPU nodes, fonts (nix/app).
+      nixosModules.app-sandbox = ./nix/app/nixos-module.nix;
 
       # services.prisons. Takes pkgs from the importing configuration rather
       # than this flake's, so a consumer's nixpkgs is what builds the services.

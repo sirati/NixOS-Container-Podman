@@ -1,0 +1,98 @@
+# app
+
+`mkApp` runs a desktop program in a rootless podman container and presents it to
+the host as an ordinary Wayland application, much as snap does.
+
+The host sees what an installed program shows. `bin/<entry>` is on `PATH`, and
+the package's `share/` (desktop entries, icons, MIME types) is carried over
+unchanged, so the menu, the file manager and `xdg-open` find it as they would any
+other program. Run it and the window is a native Wayland client of the host
+compositor, with the GPU, clipboard, input method and audio, because the
+container is given those sockets and device nodes and nothing else.
+
+What the program cannot see is the rest of the machine: your dotfiles, other
+processes, the host's loopback and the session bus.
+
+```nix
+# with the NixOS module (`appSandbox.enable = true`), which fills in the users,
+# the GPU nodes, the fonts and podman from the configuration:
+config.appSandbox.mkApp {
+  name = "photocraft";
+  package = pkgs.photocraft;
+  homeVisible = true;          # snap's `home`
+  audio = true;
+  entries = {
+    photocraft     = { exec = "bin/photocraft"; display = true; };
+    photocraft-cli = { exec = "bin/photocraft-cli"; stdio = true; tty = "auto"; cwd = true; };
+  };
+}
+```
+
+## Layers
+
+```
+default.nix       what an app may reach ("plugs"); renders one plan per user and entry
+../podman.nix     the typed podman model; the only code producing a command line
+plan.nix          serialises that argv, plus what is only known at launch
+runner.rs         the launcher; reads a plan, fills in the launch-time parts
+rootfs.nix        the smallest tree podman accepts, with the user in it
+nixos-module.nix  users, GPU nodes and fonts, read from the NixOS configuration
+```
+
+The runner is Rust (standard library only, built with `rustc`, unit tests run as
+part of the build) because it decides what the confined process can see. A path
+that reaches `--mount` is rejected if it could be read as more than one option,
+and nothing goes through a shell.
+
+## What an app is given
+
+| plug | what it is | default |
+|---|---|---|
+| `display` (per entry) | the compositor socket, GPU, audio, fonts, cursor theme, a filtered session bus | off |
+| `gpu` | `/dev/dri` (or the nodes in `gpu.dri`), `gpu.devices` globs, the host's driver directory | none |
+| `audio` | the PipeWire and PulseAudio sockets, and an ALSA configuration that routes to them | off |
+| `fonts` / `icons` | host directories served read-only as `/usr/share/fonts` and `/usr/share/icons` | none |
+| `dbus` | `xdg-dbus-proxy` in filter mode: portals, notifications, the tray, the file manager | on |
+| `homeVisible` | every non-hidden entry of the home directory, read-write | off |
+| `userDirs`, `paths` | named folders or absolute paths, read-write or `ro`; the same path inside | none |
+| `state` | `~/.var/app/<name>/{config,data,cache,state}` as the app's XDG directories | on |
+| `network` | the shared namespace gets `pasta` (internet) or `none` | `pasta` |
+
+The home directory inside is a scratch tmpfs. Only the four XDG directories above
+persist, and they belong to the app alone. Paths are identical inside and out, so a
+file passed on the command line or from a file manager needs no translation.
+
+## One private loopback per app
+
+Every entry of one app joins a network namespace held by a small pause container
+(`<prefix>-<name>-net`), the way a prison's services join theirs. A program that
+opens a control port on `127.0.0.1` opens it there. The host and every other
+program cannot reach it; the app's own CLI and MCP-server entries can, because
+they are in the same namespace. An entry with `joinNetwork = false` gets a
+namespace with nothing in it.
+
+## Per-user plans
+
+Paths inside are the host's own, so the plan is rendered for each user ahead of
+time (`<uid>.plan`) and the runner picks the one for the invoking uid. A user
+without a plan gets a clear error, not a half-working app. The NixOS module needs
+a fixed uid for each user for this reason.
+
+## Entries
+
+| field | meaning |
+|---|---|
+| `exec`, `args`, `env` | what runs; `{home}`, `{user}`, `{uid}`, `{runtime_dir}` are the user's |
+| `display` | give it a window: compositor, GPU, audio, fonts, cursors, the bus |
+| `stdio`, `tty` | keep stdin open; `"auto"` allocates a terminal when both ends are one |
+| `cwd` | start in the caller's directory, where the sandbox can see it |
+| `joinNetwork` | join the app's shared namespace (default) or get an empty one |
+| `paths`, `ensureDirs` | more visible paths, and directories the runner creates first (mode `0700`) |
+
+## What it does not do yet
+
+- Accessibility (AT-SPI) is not bridged; the bus filter does not allow `org.a11y.Bus`.
+- The document portal is not used. File dialogs return host paths, which work because
+  paths are identical inside, but a file outside the visible paths is invisible to the app.
+- A filtered view of `/nix/store` (as a prison has) would show the app only its own
+  closure. It sees the whole read-only store today.

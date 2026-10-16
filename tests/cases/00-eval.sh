@@ -515,4 +515,51 @@ eval_fails "portable tarball: isolateLan is not implemented" "not implemented" \
 eval_fails "mkContainer rejects an unknown storage axis" "invalid" \
   "(ct.mkContainer { modules = [ ]; storage = \"bogus\"; }).run.drvPath"
 
+echo "== eval: what a desktop app needs from the podman model =="
+
+BASE='name = "c"; command = [ "/init" ]; rootfs = "/r";'
+
+check_out "keep-id maps the invoking user, with ids when asked" \
+  "--userns=keep-id:uid=1000,gid=100" \
+  nix_eval "$PODMAN p.renderRunShell \"pm\" { $BASE userns = { mode = \"keep-id\"; uid = 1000; gid = 100; }; }"
+
+check_out "interactive keeps stdin open" "run --rm -i" \
+  nix_eval "$PODMAN p.renderRunShell \"pm\" { $BASE interactive = true; }"
+
+# shellcheck disable=SC2016 # the shell array expansion is what is rendered
+eval_ends_with "a runtime list is spliced in before the rootfs" \
+  '"${GPU_ARGS[@]}" --rootfs /r:O /init' \
+  "$PODMAN p.renderRunShell \"pm\" { $BASE splice = [ (p.rtArray \"GPU_ARGS\") ]; }"
+
+eval_fails "a scalar runtime value is not a runtime list" "runtime list" \
+  "$PODMAN p.renderRunShell \"pm\" { $BASE splice = [ (p.rt \"X\") ]; }"
+
+check_out "host variables are passed by name, not by value" "--env LANG" \
+  nix_eval "$PODMAN p.renderRunShell \"pm\" { $BASE passEnv = [ \"LANG\" ]; }"
+
+eval_fails "an environment variable name with a space is refused" "environment variable name" \
+  "$PODMAN p.renderRunShell \"pm\" { $BASE passEnv = [ \"A B\" ]; }"
+
+echo "== eval: mkApp =="
+
+APP='let a = ct.mkApp {
+       name = "x"; package = pkgs.coreutils;
+       users = [ { name = "u"; uid = 1000; gid = 100; home = "/home/u"; } ];
+       entries.x = { exec = "bin/true"; };
+     }; in'
+
+eval_is "an app has a plan for each user" "1000.plan" \
+  "$APP builtins.concatStringsSep \",\" (builtins.attrNames (builtins.readDir a.passthru.planDirs.x))"
+
+eval_fails "an app with no users is refused" "no users" \
+  "(ct.mkApp { name = \"x\"; package = pkgs.coreutils; users = [ ]; entries = { }; }).drvPath"
+
+eval_fails "a network other than pasta or none is refused" "must be" \
+  "(ct.mkApp { name = \"x\"; package = pkgs.coreutils; network = \"host\";
+     users = [ { name = \"u\"; uid = 1; gid = 1; home = \"/h\"; } ]; entries = { }; }).drvPath"
+
+eval_fails "a user name that could break the passwd file is refused" "must not contain" \
+  "(ct.mkApp { name = \"x\"; package = pkgs.coreutils;
+     users = [ { name = \"a:b\"; uid = 1; gid = 1; home = \"/h\"; } ]; entries = { x = { exec = \"bin/true\"; }; }; }).drvPath"
+
 finish
