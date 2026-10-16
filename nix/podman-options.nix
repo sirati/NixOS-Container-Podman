@@ -39,6 +39,26 @@ let
   };
   orRt = t: types.either t rtType;
 
+  # A runtime LIST of arguments, spliced in where it is placed: the GPU device
+  # nodes this machine has, the audio sockets that are up. The model cannot
+  # know how many there are, so it holds a marker and whatever runs the
+  # command fills it -- `"${NAME[@]}"` in a shell, a named provider in the app
+  # runner. Unlike a scalar it cannot sit inside a joined option string.
+  rtArray = name: {
+    __rt = name;
+    array = true;
+    prefix = "";
+    suffix = "";
+  };
+  isRtArray = v: isRt v && (v.array or false);
+  rtArrayType = types.addCheck types.attrs isRtArray // {
+    description = "a runtime list, from rtArray \"NAME\"";
+  };
+
+  envName = types.strMatching "[A-Za-z_][A-Za-z0-9_]*" // {
+    description = "environment variable name";
+  };
+
   absPath =
     description:
     lib.types.addCheck types.str (s: lib.hasPrefix "/" s)
@@ -257,6 +277,76 @@ let
       description = "Environment variables.";
     };
 
+    userns = mkOption {
+      type = types.nullOr (
+        types.submodule {
+          options = {
+            mode = mkOption {
+              type = types.enum [ "keep-id" ];
+              description = ''
+                `keep-id` maps the invoking host user to the same uid inside, so
+                files it creates in a bind-mounted directory belong to it and
+                a path means the same thing on both sides.
+              '';
+            };
+            uid = mkOption {
+              type = types.nullOr types.ints.unsigned;
+              default = null;
+              description = "In-container uid for the host user. Null keeps the host's.";
+            };
+            gid = mkOption {
+              type = types.nullOr types.ints.unsigned;
+              default = null;
+              description = "In-container gid for the host user. Null keeps the host's.";
+            };
+          };
+        }
+      );
+      default = null;
+      description = "User namespace placement. Null is podman's default.";
+    };
+
+    interactive = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Keep stdin open (`-i`), for a command that speaks over stdio.";
+    };
+
+    workdir = mkOption {
+      type = types.nullOr (orRt (absPath "absolute path inside the container"));
+      default = null;
+      description = "Working directory inside the container.";
+    };
+
+    groups = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = ''
+        Supplementary groups (`--group-add`). `keep-groups` retains the host
+        user's own groups, which is how a rootless container reaches a device
+        node that is group-readable rather than world-readable.
+      '';
+    };
+
+    passEnv = mkOption {
+      type = types.listOf envName;
+      default = [ ];
+      description = ''
+        Host variables handed through by name (`--env NAME`), so the value is
+        whatever the launching session has and nothing is passed when it is
+        unset.
+      '';
+    };
+
+    splice = mkOption {
+      type = types.listOf rtArrayType;
+      default = [ ];
+      description = ''
+        Runtime-computed argument lists, placed after every other option and
+        before the rootfs. See `rtArray`.
+      '';
+    };
+
     extraArgs = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -272,6 +362,8 @@ in
   inherit
     rt
     isRt
+    rtArray
+    isRtArray
     rtWrap
     runOptions
     mountModel

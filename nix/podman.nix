@@ -28,6 +28,8 @@ let
   inherit (model)
     rt
     isRt
+    rtArray
+    isRtArray
     rtWrap
     runOptions
     mountModel
@@ -57,6 +59,16 @@ let
         "--publish"
         "${toString (if p.hostPort != null then p.hostPort else p.port)}:${toString p.port}/${p.protocol}"
       ]) n.publish;
+
+  renderUserns =
+    u:
+    if u.uid == null && u.gid == null then
+      u.mode
+    else
+      "${u.mode}:"
+      + lib.concatStringsSep "," (
+        optionals (u.uid != null) [ "uid=${toString u.uid}" ] ++ optionals (u.gid != null) [ "gid=${toString u.gid}" ]
+      );
 
   # Error messages need a printable name even when it is a runtime value.
   dispName = c: if isRt c.name then "$" + c.name.__rt else c.name;
@@ -113,6 +125,7 @@ let
     ++ optionals c.remove [ "--rm" ]
     ++ optionals c.replace [ "--replace" ]
     ++ optionals c.detach [ "-d" ]
+    ++ optionals c.interactive [ "-i" ]
     ++ [
       "--name"
       c.name
@@ -124,6 +137,17 @@ let
     ++ optionals (c.user != null) [
       "--user"
       "${toString c.user.uid}:${toString c.user.gid}"
+    ]
+    ++ optionals (c.userns != null) [
+      "--userns=${renderUserns c.userns}"
+    ]
+    ++ lib.concatMap (g: [
+      "--group-add"
+      g
+    ]) c.groups
+    ++ optionals (c.workdir != null) [
+      "--workdir"
+      c.workdir
     ]
     ++ optionals c.readOnly [ "--read-only" ]
     ++ map (x: "--cap-drop=${x}") c.capabilities.drop
@@ -149,7 +173,12 @@ let
         "${k}=${v}"
       ]) c.env
     )
+    ++ lib.concatMap (n: [
+      "--env"
+      n
+    ]) c.passEnv
     ++ c.extraArgs
+    ++ c.splice
     ++ [ "--rootfs" ]
     ++ [
       (
@@ -171,7 +200,9 @@ let
   # with any literal text around it escaped for that context.
   renderItem =
     i:
-    if isRt i then
+    if isRtArray i then
+      ''"''${'' + i.__rt + ''[@]}"''
+    else if isRt i then
       ''"'' + escapeInDq (i.prefix or "") + "$" + i.__rt + escapeInDq (i.suffix or "") + ''"''
     else
       lib.escapeShellArg i;
@@ -182,6 +213,9 @@ in
     renderRun
     eval
     rt
+    rtArray
+    isRt
+    isRtArray
     rtWrap
     ;
   renderRunShell = bin: spec: lib.concatMapStringsSep " " renderItem (renderRun bin spec);
