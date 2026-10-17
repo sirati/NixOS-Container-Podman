@@ -129,12 +129,21 @@ check_err "a windowed entry refuses to start without a compositor" "no Wayland c
 
 # ------------------------------------------------- the holder's lifetime
 
+# The app's containers are in a podman storage of their own (see
+# `privateStorage`); `pm` is podman looking at that one.
+appstore="$XDG_RUNTIME_DIR/apptest-probe-podman"
+printf '[engine]\nlock_type = "file"\n' >"$SCRATCH/app-containers.conf"
+pm() {
+  CONTAINERS_CONF_OVERRIDE="$SCRATCH/app-containers.conf" \
+    podman --root "$appstore/root" --runroot "$appstore/run" --tmpdir "$appstore/tmp" --storage-driver vfs "$@"
+}
+
 # The servers above never get a client; end them, which ends their runners.
-podman rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true
+pm rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true
 holder_gone() {
   local _
   for _ in $(seq 40); do
-    podman container exists apptest-probe-net || return 0
+    pm container exists apptest-probe-net || return 0
     sleep 0.5
   done
   return 1
@@ -143,10 +152,14 @@ check "no holder is left once every entry has ended" holder_gone
 
 ( "$app/bin/bb" sleep 8 >/dev/null 2>&1 & )
 sleep 3
-check "the holder exists while an entry runs" podman container exists apptest-probe-net
+check "the holder exists while an entry runs" pm container exists apptest-probe-net
+default_storage_empty() { [ -z "$(podman ps -aq)" ]; }
+check "and the user's own podman does not list it" default_storage_empty
+lock_files() { ls "$appstore/tmp/locks" | grep -q .; }
+check "the app's containers lock with files, not the user's shared-memory pool" lock_files
 check "a second entry runs on it" "$app/bin/bb" true
 check "and ending first does not take the holder away" \
-  podman container exists apptest-probe-net
+  pm container exists apptest-probe-net
 check "the last entry to end removes it" holder_gone
 
 check_out "the app's exit status is the command's" "status=5" \
@@ -166,23 +179,23 @@ done
 wait "$launcher" 2>/dev/null || true
 check "SIGTERM to the launcher stops the app" test "$ended" = true
 check "and leaves no container behind" holder_gone
-check_fails "not even the entry's own" bash -c \
-  '[ -n "$(podman ps -aq --filter name=apptest-probe-bb)" ]'
+no_entry_container() { [ -z "$(pm ps -aq --filter name=apptest-probe-bb)" ]; }
+check "not even the entry's own" no_entry_container
 
 # What an older launch or a reboot leaves: a holder whose root filesystem is
 # gone, which podman will not start.
 stale="$SCRATCH/stale-rootfs"
 mkdir -p "$stale"
-podman create --name apptest-probe-net --rootfs "$stale" /bin/true >/dev/null
+pm create --name apptest-probe-net --rootfs "$stale" /bin/true >/dev/null
 rmdir "$stale"
-check_fails "(a leftover holder like that cannot start)" podman start apptest-probe-net
+check_fails "(a leftover holder like that cannot start)" pm start apptest-probe-net
 check "a leftover holder with no root filesystem is replaced, not reused" "$app/bin/bb" true
 check "and the replacement is removed again" holder_gone
 
 # ---------------------------------------------------------------- cleanup
 
-podman rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true
+pm rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true
 check_fails "the holder is gone after cleanup" \
-  podman container exists apptest-probe-net
+  pm container exists apptest-probe-net
 
 finish

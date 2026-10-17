@@ -88,6 +88,31 @@ window closes, and a reboot or logout leaves no container behind.
   and SIGQUIT) on to it. An entry with no holder and no D-Bus proxy still replaces
   the runner with podman.
 
+## A podman storage of its own
+
+An app's containers are not in the user's default podman storage. They live in
+`$XDG_RUNTIME_DIR/<prefix>-<name>-podman`, which is tmpfs, with `vfs` (the
+containers run from a root filesystem in the Nix store and have no image layers)
+and file locks. Every podman call of the app carries those options (the plan's
+`[podman]` section), so `podman ps` does not list the app's containers; ask with
+the same `--root`, `--runroot`, `--tmpdir` and `--storage-driver vfs`.
+
+The reason is locking. podman keeps container locks in one shared-memory pool per
+user, `/dev/shm/libpod_rootless_lock_<uid>`, and every storage the user has
+shares it: their own containers, a `nixct` session, each app. Storages do not
+know about each other's locks. When one refreshes after a login, its containers
+ask for the lock ids they had, and one that another storage already holds is
+refused (`acquiring lock 0 for container …: file exists`). A podman call that
+waits on a lock nobody will release hangs without an error, which is how an app
+ends up unable to start. A storage with file locks does not touch the pool.
+
+`privateStorage = false` puts the app's containers in the user's default storage
+again.
+
+A podman call that prepares or removes the holder gets 30 seconds, and a launch
+waits up to 75 seconds for another launch of the same app that is doing the same.
+After that the runner says which call stalled and fails, instead of hanging.
+
 ## Per-user plans
 
 Paths inside are the host's own, so the plan is rendered for each user ahead of

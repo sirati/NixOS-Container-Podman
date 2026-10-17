@@ -27,6 +27,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +56,10 @@ struct Plan {
     ensure_dirs: Vec<(u32, String)>,
     providers: BTreeMap<String, Vec<Rule>>,
     dbus: Option<Dbus>,
+    /// Options for every podman call, before its subcommand, and its
+    /// environment; templates until `resolve_podman` fills them in.
+    podman_args: Vec<String>,
+    podman_env: Vec<(String, String)>,
     holder_argv: Vec<Item>,
     run_argv: Vec<Item>,
 }
@@ -81,6 +86,7 @@ enum Section {
     EnsureDir,
     Provider,
     DbusSection,
+    PodmanSection,
     Holder,
     Run,
 }
@@ -97,6 +103,8 @@ enum Section {
 ///   [dbus]              proxy / upstream / socket TAB value, arg TAB option
 ///                       -- a filtered session bus for the app's lifetime; the
 ///                       socket is `{dbus_socket}` to the providers
+///   [podman]            arg TAB option -- a global option of every podman call
+///                       (templates), env TAB name TAB value -- its environment
 ///   [holder] [run]      s TAB text | r TAB var TAB prefix TAB suffix | a TAB provider
 fn parse_plan(text: &str) -> Result<Plan, String> {
     let mut plan = Plan::default();
@@ -117,6 +125,7 @@ fn parse_plan(text: &str) -> Result<Plan, String> {
                 "require" => Section::Require,
                 "ensure-dir" => Section::EnsureDir,
                 "holder" => Section::Holder,
+                "podman" => Section::PodmanSection,
                 "dbus" => {
                     plan.dbus.get_or_insert_with(Dbus::default);
                     Section::DbusSection
@@ -196,6 +205,13 @@ fn parse_plan(text: &str) -> Result<Plan, String> {
                     _ => return Err(at("bad dbus line")),
                 }
             }
+            Section::PodmanSection => match fields.as_slice() {
+                ["arg", v] => plan.podman_args.push(v.to_string()),
+                ["env", name, v] if !name.is_empty() && !name.contains('=') && !name.contains('\0') => {
+                    plan.podman_env.push((name.to_string(), v.to_string()))
+                }
+                _ => return Err(at("bad podman line")),
+            },
             Section::Holder | Section::Run => {
                 let item = match fields.as_slice() {
                     ["s", text] => Item::Lit(text.to_string()),
@@ -450,22 +466,85 @@ fn with_wrappers(path: &str) -> String {
     if path.is_empty() { "/run/wrappers/bin".to_string() } else { format!("/run/wrappers/bin:{path}") }
 }
 
+/// Fill in the templates of the `[podman]` section, now that the launch's
+/// values are known.
+fn resolve_podman(plan: &mut Plan, vars: &Vars) -> Result<(), String> {
+    for arg in &mut plan.podman_args {
+        *arg = expand(arg, vars)?;
+    }
+    for (_, value) in &mut plan.podman_env {
+        *value = expand(value, vars)?;
+    }
+    Ok(())
+}
+
 fn podman_command(plan: &Plan) -> Command {
     let mut command = Command::new(&plan.podman);
     command.env("PATH", with_wrappers(&env::var("PATH").unwrap_or_default()));
+    command.envs(plan.podman_env.iter().map(|(k, v)| (k, v)));
+    command.args(&plan.podman_args);
     command
 }
 
-/// Runs podman for its exit status; `stderr` is where its complaints go.
+/// How long podman gets for the calls that prepare or take down the holder.
+/// They take a second at most; one that takes much longer is stuck behind a
+/// lock some other podman process holds, and waiting longer only piles up
+/// another stuck process with every launch the user retries.
+const MANAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a launch waits for another launch of the same app that is busy
+/// preparing the holder: long enough for that one to hit its own timeouts.
+const GUARD_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Run `command` to its end, or give up on it after `limit`: `None` means it
+/// was stopped for taking too long.
+fn status_within(command: &mut Command, limit: Duration) -> Result<Option<std::process::ExitStatus>, String> {
+    let mut child = command.spawn().map_err(|e| format!("cannot run {}: {e}", command.get_program().to_string_lossy()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("cannot wait for {}: {e}", command.get_program().to_string_lossy())),
+        }
+    }
+}
+
+/// Take an exclusive lock on `file`, waiting at most `limit` for whoever holds it.
+fn lock_within(file: &File, limit: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if started.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            Err(TryLockError::WouldBlock) => return Err(format!("still locked after {}s", limit.as_secs())),
+            Err(TryLockError::Error(e)) => return Err(e.to_string()),
+        }
+    }
+}
+
+fn stalled(what: &str, limit: Duration) -> String {
+    format!(
+        "podman did not finish `{what}` within {}s. A podman process left by an earlier launch may still hold this app's lock; \
+         `ps -u $USER -o pid,etime,args | grep podman` shows it.",
+        limit.as_secs()
+    )
+}
+
+/// Runs podman for its exit status, for at most `MANAGE_TIMEOUT`; `stderr` is
+/// where its complaints go.
 fn podman_with(plan: &Plan, args: &[&str], stderr: Stdio) -> Result<bool, String> {
-    podman_command(plan)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .status()
-        .map(|s| s.success())
-        .map_err(|e| format!("cannot run {}: {e}", plan.podman))
+    let mut command = podman_command(plan);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
+    match status_within(&mut command, MANAGE_TIMEOUT)? {
+        Some(status) => Ok(status.success()),
+        None => Err(stalled(&args.join(" "), MANAGE_TIMEOUT)),
+    }
 }
 
 fn podman(plan: &Plan, args: &[&str]) -> Result<bool, String> {
@@ -483,13 +562,9 @@ fn podman_quiet(plan: &Plan, args: &[&str]) -> Result<bool, String> {
 fn start_holder(plan: &Plan, vars: &Vars, name: &str) -> Result<(), String> {
     if !podman_quiet(plan, &["container", "exists", name])? {
         let argv = resolve(&plan.holder_argv, plan, vars)?;
-        let created = podman_command(plan)
-            .args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| format!("cannot run {}: {e}", plan.podman))?;
+        let mut create = podman_command(plan);
+        create.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+        let created = status_within(&mut create, MANAGE_TIMEOUT)?.ok_or_else(|| stalled("run (the network holder)", MANAGE_TIMEOUT))?;
         if !created.success() && !podman_quiet(plan, &["container", "exists", name])? {
             return Err(format!("could not create network holder `{name}`"));
         }
@@ -521,7 +596,6 @@ fn lock_paths(holder: &str, vars: &Vars) -> Result<(String, String), String> {
 fn lock_error(path: &str, e: std::io::Error) -> String {
     format!("cannot lock {path}: {e}")
 }
-
 /// Take a claim on the app's holder, making the holder first if no entry is
 /// using one.
 ///
@@ -536,7 +610,7 @@ fn acquire_lease(plan: &Plan, vars: &Vars) -> Result<Option<Lease>, String> {
     let Some(name) = &plan.holder else { return Ok(None) };
     let (guard_path, lease_path) = lock_paths(name, vars)?;
     let guard = lock_file(&guard_path)?;
-    guard.lock().map_err(|e| lock_error(&guard_path, e))?;
+    lock_within(&guard, GUARD_TIMEOUT).map_err(|e| format!("another launch of this app is stuck preparing its network holder ({e}); `ps -u $USER -o pid,etime,args | grep podman` shows it"))?;
     let claim = lock_file(&lease_path)?;
     match claim.try_lock() {
         Ok(()) => {
@@ -562,7 +636,7 @@ fn release_lease(plan: &Plan, vars: &Vars, lease: Lease) {
     let Some(name) = &plan.holder else { return };
     let Ok((guard_path, lease_path)) = lock_paths(name, vars) else { return };
     let Ok(guard) = lock_file(&guard_path) else { return };
-    if guard.lock().is_err() {
+    if lock_within(&guard, GUARD_TIMEOUT).is_err() {
         return;
     }
     let Ok(probe) = lock_file(&lease_path) else { return };
@@ -709,7 +783,7 @@ fn run(plan_dir: &str, user_args: Vec<String>) -> Result<std::convert::Infallibl
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!("this app is not set up for uid {uid} (no {plan_path})")),
         Err(e) => return Err(format!("cannot read plan {plan_path}: {e}")),
     };
-    let plan = parse_plan(&text)?;
+    let mut plan = parse_plan(&text)?;
     let mut vars = host_vars(&plan)?;
     for (var, message) in &plan.require {
         if vars.get(var).map(String::is_empty).unwrap_or(true) {
@@ -719,6 +793,7 @@ fn run(plan_dir: &str, user_args: Vec<String>) -> Result<std::convert::Infallibl
     for (mode, template) in &plan.ensure_dirs {
         ensure_dir(*mode, &expand(template, &vars)?)?;
     }
+    resolve_podman(&mut plan, &vars)?;
     let lease = acquire_lease(&plan, &vars)?;
     let leased = lease.is_some();
     let outcome = launch(&plan, &mut vars, user_args, leased);
@@ -1144,6 +1219,64 @@ mod tests {
         let next = acquire_lease(&plan, &v).unwrap().unwrap();
         assert_eq!(calls(&dir, "run"), 2, "nobody holds the old claim, so the holder is made again");
         release_lease(&plan, &v, next);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_podman_call_carries_the_plans_global_options_and_environment() {
+        let dir = scratch("podman-section");
+        let fake = dir.join("podman");
+        fs::write(&fake, format!("#!/bin/sh\necho \"$* LOCK=$CONTAINERS_LOCK\" >> '{}/log'\n", dir.to_string_lossy())).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let text = format!(
+            "plan 1\n[meta]\npodman\t{}\n[podman]\narg\t--root\narg\t{{xdg_runtime_dir}}/p/root\nenv\tCONTAINERS_LOCK\t{{xdg_runtime_dir}}/p.conf\n[run]\ns\tx\n",
+            fake.to_string_lossy()
+        );
+        let mut plan = parse_plan(&text).unwrap();
+        assert_eq!(plan.podman_args, vec!["--root", "{xdg_runtime_dir}/p/root"]);
+        assert_eq!(plan.podman_env, vec![("CONTAINERS_LOCK".to_string(), "{xdg_runtime_dir}/p.conf".to_string())]);
+        resolve_podman(&mut plan, &state(&dir)).unwrap();
+        assert!(podman_quiet(&plan, &["container", "exists", "demo-net"]).unwrap());
+        let log = fs::read_to_string(dir.join("log")).unwrap();
+        let d = dir.to_string_lossy();
+        assert_eq!(log.trim(), format!("--root {d}/p/root container exists demo-net LOCK={d}/p.conf"), "options come before the subcommand");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_without_a_podman_section_calls_podman_as_before() {
+        let plan = parse_plan("plan 1\n[meta]\npodman\t/p\n[run]\ns\tx\n").unwrap();
+        assert!(plan.podman_args.is_empty() && plan.podman_env.is_empty());
+        let command = podman_command(&plan);
+        assert_eq!(command.get_args().count(), 0);
+        assert!(parse_plan("plan 1\n[meta]\npodman\t/p\n[podman]\nenv\tA=B\tv\n[run]\ns\tx\n").is_err(), "a name with `=`");
+        assert!(parse_plan("plan 1\n[meta]\npodman\t/p\n[podman]\nnonsense\n[run]\ns\tx\n").is_err());
+    }
+
+    #[test]
+    fn a_podman_call_that_does_not_come_back_is_stopped() {
+        let started = Instant::now();
+        let stopped = status_within(Command::new("/bin/sh").args(["-c", "sleep 30"]), Duration::from_millis(200)).unwrap();
+        assert!(stopped.is_none(), "reported as stopped");
+        assert!(started.elapsed() < Duration::from_secs(10), "and it was not waited for");
+        let quick = status_within(Command::new("/bin/sh").args(["-c", "exit 4"]), Duration::from_secs(30)).unwrap().unwrap();
+        assert_eq!(quick.code(), Some(4), "a call that finishes keeps its status");
+        assert!(status_within(&mut Command::new("/nonexistent/podman"), Duration::from_secs(1)).is_err());
+        assert!(stalled("start demo-net", MANAGE_TIMEOUT).contains("start demo-net"));
+    }
+
+    #[test]
+    fn waiting_for_another_launch_ends() {
+        let dir = scratch("lockwait");
+        let path = dir.join("guard").to_string_lossy().into_owned();
+        let holder = lock_file(&path).unwrap();
+        holder.lock().unwrap();
+        let waiter = lock_file(&path).unwrap();
+        let started = Instant::now();
+        assert!(lock_within(&waiter, Duration::from_millis(150)).unwrap_err().contains("still locked"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(holder);
+        assert!(lock_within(&waiter, Duration::from_millis(150)).is_ok(), "free once the other launch is done");
         fs::remove_dir_all(dir).unwrap();
     }
 

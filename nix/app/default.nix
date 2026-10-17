@@ -150,6 +150,12 @@ let
       audio ? false,
       dbus ? true, # a filtered session bus: portals, notifications, tray
       appId ? "app.${prefix}.${name}", # the D-Bus name the app may own
+      # The app's containers live in a podman storage of their own, under the
+      # user's runtime directory, with file locks. podman keeps container locks
+      # in one shared-memory pool per user, shared by every storage the user
+      # has (their own containers, a nixct session); one stuck podman call in
+      # that pool stops every other. `false` uses the user's default storage.
+      privateStorage ? true,
       env ? { },
       passEnv ? defaultPassEnv,
       entries,
@@ -162,6 +168,32 @@ let
     let
       holderName = "${prefix}-${name}-net";
       podmanBin = "${podman}/bin/podman";
+
+      # Nothing in the private storage outlives the user's runtime directory,
+      # so a reboot or a last logout leaves no holder behind to go stale. The
+      # containers run from a root filesystem in the Nix store and have no
+      # image layers, which is why `vfs` costs nothing here.
+      storageBase = "{xdg_runtime_dir}/${prefix}-${name}-podman";
+      storageDirs = [
+        "${storageBase}/root"
+        "${storageBase}/run"
+        "${storageBase}/tmp"
+      ];
+      podmanConf = pkgs.writeText "${prefix}-${name}-containers.conf" ''
+        [engine]
+        lock_type = "file"
+      '';
+      podmanArgs = lib.optionals privateStorage [
+        "--root"
+        "${storageBase}/root"
+        "--runroot"
+        "${storageBase}/run"
+        "--tmpdir"
+        "${storageBase}/tmp"
+        "--storage-driver"
+        "vfs"
+      ];
+      podmanEnv = lib.optionalAttrs privateStorage { CONTAINERS_CONF_OVERRIDE = "${podmanConf}"; };
 
       planFor =
         user: entryName: entry0:
@@ -428,8 +460,14 @@ let
                 template = "${stateDir}/${d.keep}";
               }) stateDirs
             )
+            ++ lib.optionals privateStorage (
+              map (template: {
+                mode = "700";
+                inherit template;
+              }) storageDirs
+            )
             ++ e.ensureDirs;
-          inherit providers;
+          inherit providers podmanArgs podmanEnv;
           dbus = if !(e.display && dbus) then null else {
             proxy = "${pkgs.xdg-dbus-proxy}/bin/xdg-dbus-proxy";
             upstream = "{xdg_runtime_dir}/bus";
@@ -477,7 +515,13 @@ let
           platforms = lib.platforms.linux;
         };
         passthru = {
-          inherit package planDirs holderName;
+          inherit
+            package
+            planDirs
+            holderName
+            podmanArgs
+            podmanEnv
+            ;
         };
       }
       ''

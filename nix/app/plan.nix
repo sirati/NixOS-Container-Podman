@@ -65,6 +65,8 @@ in
       ensureDirs ? [ ],
       providers ? { },
       dbus ? null, # { proxy; upstream; socket; args; }
+      podmanArgs ? [ ], # global options, before the subcommand of every podman call
+      podmanEnv ? { }, # environment for every podman call
       holderArgv ? [ ],
       runArgv,
     }:
@@ -143,6 +145,25 @@ in
               (field a)
             ]
           ) dbus.args
+        )
+      )
+      ++ lib.optionals (podmanArgs != [ ] || podmanEnv != { }) (
+        section "podman" (
+          map (
+            a:
+            tab [
+              "arg"
+              (field a)
+            ]
+          ) podmanArgs
+          ++ lib.mapAttrsToList (
+            n: v:
+            tab [
+              "env"
+              (field n)
+              (field v)
+            ]
+          ) podmanEnv
         )
       )
       ++ section "holder" (map item holderArgv)
