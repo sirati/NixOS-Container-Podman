@@ -11,14 +11,22 @@
 //   app-runner PLANDIR [ARGS...]  PLANDIR holds one `<uid>.plan` per user; ARGS
 //                                 go to the sandboxed command unchanged
 //
+// The entries of one app share a network namespace owned by a holder
+// container. The holder lives exactly as long as some entry does: each entry
+// keeps a lease on it while it runs and the last one to end removes it (see
+// acquire_lease). An entry that needs no clean-up afterwards, because it has
+// no holder and no D-Bus proxy, still replaces this process with podman.
+//
 // Plan format: see parse_plan. Standard library only.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::IsTerminal;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::{env, fs};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,7 +146,9 @@ fn parse_plan(text: &str) -> Result<Plan, String> {
             Section::Meta => match fields.as_slice() {
                 ["name", v] => plan.name = v.to_string(),
                 ["podman", v] => plan.podman = v.to_string(),
-                ["holder", v] => plan.holder = Some(v.to_string()),
+                // The name becomes part of two file names in the runtime directory.
+                ["holder", v] if !v.is_empty() && !v.contains('/') && !v.contains('\0') => plan.holder = Some(v.to_string()),
+                ["holder", _] => return Err(at("a holder name is not empty and has no `/`")),
                 ["tty", "auto"] => plan.tty_auto = true,
                 ["tty", "never"] => plan.tty_auto = false,
                 _ => return Err(at("bad meta line")),
@@ -212,6 +222,9 @@ fn parse_plan(text: &str) -> Result<Plan, String> {
     }
     if plan.run_argv.is_empty() {
         return Err("plan has an empty [run] section".into());
+    }
+    if plan.holder.is_some() && plan.holder_argv.len() < 2 {
+        return Err("plan names a holder but has no [holder] command to create it".into());
     }
     Ok(plan)
 }
@@ -443,23 +456,32 @@ fn podman_command(plan: &Plan) -> Command {
     command
 }
 
-fn podman(plan: &Plan, args: &[&str]) -> Result<bool, String> {
+/// Runs podman for its exit status; `stderr` is where its complaints go.
+fn podman_with(plan: &Plan, args: &[&str], stderr: Stdio) -> Result<bool, String> {
     podman_command(plan)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .status()
         .map(|s| s.success())
         .map_err(|e| format!("cannot run {}: {e}", plan.podman))
 }
 
+fn podman(plan: &Plan, args: &[&str]) -> Result<bool, String> {
+    podman_with(plan, args, Stdio::inherit())
+}
+
+/// For calls whose failure is an answer and not a problem.
+fn podman_quiet(plan: &Plan, args: &[&str]) -> Result<bool, String> {
+    podman_with(plan, args, Stdio::null())
+}
+
 /// The holder owns the network namespace the app and its MCP server share.
-/// Created on first use, started again if it was stopped; losing a creation
-/// race to another launch is fine as long as the container exists after.
-fn ensure_holder(plan: &Plan, vars: &Vars) -> Result<(), String> {
-    let Some(name) = &plan.holder else { return Ok(()) };
-    if !podman(plan, &["container", "exists", name])? {
+/// Created if it is missing, started if it is stopped; losing a creation race
+/// to another launch is fine as long as the container exists after.
+fn start_holder(plan: &Plan, vars: &Vars, name: &str) -> Result<(), String> {
+    if !podman_quiet(plan, &["container", "exists", name])? {
         let argv = resolve(&plan.holder_argv, plan, vars)?;
         let created = podman_command(plan)
             .args(&argv[1..])
@@ -468,7 +490,7 @@ fn ensure_holder(plan: &Plan, vars: &Vars) -> Result<(), String> {
             .stderr(Stdio::inherit())
             .status()
             .map_err(|e| format!("cannot run {}: {e}", plan.podman))?;
-        if !created.success() && !podman(plan, &["container", "exists", name])? {
+        if !created.success() && !podman_quiet(plan, &["container", "exists", name])? {
             return Err(format!("could not create network holder `{name}`"));
         }
     }
@@ -476,6 +498,145 @@ fn ensure_holder(plan: &Plan, vars: &Vars) -> Result<(), String> {
         return Err(format!("could not start network holder `{name}`"));
     }
     Ok(())
+}
+
+/// An entry's claim on the holder, for as long as it runs. It is a shared
+/// `flock` on a file in the runtime directory, so it ends with the process
+/// however that happens, a `kill -9` included, and no bookkeeping can go stale.
+struct Lease {
+    _claim: File,
+}
+
+fn lock_file(path: &str) -> Result<File, String> {
+    OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path).map_err(|e| format!("cannot open {path}: {e}"))
+}
+
+/// The guard serialises the moments the holder is made or removed; the lease
+/// file carries the claims themselves.
+fn lock_paths(holder: &str, vars: &Vars) -> Result<(String, String), String> {
+    let runtime = vars.get("xdg_runtime_dir").ok_or("no runtime directory to keep the holder's locks in")?;
+    Ok((format!("{runtime}/{holder}.guard"), format!("{runtime}/{holder}.lease")))
+}
+
+fn lock_error(path: &str, e: std::io::Error) -> String {
+    format!("cannot lock {path}: {e}")
+}
+
+/// Take a claim on the app's holder, making the holder first if no entry is
+/// using one.
+///
+/// With no claim anywhere, a holder that exists is a leftover: from a reboot,
+/// from a runner that was killed, or from before the app was updated. The
+/// last of these is the one that matters, because a holder made from an older
+/// root filesystem cannot start once that store path is collected. So it is
+/// never reused; it is removed and made again from this launch's plan. If it
+/// cannot be removed, because a container that still runs joins it, that one
+/// is the holder the entry needs and it is used as it is.
+fn acquire_lease(plan: &Plan, vars: &Vars) -> Result<Option<Lease>, String> {
+    let Some(name) = &plan.holder else { return Ok(None) };
+    let (guard_path, lease_path) = lock_paths(name, vars)?;
+    let guard = lock_file(&guard_path)?;
+    guard.lock().map_err(|e| lock_error(&guard_path, e))?;
+    let claim = lock_file(&lease_path)?;
+    match claim.try_lock() {
+        Ok(()) => {
+            if podman_quiet(plan, &["container", "exists", name])? {
+                let _ = podman_quiet(plan, &["rm", "-f", "-t", "0", name]);
+            }
+        }
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(e)) => return Err(lock_error(&lease_path, e)),
+    }
+    start_holder(plan, vars, name)?;
+    // Held in place of the exclusive lock above; the guard keeps anyone from
+    // slipping in between the two.
+    claim.lock_shared().map_err(|e| lock_error(&lease_path, e))?;
+    Ok(Some(Lease { _claim: claim }))
+}
+
+/// End a claim, and remove the holder when it was the last. A holder that
+/// cannot be removed, because a container still joins it, is left for the
+/// next launch to deal with.
+fn release_lease(plan: &Plan, vars: &Vars, lease: Lease) {
+    drop(lease);
+    let Some(name) = &plan.holder else { return };
+    let Ok((guard_path, lease_path)) = lock_paths(name, vars) else { return };
+    let Ok(guard) = lock_file(&guard_path) else { return };
+    if guard.lock().is_err() {
+        return;
+    }
+    let Ok(probe) = lock_file(&lease_path) else { return };
+    if probe.try_lock().is_ok() {
+        let _ = podman_quiet(plan, &["rm", "-f", "-t", "0", name]);
+    }
+}
+
+// What the app is told when it is asked to stop. The standard library has no
+// way to catch a signal; these are the C library's, which every Rust program
+// on Linux links already. The numbers are the same on every architecture that
+// NixOS runs on.
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn tcgetpgrp(fd: i32) -> i32;
+    fn getpgrp() -> i32;
+    fn __errno_location() -> *mut i32;
+}
+
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGQUIT: i32 = 3;
+const SIGTERM: i32 = 15;
+
+/// podman's pid while it runs, else 0; `EARLY` is a signal that arrived before.
+static CHILD: AtomicI32 = AtomicI32::new(0);
+static EARLY: AtomicI32 = AtomicI32::new(0);
+
+/// Whether podman has to be told. When a terminal sends Ctrl-C to its
+/// foreground group, podman is in that group and already has it; sending it
+/// again would make the app see two. Anything else, and a plain SIGTERM from
+/// whoever stops the app, reaches only this process.
+fn must_forward(sig: i32) -> bool {
+    sig == SIGTERM || unsafe { tcgetpgrp(0) != getpgrp() }
+}
+
+extern "C" fn relay(sig: i32) {
+    // Only async-signal-safe calls in here, and errno put back as it was.
+    unsafe {
+        let saved = *__errno_location();
+        let pid = CHILD.load(Ordering::SeqCst);
+        if pid <= 0 {
+            EARLY.store(sig, Ordering::SeqCst);
+        } else if must_forward(sig) {
+            kill(pid, sig);
+        }
+        *__errno_location() = saved;
+    }
+}
+
+/// How a process ended, as a shell reports it.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// Run `command` as a child and wait for it, passing on the signals that ask
+/// it to stop. This process has work to do after it ends, so it cannot hand
+/// itself over with exec; and a SIGTERM that reached only this process would
+/// otherwise leave podman, and the app, running.
+fn supervise(command: &mut Command) -> Result<i32, String> {
+    for sig in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
+        unsafe { signal(sig, relay as extern "C" fn(i32) as usize) };
+    }
+    let mut child = command.spawn().map_err(|e| format!("cannot run {}: {e}", command.get_program().to_string_lossy()))?;
+    let pid = child.id() as i32;
+    CHILD.store(pid, Ordering::SeqCst);
+    let early = EARLY.swap(0, Ordering::SeqCst);
+    if early != 0 && must_forward(early) {
+        unsafe { kill(pid, early) };
+    }
+    let status = child.wait().map_err(|e| format!("cannot wait for {}: {e}", command.get_program().to_string_lossy()));
+    CHILD.store(0, Ordering::SeqCst);
+    Ok(exit_code(status?))
 }
 
 /// The proxy for as long as this exists. Dropping it stops the proxy (its
@@ -558,22 +719,35 @@ fn run(plan_dir: &str, user_args: Vec<String>) -> Result<std::convert::Infallibl
     for (mode, template) in &plan.ensure_dirs {
         ensure_dir(*mode, &expand(template, &vars)?)?;
     }
-    ensure_holder(&plan, &vars)?;
-    let proxy = start_dbus_proxy(&plan, &mut vars)?;
-    let mut argv = resolve(&plan.run_argv, &plan, &vars)?;
+    let lease = acquire_lease(&plan, &vars)?;
+    let leased = lease.is_some();
+    let outcome = launch(&plan, &mut vars, user_args, leased);
+    if let Some(lease) = lease {
+        release_lease(&plan, &vars, lease);
+    }
+    std::process::exit(outcome?);
+}
+
+/// Start the entry and, unless nothing is left to clean up, stay until it ends.
+/// Returns the exit status the runner should end with.
+fn launch(plan: &Plan, vars: &mut Vars, user_args: Vec<String>, leased: bool) -> Result<i32, String> {
+    let proxy = start_dbus_proxy(plan, vars)?;
+    let mut argv = resolve(&plan.run_argv, plan, vars)?;
     if plan.tty_auto && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && argv.len() > 1 {
         argv.insert(2, "-t".into());
     }
     argv.extend(user_args);
-    let Some(guard) = proxy else {
-        let err = podman_command(&plan).args(&argv[1..]).exec();
+    let mut command = podman_command(plan);
+    command.args(&argv[1..]);
+    if proxy.is_none() && !leased {
+        let err = command.exec();
         return Err(format!("cannot exec {}: {err}", plan.podman));
-    };
-    // The proxy has to be cleaned up when the app ends, so podman is a child
-    // here and not a replacement of this process.
-    let status = podman_command(&plan).args(&argv[1..]).status().map_err(|e| format!("cannot run {}: {e}", plan.podman));
-    drop(guard);
-    std::process::exit(status?.code().unwrap_or(1));
+    }
+    // The proxy and the claim on the holder have to be ended when the app does,
+    // so podman is a child here and not a replacement of this process.
+    let code = supervise(&mut command);
+    drop(proxy);
+    code
 }
 
 fn main() {
@@ -851,6 +1025,165 @@ mod tests {
         assert_eq!(argv.last().map(String::as_str), Some("/app"));
         assert!(resolve(&[Item::Splice("nope".into())], &plan, &v).is_err());
         assert!(resolve(&[Item::Var { name: "nope".into(), prefix: String::new(), suffix: String::new() }], &plan, &v).is_err());
+    }
+
+    #[test]
+    fn a_holder_needs_a_safe_name_and_a_command() {
+        let with = |holder: &str, argv: &str| format!("plan 1\n[meta]\npodman\t/p\nholder\t{holder}\n[holder]\n{argv}[run]\ns\tx\n");
+        let command = "s\tpodman\ns\trun\n";
+        assert!(parse_plan(&with("demo-net", command)).is_ok());
+        assert!(parse_plan(&with("../escape", command)).is_err(), "a name that leaves the runtime directory");
+        assert!(parse_plan(&with("", command)).is_err());
+        assert!(parse_plan(&with("demo-net", "")).is_err(), "nothing to create it with");
+    }
+
+    /// A podman whose containers are marker files in `dir`, and whose calls are
+    /// written to `dir/log`: a holder exists while `dir/holder` does, `stale`
+    /// makes one that cannot start (as when its root filesystem is gone), and
+    /// `dependents` makes one that cannot be removed.
+    fn fake_podman(dir: &Path) -> Plan {
+        let fake = dir.join("podman");
+        let script = format!(
+            "#!/bin/sh\nd='{d}'\necho \"$*\" >> \"$d/log\"\ncase \"$1\" in\n\
+             container) [ -e \"$d/holder\" ] ;;\n\
+             rm) [ -e \"$d/dependents\" ] && exit 1; rm -f \"$d/holder\" \"$d/stale\" ;;\n\
+             start) [ -e \"$d/holder\" ] && [ ! -e \"$d/stale\" ] ;;\n\
+             run) : > \"$d/holder\" ;;\n\
+             esac\n",
+            d = dir.to_string_lossy()
+        );
+        fs::write(&fake, script).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let f = fake.to_string_lossy();
+        parse_plan(&format!("plan 1\n[meta]\nname\tdemo\npodman\t{f}\nholder\tdemo-net\n[holder]\ns\t{f}\ns\trun\ns\t-d\n[run]\ns\tx\n")).unwrap()
+    }
+
+    fn state(dir: &Path) -> Vars {
+        let mut v = vars();
+        v.insert("xdg_runtime_dir".into(), dir.to_string_lossy().into_owned());
+        v
+    }
+
+    fn calls(dir: &Path, verb: &str) -> usize {
+        fs::read_to_string(dir.join("log")).unwrap_or_default().lines().filter(|l| l.starts_with(verb)).count()
+    }
+
+    #[test]
+    fn the_holder_is_made_for_the_first_entry_and_removed_after_the_last() {
+        let dir = scratch("lease");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        let first = acquire_lease(&plan, &v).unwrap().expect("a plan with a holder leases it");
+        assert!(dir.join("holder").exists());
+        assert_eq!(calls(&dir, "run"), 1);
+        let second = acquire_lease(&plan, &v).unwrap().unwrap();
+        assert_eq!(calls(&dir, "run"), 1, "the second entry joins the holder that is there");
+        release_lease(&plan, &v, first);
+        assert!(dir.join("holder").exists(), "an entry is still running");
+        release_lease(&plan, &v, second);
+        assert!(!dir.join("holder").exists(), "nothing left to hold");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_entry_without_a_holder_takes_no_lease() {
+        let dir = scratch("nolease");
+        let plan = parse_plan("plan 1\n[meta]\npodman\t/p\n[run]\ns\tx\n").unwrap();
+        assert!(acquire_lease(&plan, &state(&dir)).unwrap().is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no lock files either");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_holder_is_replaced_when_nobody_uses_it() {
+        // The holder of an older root filesystem, which can no longer start.
+        let dir = scratch("stale");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        fs::write(dir.join("holder"), "").unwrap();
+        fs::write(dir.join("stale"), "").unwrap();
+        let lease = acquire_lease(&plan, &v).expect("the stale holder does not stop the launch").unwrap();
+        assert_eq!(calls(&dir, "rm"), 1);
+        assert_eq!(calls(&dir, "run"), 1, "made again from this launch's plan");
+        assert!(!dir.join("stale").exists());
+        release_lease(&plan, &v, lease);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_holder_still_in_use_is_not_replaced() {
+        let dir = scratch("busy");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        let first = acquire_lease(&plan, &v).unwrap().unwrap();
+        let second = acquire_lease(&plan, &v).unwrap().unwrap();
+        assert_eq!(calls(&dir, "rm"), 0, "an entry is running on it");
+        release_lease(&plan, &v, first);
+        release_lease(&plan, &v, second);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_cannot_be_removed_is_used_as_it_is() {
+        // A container whose runner was killed still joins it.
+        let dir = scratch("dependents");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        fs::write(dir.join("holder"), "").unwrap();
+        fs::write(dir.join("dependents"), "").unwrap();
+        let lease = acquire_lease(&plan, &v).expect("a refused removal is not an error").unwrap();
+        assert_eq!(calls(&dir, "run"), 0, "the holder that is there is the one to use");
+        assert_eq!(calls(&dir, "start"), 1);
+        release_lease(&plan, &v, lease);
+        assert!(dir.join("holder").exists(), "and it stays, with the container that needs it");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_runner_that_dies_leaves_no_claim_behind() {
+        let dir = scratch("crash");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        let lost = acquire_lease(&plan, &v).unwrap().unwrap();
+        drop(lost); // what the kernel does to a killed process's locks
+        let next = acquire_lease(&plan, &v).unwrap().unwrap();
+        assert_eq!(calls(&dir, "run"), 2, "nobody holds the old claim, so the holder is made again");
+        release_lease(&plan, &v, next);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `supervise` keeps the running child's pid in a static, as the signal
+    /// handler has nowhere else to look; tests that start one take turns.
+    static ONE_SUPERVISOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_supervised_command_gives_its_exit_status() {
+        let _turn = ONE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner());
+        let sh = |script: &str| supervise(Command::new("/bin/sh").args(["-c", script]));
+        assert_eq!(sh("exit 0").unwrap(), 0);
+        assert_eq!(sh("exit 3").unwrap(), 3);
+        assert_eq!(sh("kill -9 $$").unwrap(), 128 + 9, "as a shell reports a command that was killed");
+        assert!(supervise(&mut Command::new("/nonexistent/podman")).is_err());
+    }
+
+    #[test]
+    fn sigterm_to_the_runner_reaches_the_app() {
+        let _turn = ONE_SUPERVISOR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("term");
+        let ready = dir.join("ready");
+        let script = format!("trap 'exit 9' TERM; : > '{}'; while :; do sleep 0.05; done", ready.to_string_lossy());
+        let signaller = std::thread::spawn({
+            let ready = ready.clone();
+            move || {
+                for _ in 0..200 {
+                    if ready.exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                unsafe { kill(std::process::id() as i32, SIGTERM) };
+            }
+        });
+        let code = supervise(Command::new("/bin/sh").args(["-c", &script])).unwrap();
+        signaller.join().unwrap();
+        assert_eq!(code, 9, "the command saw the signal this process was sent");
+        assert!(must_forward(SIGTERM), "a terminate request is always passed on");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -15,7 +15,9 @@
 #
 # Every entry of one app joins one network namespace, held by a small pause
 # container, so the app and anything that talks to it over loopback (an MCP
-# server, a CLI) share a private `127.0.0.1` the host cannot reach.
+# server, a CLI) share a private `127.0.0.1` the host cannot reach. The pause
+# container lives while some entry runs: the runner keeps a lease on it and the
+# last entry to end removes it (nix/app/runner.rs, acquire_lease).
 #
 #   mkApp {
 #     name = "photocraft";

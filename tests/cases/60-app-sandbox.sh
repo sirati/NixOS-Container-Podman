@@ -127,6 +127,58 @@ check_fails "an entry with its own namespace does not see it" \
 check_err "a windowed entry refuses to start without a compositor" "no Wayland compositor" \
   env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" "$app/bin/bb-win" true
 
+# ------------------------------------------------- the holder's lifetime
+
+# The servers above never get a client; end them, which ends their runners.
+podman rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true
+holder_gone() {
+  local _
+  for _ in $(seq 40); do
+    podman container exists apptest-probe-net || return 0
+    sleep 0.5
+  done
+  return 1
+}
+check "no holder is left once every entry has ended" holder_gone
+
+( "$app/bin/bb" sleep 8 >/dev/null 2>&1 & )
+sleep 3
+check "the holder exists while an entry runs" podman container exists apptest-probe-net
+check "a second entry runs on it" "$app/bin/bb" true
+check "and ending first does not take the holder away" \
+  podman container exists apptest-probe-net
+check "the last entry to end removes it" holder_gone
+
+check_out "the app's exit status is the command's" "status=5" \
+  bash -c "\"$app/bin/bb\" sh -c 'exit 5'; echo status=\$?"
+
+# SIGTERM sent to the launcher alone has to stop the app; the launcher stays
+# around to clean up, so it can no longer rely on being podman itself.
+"$app/bin/bb" sleep 60 >/dev/null 2>&1 &
+launcher=$!
+sleep 3
+kill -TERM "$launcher"
+ended=false
+for _ in $(seq 20); do
+  kill -0 "$launcher" 2>/dev/null || { ended=true; break; }
+  sleep 0.5
+done
+wait "$launcher" 2>/dev/null || true
+check "SIGTERM to the launcher stops the app" test "$ended" = true
+check "and leaves no container behind" holder_gone
+check_fails "not even the entry's own" bash -c \
+  '[ -n "$(podman ps -aq --filter name=apptest-probe-bb)" ]'
+
+# What an older launch or a reboot leaves: a holder whose root filesystem is
+# gone, which podman will not start.
+stale="$SCRATCH/stale-rootfs"
+mkdir -p "$stale"
+podman create --name apptest-probe-net --rootfs "$stale" /bin/true >/dev/null
+rmdir "$stale"
+check_fails "(a leftover holder like that cannot start)" podman start apptest-probe-net
+check "a leftover holder with no root filesystem is replaced, not reused" "$app/bin/bb" true
+check "and the replacement is removed again" holder_gone
+
 # ---------------------------------------------------------------- cleanup
 
 podman rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true

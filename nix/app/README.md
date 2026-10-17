@@ -71,6 +71,23 @@ program cannot reach it; the app's own CLI and MCP-server entries can, because
 they are in the same namespace. An entry with `joinNetwork = false` gets a
 namespace with nothing in it.
 
+The holder exists only while the app is running. Each entry takes a shared
+`flock` on `$XDG_RUNTIME_DIR/<holder>.lease` for as long as it runs, and the
+last entry to end removes the holder. Nothing is left running when the last
+window closes, and a reboot or logout leaves no container behind.
+
+- A launch that finds no entry running treats any holder that exists as a
+  leftover and makes a new one from its own plan. A holder from before an update
+  points at the old root filesystem and could not be started once that store path
+  was collected; it is never reused.
+- A runner that is killed loses its claim with the process, so there is nothing
+  to go stale. A holder that cannot be removed because a container still joins it
+  (an app whose launcher died) is used as it is.
+- The runner stays as the parent of podman while it holds a claim, so it can
+  clean up afterwards, and passes SIGTERM (and, outside a terminal, SIGHUP, SIGINT
+  and SIGQUIT) on to it. An entry with no holder and no D-Bus proxy still replaces
+  the runner with podman.
+
 ## Per-user plans
 
 Paths inside are the host's own, so the plan is rendered for each user ahead of
