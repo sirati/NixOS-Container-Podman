@@ -59,6 +59,7 @@ in
       name,
       podman,
       holder ? null,
+      holderProcess ? null, # the name of the process that is the holder, to tell it from a pid reused since
       tty ? "never",
       vars ? [ ],
       require ? [ ],
@@ -90,6 +91,10 @@ in
         ++ lib.optional (holder != null) (tab [
           "holder"
           (field holder)
+        ])
+        ++ lib.optional (holder != null && holderProcess != null) (tab [
+          "holder-process"
+          (field holderProcess)
         ])
       )
       ++ section "vars" (

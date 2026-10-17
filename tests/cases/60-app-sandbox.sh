@@ -192,6 +192,27 @@ check_fails "(a leftover holder like that cannot start)" pm start apptest-probe-
 check "a leftover holder with no root filesystem is replaced, not reused" "$app/bin/bb" true
 check "and the replacement is removed again" holder_gone
 
+# A holder whose process was killed (a logout, a crash) while podman still has
+# it down as running, with an app container that had joined it and a launcher
+# that is gone: the state a laptop was found in. Joining it fails on
+# `open /proc/<pid>/ns/net`, and the container that depends on it keeps it from
+# being removed the ordinary way.
+"$app/bin/bb" sleep 300 >/dev/null 2>&1 &
+orphan=$!
+sleep 3
+hpid=$(pm inspect --format '{{.State.Pid}}' apptest-probe-net)
+hconmon=$(pm inspect --format '{{.State.ConmonPid}}' apptest-probe-net)
+kill -9 "$orphan"
+kill -9 "$hconmon" "$hpid"
+sleep 1
+process_gone() { ! [ -d "/proc/$1" ]; }
+check "(the holder's process is gone, whatever podman thinks)" process_gone "$hpid"
+check "(and an app container still depends on it)" bash -c \
+  "[ -n \"\$(CONTAINERS_CONF_OVERRIDE='$SCRATCH/app-containers.conf' podman --root '$appstore/root' --runroot '$appstore/run' --tmpdir '$appstore/tmp' --storage-driver vfs ps -aq --filter name=apptest-probe-bb)\" ]"
+check "a launch after the holder died still works" "$app/bin/bb" true
+check "and the dead holder is gone afterwards" holder_gone
+check "with the container that depended on it" no_entry_container
+
 # ---------------------------------------------------------------- cleanup
 
 pm rm -f -t0 --depend apptest-probe-net >/dev/null 2>&1 || true

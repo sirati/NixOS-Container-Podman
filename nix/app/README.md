@@ -76,13 +76,20 @@ The holder exists only while the app is running. Each entry takes a shared
 last entry to end removes the holder. Nothing is left running when the last
 window closes, and a reboot or logout leaves no container behind.
 
-- A launch that finds no entry running treats any holder that exists as a
-  leftover and makes a new one from its own plan. A holder from before an update
-  points at the old root filesystem and could not be started once that store path
-  was collected; it is never reused.
+- A launch that finds no entry running looks at a holder that exists and asks
+  whether it can be joined: podman has it running *and* the process it names
+  (`catatonit`) is there. podman's record outlives that process when something
+  kills it (a logout, a crash, the OOM killer), and joining the holder then fails
+  on `open /proc/<pid>/ns/net` while `podman ps` says it is up. A holder that
+  cannot be joined is removed together with every container that had joined it,
+  which are leftovers too and would otherwise keep it from being removed, and is
+  made again from the launch's own plan. A holder that is alive is used as it is.
+  One from before an update points at the old root filesystem and could not be
+  started once that store path was collected; it is not running, so it is replaced.
 - A runner that is killed loses its claim with the process, so there is nothing
-  to go stale. A holder that cannot be removed because a container still joins it
-  (an app whose launcher died) is used as it is.
+  to go stale.
+- If the holder is still not running after that, the launch stops with an error
+  saying so, instead of starting an app that cannot reach its own loopback.
 - The runner stays as the parent of podman while it holds a claim, so it can
   clean up afterwards, and passes SIGTERM (and, outside a terminal, SIGHUP, SIGINT
   and SIGQUIT) on to it. An entry with no holder and no D-Bus proxy still replaces

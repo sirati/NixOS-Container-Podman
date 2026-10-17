@@ -50,6 +50,9 @@ struct Plan {
     name: String,
     podman: String,
     holder: Option<String>,
+    /// The name (`comm`) of the process that keeps the holder alive, to tell it
+    /// from another process that was given its pid since.
+    holder_process: Option<String>,
     tty_auto: bool,
     require: Vec<(String, String)>,
     derived: Vec<(String, String)>,
@@ -94,7 +97,7 @@ enum Section {
 /// The plan is line oriented, fields separated by TAB, `#` starts a comment.
 ///
 ///   plan 1
-///   [meta]              name / podman / holder / tty  (key TAB value)
+///   [meta]              name / podman / holder / holder-process / tty  (key TAB value)
 ///   [vars]              name TAB template -- derived from the host's, in order
 ///   [require]           var TAB message   -- the runtime variable must be non-empty
 ///   [ensure-dir]        octal-mode TAB template
@@ -158,6 +161,8 @@ fn parse_plan(text: &str) -> Result<Plan, String> {
                 // The name becomes part of two file names in the runtime directory.
                 ["holder", v] if !v.is_empty() && !v.contains('/') && !v.contains('\0') => plan.holder = Some(v.to_string()),
                 ["holder", _] => return Err(at("a holder name is not empty and has no `/`")),
+                ["holder-process", v] if !v.is_empty() && !v.contains('/') && v.len() <= 15 => plan.holder_process = Some(v.to_string()),
+                ["holder-process", _] => return Err(at("a holder process is a process name: not empty, no `/`, at most 15 bytes")),
                 ["tty", "auto"] => plan.tty_auto = true,
                 ["tty", "never"] => plan.tty_auto = false,
                 _ => return Err(at("bad meta line")),
@@ -515,6 +520,64 @@ fn status_within(command: &mut Command, limit: Duration) -> Result<Option<std::p
     }
 }
 
+/// Like `status_within`, with what the command wrote to stdout. For commands
+/// whose output is a line, not a stream.
+fn output_within(command: &mut Command, limit: Duration) -> Result<Option<(std::process::ExitStatus, String)>, String> {
+    use std::io::Read;
+    command.stdout(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| format!("cannot run {}: {e}", command.get_program().to_string_lossy()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut out);
+                }
+                return Ok(Some((status, out)));
+            }
+            Ok(None) if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("cannot wait for {}: {e}", command.get_program().to_string_lossy())),
+        }
+    }
+}
+
+/// Whether `pid` is a live process that has a network namespace to join and,
+/// when the plan names one, is the process the holder is made of.
+fn process_is(pid: u32, comm: Option<&str>) -> bool {
+    if pid == 0 || !Path::new(&format!("/proc/{pid}/ns/net")).exists() {
+        return false;
+    }
+    match comm {
+        None => true,
+        Some(name) => fs::read_to_string(format!("/proc/{pid}/comm")).map(|c| c.trim() == name).unwrap_or(false),
+    }
+}
+
+/// Whether the holder can be joined: podman has it running, *and* the process
+/// it says that is, is there. podman's record outlives the process when
+/// something kills it (a logout, a crash, the OOM killer), and joining the
+/// holder then fails on `open /proc/<pid>/ns/net` while podman insists the
+/// container is up. A podman that does not answer is an error, not a "no".
+fn holder_alive(plan: &Plan, name: &str) -> Result<bool, String> {
+    let mut command = podman_command(plan);
+    command.args(["inspect", "--format", "{{.State.Status}} {{.State.Pid}}", name]).stdin(Stdio::null()).stderr(Stdio::null());
+    let Some((status, out)) = output_within(&mut command, MANAGE_TIMEOUT)? else {
+        return Err(stalled("inspect", MANAGE_TIMEOUT));
+    };
+    if !status.success() {
+        return Ok(false);
+    }
+    let mut words = out.split_whitespace();
+    let (Some("running"), Some(pid)) = (words.next(), words.next()) else { return Ok(false) };
+    Ok(pid.parse::<u32>().map(|pid| process_is(pid, plan.holder_process.as_deref())).unwrap_or(false))
+}
+
 /// Take an exclusive lock on `file`, waiting at most `limit` for whoever holds it.
 fn lock_within(file: &File, limit: Duration) -> Result<(), String> {
     let started = Instant::now();
@@ -600,12 +663,13 @@ fn lock_error(path: &str, e: std::io::Error) -> String {
 /// using one.
 ///
 /// With no claim anywhere, a holder that exists is a leftover: from a reboot,
-/// from a runner that was killed, or from before the app was updated. The
-/// last of these is the one that matters, because a holder made from an older
-/// root filesystem cannot start once that store path is collected. So it is
-/// never reused; it is removed and made again from this launch's plan. If it
-/// cannot be removed, because a container that still runs joins it, that one
-/// is the holder the entry needs and it is used as it is.
+/// from a runner that was killed, or from before the app was updated. One that
+/// cannot be joined is no use to anyone: it is not running (an older one's root
+/// filesystem may be gone from the store), or podman lists it as running while
+/// its process is dead. It is removed, and with it every container that had
+/// joined it, since those are leftovers too and would otherwise keep it from
+/// being removed; then it is made again from this launch's plan. One that is
+/// alive is the holder the entry needs and is used as it is.
 fn acquire_lease(plan: &Plan, vars: &Vars) -> Result<Option<Lease>, String> {
     let Some(name) = &plan.holder else { return Ok(None) };
     let (guard_path, lease_path) = lock_paths(name, vars)?;
@@ -614,14 +678,20 @@ fn acquire_lease(plan: &Plan, vars: &Vars) -> Result<Option<Lease>, String> {
     let claim = lock_file(&lease_path)?;
     match claim.try_lock() {
         Ok(()) => {
-            if podman_quiet(plan, &["container", "exists", name])? {
-                let _ = podman_quiet(plan, &["rm", "-f", "-t", "0", name]);
+            if podman_quiet(plan, &["container", "exists", name])? && !holder_alive(plan, name)? {
+                let _ = podman_quiet(plan, &["rm", "-f", "-t", "0", "--depend", name]);
             }
         }
         Err(TryLockError::WouldBlock) => {}
         Err(TryLockError::Error(e)) => return Err(lock_error(&lease_path, e)),
     }
     start_holder(plan, vars, name)?;
+    if !holder_alive(plan, name)? {
+        return Err(format!(
+            "the network holder `{name}` is not running and could not be replaced. If a window of this app is still open, \
+             close it and start the app again."
+        ));
+    }
     // Held in place of the exclusive lock above; the guard keeps anyone from
     // slipping in between the two.
     claim.lock_shared().map_err(|e| lock_error(&lease_path, e))?;
@@ -1112,25 +1182,41 @@ mod tests {
         assert!(parse_plan(&with("demo-net", "")).is_err(), "nothing to create it with");
     }
 
+    /// The name `process_is` sees for this very process, which stands in for
+    /// the holder's: it is the one live process a test can be sure of.
+    fn own_comm() -> String {
+        fs::read_to_string(format!("/proc/{}/comm", std::process::id())).unwrap().trim().to_string()
+    }
+
     /// A podman whose containers are marker files in `dir`, and whose calls are
-    /// written to `dir/log`: a holder exists while `dir/holder` does, `stale`
-    /// makes one that cannot start (as when its root filesystem is gone), and
-    /// `dependents` makes one that cannot be removed.
+    /// written to `dir/log`: a holder exists while `dir/holder` does and its
+    /// process is this one. `stale` makes one that is stopped and cannot start
+    /// (its root filesystem is gone), `dead` one that podman lists as running
+    /// with a process that is not there, `alwaysdead` one that is made dead,
+    /// and `dependents` one that only `--depend` can remove.
     fn fake_podman(dir: &Path) -> Plan {
         let fake = dir.join("podman");
         let script = format!(
             "#!/bin/sh\nd='{d}'\necho \"$*\" >> \"$d/log\"\ncase \"$1\" in\n\
              container) [ -e \"$d/holder\" ] ;;\n\
-             rm) [ -e \"$d/dependents\" ] && exit 1; rm -f \"$d/holder\" \"$d/stale\" ;;\n\
+             inspect) [ -e \"$d/holder\" ] || exit 1\n\
+               if [ -e \"$d/stale\" ]; then echo 'exited 0'\n\
+               elif [ -e \"$d/dead\" ]; then echo 'running 999999999'\n\
+               else echo 'running {pid}'; fi ;;\n\
+             rm) case \"$*\" in *--depend*) ;; *) [ -e \"$d/dependents\" ] && exit 1 ;; esac\n\
+               rm -f \"$d/holder\" \"$d/stale\" \"$d/dead\" \"$d/dependents\" ;;\n\
              start) [ -e \"$d/holder\" ] && [ ! -e \"$d/stale\" ] ;;\n\
-             run) : > \"$d/holder\" ;;\n\
+             run) : > \"$d/holder\"; [ -e \"$d/alwaysdead\" ] && : > \"$d/dead\"; true ;;\n\
              esac\n",
-            d = dir.to_string_lossy()
+            d = dir.to_string_lossy(),
+            pid = std::process::id()
         );
         fs::write(&fake, script).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         let f = fake.to_string_lossy();
-        parse_plan(&format!("plan 1\n[meta]\nname\tdemo\npodman\t{f}\nholder\tdemo-net\n[holder]\ns\t{f}\ns\trun\ns\t-d\n[run]\ns\tx\n")).unwrap()
+        let mut plan = parse_plan(&format!("plan 1\n[meta]\nname\tdemo\npodman\t{f}\nholder\tdemo-net\n[holder]\ns\t{f}\ns\trun\ns\t-d\n[run]\ns\tx\n")).unwrap();
+        plan.holder_process = Some(own_comm());
+        plan
     }
 
     fn state(dir: &Path) -> Vars {
@@ -1184,6 +1270,60 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_whose_process_died_is_replaced_with_what_joined_it() {
+        // podman lists it as running; its pid is gone; a leftover container
+        // depends on it, so it cannot be removed the ordinary way.
+        let dir = scratch("dead");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        for marker in ["holder", "dead", "dependents"] {
+            fs::write(dir.join(marker), "").unwrap();
+        }
+        let lease = acquire_lease(&plan, &v).expect("a dead holder does not stop the launch").unwrap();
+        let log = fs::read_to_string(dir.join("log")).unwrap();
+        assert!(log.lines().any(|l| l.starts_with("rm") && l.contains("--depend")), "removed with its dependents: {log}");
+        assert_eq!(calls(&dir, "run"), 1, "and made again");
+        assert!(!dir.join("dead").exists() && !dir.join("dependents").exists());
+        release_lease(&plan, &v, lease);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_is_alive_is_kept_even_with_dependents() {
+        let dir = scratch("alive");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        fs::write(dir.join("holder"), "").unwrap();
+        fs::write(dir.join("dependents"), "").unwrap();
+        let lease = acquire_lease(&plan, &v).unwrap().unwrap();
+        assert_eq!(calls(&dir, "rm"), 0, "nothing running is taken away");
+        assert_eq!(calls(&dir, "run"), 0);
+        release_lease(&plan, &v, lease);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_cannot_be_brought_up_is_an_error_not_a_hang() {
+        let dir = scratch("alwaysdead");
+        let (plan, v) = (fake_podman(&dir), state(&dir));
+        fs::write(dir.join("alwaysdead"), "").unwrap();
+        let err = acquire_lease(&plan, &v).err().expect("a holder that is dead on arrival");
+        assert!(err.contains("is not running"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pid_counts_only_as_the_process_it_should_be() {
+        let me = std::process::id();
+        assert!(process_is(me, None));
+        assert!(process_is(me, Some(&own_comm())));
+        assert!(!process_is(me, Some("catatonit")), "another process under that pid");
+        assert!(!process_is(0, None) && !process_is(999_999_999, None), "no such process");
+        assert!(parse_plan("plan 1\n[meta]\npodman\t/p\nholder-process\ta/b\n[run]\ns\tx\n").is_err());
+        assert!(parse_plan("plan 1\n[meta]\npodman\t/p\nholder-process\t\n[run]\ns\tx\n").is_err());
+        let plan = parse_plan("plan 1\n[meta]\npodman\t/p\nholder-process\tcatatonit\n[run]\ns\tx\n").unwrap();
+        assert_eq!(plan.holder_process.as_deref(), Some("catatonit"));
+    }
+
+    #[test]
     fn a_holder_still_in_use_is_not_replaced() {
         let dir = scratch("busy");
         let (plan, v) = (fake_podman(&dir), state(&dir));
@@ -1217,8 +1357,10 @@ mod tests {
         let lost = acquire_lease(&plan, &v).unwrap().unwrap();
         drop(lost); // what the kernel does to a killed process's locks
         let next = acquire_lease(&plan, &v).unwrap().unwrap();
-        assert_eq!(calls(&dir, "run"), 2, "nobody holds the old claim, so the holder is made again");
+        assert_eq!(calls(&dir, "run"), 1, "nobody holds the old claim, and the holder it left is alive: used as it is");
+        assert_eq!(calls(&dir, "rm"), 0);
         release_lease(&plan, &v, next);
+        assert!(!dir.join("holder").exists(), "and the last one out still removes it");
         fs::remove_dir_all(dir).unwrap();
     }
 

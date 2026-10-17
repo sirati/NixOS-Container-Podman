@@ -448,6 +448,7 @@ let
           name = "${name}/${entryName}";
           podman = podmanBin;
           holder = if e.joinNetwork then holderName else null;
+          holderProcess = baseNameOf catatonit;
           inherit (e) tty;
           require = lib.optional e.display {
             var = "wayland_socket";
