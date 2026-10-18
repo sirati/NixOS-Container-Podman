@@ -1,7 +1,9 @@
-# The prison's own unit, <n>.service: oneshot + RemainAfterExit. Mounts every
+# The prison's own unit, <n>.service. Mounts every
 # service's store view, syncs configs, starts the namespace owner and loads
 # the ruleset into its network namespace from the host. Torn down in reverse
-# on stop, and after a setup that failed or that a stop interrupted.
+# on stop, and after a setup that failed or that a stop interrupted. An
+# owning prison's unit then waits on its namespace owner and is restarted
+# when the owner dies; a joining prison's is a oneshot.
 {
   lib,
   pkgs,
@@ -82,6 +84,14 @@ let
         ${backend.podmanBin} unshare ${pkgs.bash}/bin/bash -c \
           '${nsenterBin} --net=/proc/'"$gpid"'/ns/net ${nftBin} -f ${p.ruleset}'
       ''}
+
+      ${lib.optionalString (!joining) ''
+        # Up: this unit now lives as long as the namespace owner does. Its
+        # death ends the unit, and systemd restarts it (Restart= below):
+        # the owner runs under no unit of its own, so nothing else would.
+        ${pkgs.systemd}/bin/systemd-notify --ready
+        exec ${backend.podmanBin} wait ${backend.ownerName p}
+      ''}
     '';
   };
 
@@ -130,15 +140,32 @@ nameValuePair p.name {
   bindsTo = storeUnits;
   wantedBy = [ "multi-user.target" ];
   path = [ "/run/wrappers" ];
-  serviceConfig = {
+  # An owning prison's unit supervises its namespace owner: ready once set
+  # up, ended when the owner dies, then set up again a bounded number of
+  # times. Its BindsTo children stop with it, and its Wants bring them back.
+  unitConfig = lib.optionalAttrs (!joining) {
+    StartLimitIntervalSec = 600;
+    StartLimitBurst = 5;
+  };
+  serviceConfig = (if joining then {
     Type = "oneshot";
     RemainAfterExit = true;
+  } else {
+    Type = "notify";
+    # systemd-notify runs as a child of the setup script.
+    NotifyAccess = "all";
+    # As for the oneshot it replaces: setup may take long on a busy host.
+    TimeoutStartSec = "infinity";
+    Restart = "always";
+    RestartSec = 5;
+  }) // {
     User = p.user;
     ExecStart = "${setup}/bin/${p.name}-up";
     # ExecStopPost and not ExecStop: systemd skips ExecStop when a stop
     # interrupts setup or setup fails, which would leave the namespace
     # owner running. A stop's SIGTERM ending setup is not a failure.
     ExecStopPost = "${teardown}/bin/${p.name}-down";
-    SuccessExitStatus = "SIGTERM";
+    # podman wait, waiting on the owner, exits 1 when the stop interrupts it.
+    SuccessExitStatus = if joining then "SIGTERM" else "SIGTERM 1";
   };
 }
