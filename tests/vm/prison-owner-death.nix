@@ -25,6 +25,13 @@ pkgs.testers.runNixOSTest {
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
 
+    # Stands in for a fault report: what OnFailure= of the prison runs.
+    systemd.services.w.unitConfig.OnFailure = [ "w-failed.service" ];
+    systemd.services.w-failed.serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${coreutils}/touch /run/w-failed";
+    };
+
     services.prisons.w = prison.mkPrison {
       name = "w";
       services = [
@@ -60,6 +67,8 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("w-sleeper.service", timeout=300)
         assert owner_pid() not in ("", "0", first)
         assert show("InvocationID", "w-sleeper.service") != sleeper
+        # The death is a failure, for the fault reports.
+        machine.succeed("test -e /run/w-failed", "rm /run/w-failed")
 
     with subtest("killing the prison's unit itself is a failure it recovers from"):
         machine.wait_for_unit("w.service", timeout=300)
@@ -68,12 +77,14 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(f"test \"$(systemctl show -p InvocationID --value w.service)\" != {prison}", timeout=120)
         machine.wait_for_unit("w.service", timeout=300)
         machine.wait_for_unit("w-sleeper.service", timeout=300)
+        machine.succeed("test -e /run/w-failed", "rm /run/w-failed")
 
     with subtest("a deliberate stop is not undone"):
         machine.succeed("systemctl stop w.service")
         machine.sleep(10)
         state = [show(p, "w.service") for p in ("ActiveState", "Result", "ExecMainCode", "ExecMainStatus")]
         assert state[0] == "inactive", state
+        machine.fail("test -e /run/w-failed")
         assert show("ActiveState", "w-sleeper.service") == "inactive"
   '';
 }

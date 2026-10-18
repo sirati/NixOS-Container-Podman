@@ -90,7 +90,10 @@ let
         # death ends the unit, and systemd restarts it (Restart= below):
         # the owner runs under no unit of its own, so nothing else would.
         ${pkgs.systemd}/bin/systemd-notify --ready
-        exec ${backend.podmanBin} wait ${backend.ownerName p}
+        ${backend.podmanBin} wait ${backend.ownerName p} >/dev/null || true
+        # A failure, for OnFailure= and the fault reports, and then a restart.
+        echo "${p.name}: namespace owner died" >&2
+        exit 3
       ''}
     '';
   };
@@ -165,7 +168,6 @@ nameValuePair p.name {
     # interrupts setup or setup fails, which would leave the namespace
     # owner running. A stop's SIGTERM ending setup is not a failure.
     ExecStopPost = "${teardown}/bin/${p.name}-down";
-    # podman wait, waiting on the owner, exits 1 when the stop interrupts it.
-    SuccessExitStatus = if joining then "SIGTERM" else "SIGTERM 1";
+    SuccessExitStatus = "SIGTERM";
   };
 }
