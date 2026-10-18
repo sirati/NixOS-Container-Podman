@@ -133,11 +133,15 @@ nameValuePair p.name {
   ++ lib.optional joining "${p.joins}.service";
   # BindsTo stops every child when a store view tears down this owner.
   # Starting the owner must bring back unchanged children as well.
+  # Wants and not Requires for the setuid wrappers: an update that changes
+  # any wrapper stops and starts their unit, and Requires would stop every
+  # prison with it. Setup runs after them and fails by itself without them.
   wants =
     lib.optional p.wantsNetwork "network-online.target"
+    ++ [ "suid-sgid-wrappers.service" ]
     ++ map (s: "${p.name}-${s.name}.service") wantedServices;
   requires =
-    [ "prison-user-${p.user}.target" "suid-sgid-wrappers.service" ]
+    [ "prison-user-${p.user}.target" ]
     ++ storeUnits
     ++ lib.optional joining "${p.joins}.service";
   bindsTo = storeUnits;

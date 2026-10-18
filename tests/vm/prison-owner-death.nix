@@ -25,6 +25,10 @@ pkgs.testers.runNixOSTest {
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
 
+    # As hosts keep it (sirati-nixos base-config): the wrappers unit stays
+    # active, so an update that changes a wrapper stops and starts it.
+    systemd.services.suid-sgid-wrappers.serviceConfig.RemainAfterExit = true;
+
     # Stands in for a fault report: what OnFailure= of the prison runs.
     systemd.services.w.unitConfig.OnFailure = [ "w-failed.service" ];
     systemd.services.w-failed.serviceConfig = {
@@ -78,6 +82,18 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("w.service", timeout=300)
         machine.wait_for_unit("w-sleeper.service", timeout=300)
         machine.succeed("test -e /run/w-failed", "rm /run/w-failed")
+
+    with subtest("an update of the setuid wrappers leaves the prison running"):
+        machine.wait_for_unit("w-sleeper.service", timeout=300)
+        prison = show("InvocationID", "w.service")
+        sleeper = show("InvocationID", "w-sleeper.service")
+        machine.succeed("systemctl is-active suid-sgid-wrappers.service")
+        # What switch-to-configuration does with a changed wrappers unit.
+        machine.succeed("systemctl stop suid-sgid-wrappers.service", "systemctl start suid-sgid-wrappers.service")
+        machine.sleep(5)
+        assert show("InvocationID", "w.service") == prison
+        assert show("InvocationID", "w-sleeper.service") == sleeper
+        assert show("ActiveState", "w.service") == "active"
 
     with subtest("a deliberate stop is not undone"):
         machine.succeed("systemctl stop w.service")
